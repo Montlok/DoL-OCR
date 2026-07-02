@@ -68,6 +68,16 @@ def main() -> int:
         raise SystemExit(f"--src is not a bundle dir (no morphbpe.json): {src}")
 
     dst.mkdir(parents=True)
+    try:
+        return _patch(src, dst)
+    except BaseException:
+        # A failed run must not leave a valid-looking but unpatched bundle at
+        # --dst (it would also block retries via the exists-guard above).
+        shutil.rmtree(dst, ignore_errors=True)
+        raise
+
+
+def _patch(src: Path, dst: Path) -> int:
     for name in os.listdir(src):
         shutil.copy2(src / name, dst / name)
 
