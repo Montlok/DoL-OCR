@@ -12,6 +12,19 @@ depending on a real :class:`TokenizerBundle` on disk. The CLI
 intentionally left thin and untested here; it is exercised (against the same
 fixture, bypassing ``from_dir``) by the harness's own dry run, documented in
 the delivery report rather than as a unittest.
+
+A second suite below (``Hanshi*Test``) covers the hanshi-corpus input mode
+(:func:`iter_hanshi_meta_rows` / :func:`process_hanshi_virtual_shard` /
+:func:`build_one_hanshi_virtual_shard`) with a synthetic ~30-row meta.jsonl +
+``pages/<bucket>/<doc_id>.png`` tree, built the same way. Per that module's
+own docstring, its multiprocess reader/worker pool
+(``_hanshi_reader_main``/``_hanshi_worker_main``/``_run_hanshi_mode``) needs
+a real on-disk :class:`TokenizerBundle` and ``spawn``-context processes and
+is therefore left thin and untested at the unittest level here too; the
+reader's queue protocol (batching, done-sentinel count, sentinel-skip on
+resume) was verified manually with an in-process ``threading.Thread`` stand-in
+against ``queue.Queue`` (safe here since neither function touches torch/CUDA
+state) and is documented in the delivery report rather than as a unittest.
 """
 
 from __future__ import annotations
@@ -33,10 +46,17 @@ from Tokenizer.unified.dual_tokenizer import DualTrackTokenizer, build_unified_v
 from scripts.build_ocr_data import make_ocr_target_encoder
 from scripts.build_ocr_data_from_pairs import (
     ShardCounters,
+    build_one_hanshi_virtual_shard,
     build_one_shard,
+    hanshi_image_path,
+    hanshi_output_shard_number,
+    hanshi_virtual_shard_index,
+    iter_hanshi_meta_rows,
     iter_tar_pairs,
     letterbox_to_square,
+    parse_args,
     parse_shard_indices,
+    process_hanshi_virtual_shard,
     process_shard,
     route_band,
 )
@@ -591,6 +611,495 @@ class SSLQuotaTest(unittest.TestCase):
             self.assertEqual(counters.n_ssl_written, 0)
             ssl_path = out_dir / "jsonl" / "ssl" / "shard-00000.jsonl"
             self.assertEqual(ssl_path.read_text(encoding="utf-8"), "")
+
+
+# ===========================================================================
+# Hanshi mode: synthetic ~30-row meta.jsonl + pages/<bucket>/<doc_id>.png
+# ===========================================================================
+
+HANSHI_SHARD_SIZE = 6
+HANSHI_SHARD_OFFSET = 10_000
+
+
+def _make_hanshi_corpus(tmp_dir: Path) -> tuple[Path, Path, list[dict]]:
+    """Write a synthetic hanshi meta.jsonl + pages tree; return (meta_path, pages_root, rows).
+
+    30 rows total, laid out so the default ``HANSHI_SHARD_SIZE=6`` groups
+    them into exactly 5 virtual shards (0..4), each spanning a mix of
+    bands/edge-cases:
+
+    - rows 0..17 (virtual shards 0, 1, 2): clean train-band "line" rows,
+      alternating between two of the four seeded letters -- these carry the
+      routing-count and byte-exact-decode assertions.
+    - row 18 (virtual shard 3, index 0): val-band (src_doc == VAL_MIN).
+    - row 19 (virtual shard 3, index 1): test-band (src_doc == TEST_MIN) --
+      must be skipped whole, never even orphan/length-checked.
+    - row 20 (virtual shard 3, index 2): "kind": "page", not "line" -- must
+      be skipped and counted, not fatal.
+    - row 21 (virtual shard 3, index 3): over-length text (busts
+      MAX_SEQ_LEN via byte-fallback, same trick as SAMPLES[4] above).
+    - row 22 (virtual shard 3, index 4): clean train row whose PNG is
+      deliberately never written to disk -- the missing-image-is-an-orphan
+      (not fatal) case unique to hanshi mode.
+    - row 23 (virtual shard 3, index 5): clean train row, closes out shard 3.
+    - rows 24..29 (virtual shard 4): clean train rows.
+
+    All bucket dirs are ``"00000"`` (single bucket is enough to exercise the
+    ``<pages_root>/<bucket>/<doc_id>.png`` path; multi-bucket routing is not
+    special-cased by the builder beyond string-joining ``meta["bucket"]``).
+    """
+
+    meta_path = tmp_dir / "meta.jsonl"
+    pages_root = tmp_dir / "pages"
+    bucket = "00000"
+    bucket_dir = pages_root / bucket
+    bucket_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict] = []
+
+    def _add(doc_id: str, text: str, src_doc: int, kind: str = "line", write_image: bool = True):
+        row = {
+            "doc_id": doc_id,
+            "kind": kind,
+            "text": text,
+            "src_doc": src_doc,
+            "bucket": bucket,
+            "font": "hanshi",
+            "font_px": 32,
+        }
+        rows.append(row)
+        if write_image:
+            (bucket_dir / f"{doc_id}.png").write_bytes(_make_strip_png_bytes())
+
+    for i in range(18):
+        letters = SEEDED_LETTERS[i % 2] + SEEDED_LETTERS[(i + 1) % 2]
+        _add(f"line_{i:08d}_v0", letters, src_doc=i)
+
+    _add("line_00000018_v0", LETTER_GA, src_doc=VAL_MIN)  # val band
+    _add("line_00000019_v0", LETTER_RA, src_doc=TEST_MIN)  # test band, skipped whole
+    _add("line_00000020_v0", LETTER_A, src_doc=20, kind="page")  # non-"line", skipped
+    _add("line_00000021_v0", "x" * 600, src_doc=21)  # over-length
+    _add("line_00000022_v0", LETTER_NA, src_doc=22, write_image=False)  # missing file
+    _add("line_00000023_v0", LETTER_A + LETTER_GA, src_doc=23)
+
+    for i in range(24, 30):
+        _add(f"line_{i:08d}_v0", LETTER_A + LETTER_RA, src_doc=i)
+
+    with meta_path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    return meta_path, pages_root, rows
+
+
+class HanshiMetaStreamingTest(unittest.TestCase):
+    def setUp(self):
+        self._td = TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.tmp_dir = Path(self._td.name)
+        self.meta_path, self.pages_root, self.rows = _make_hanshi_corpus(self.tmp_dir)
+
+    def test_stride_one_keeps_every_row(self):
+        kept = list(iter_hanshi_meta_rows(self.meta_path, stride=1))
+        self.assertEqual(len(kept), 30)
+        self.assertEqual([k for k, _, _ in kept], list(range(30)))
+        self.assertEqual(kept[0][1], "line_00000000_v0")
+
+    def test_stride_keeps_every_kth_raw_line_and_reindexes_kept_idx(self):
+        kept = list(iter_hanshi_meta_rows(self.meta_path, stride=3))
+        # raw line indices 0, 3, 6, ... -> doc_ids line_00000000, 00000003, ...
+        self.assertEqual(len(kept), 10)  # ceil(30 / 3)
+        doc_ids = [doc_id for _, doc_id, _ in kept]
+        self.assertEqual(
+            doc_ids,
+            [f"line_{i:08d}_v0" for i in range(0, 30, 3)],
+        )
+        # kept_idx is dense (0..9), NOT the raw line index (0,3,6,...).
+        self.assertEqual([k for k, _, _ in kept], list(range(10)))
+
+    def test_stride_rejects_zero_and_negative_via_generator_contract(self):
+        # iter_hanshi_meta_rows itself does not validate stride (that is
+        # parse_args' job via --hanshi-stride); a stride of 0 must not be
+        # silently passed through by the CLI (covered in
+        # HanshiArgparseTest.test_stride_below_one_rejected below). Guard
+        # here only that stride=1 truly is a no-op / identity subset.
+        kept_all = [doc_id for _, doc_id, _ in iter_hanshi_meta_rows(self.meta_path, stride=1)]
+        self.assertEqual(len(kept_all), len(self.rows))
+
+    def test_missing_doc_id_raises(self):
+        bad_path = self.tmp_dir / "bad_meta.jsonl"
+        bad_path.write_text(
+            json.dumps({"kind": "line", "text": "x", "src_doc": 0, "bucket": "00000"})
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError):
+            list(iter_hanshi_meta_rows(bad_path, stride=1))
+
+    def test_invalid_json_line_raises(self):
+        bad_path = self.tmp_dir / "bad_meta2.jsonl"
+        bad_path.write_text("{not valid json\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            list(iter_hanshi_meta_rows(bad_path, stride=1))
+
+    def test_blank_lines_are_skipped_without_consuming_kept_idx_or_stride(self):
+        path_with_blanks = self.tmp_dir / "with_blanks.jsonl"
+        rows = [
+            {"doc_id": "a", "kind": "line", "text": "x", "src_doc": 0, "bucket": "00000"},
+            {"doc_id": "b", "kind": "line", "text": "y", "src_doc": 1, "bucket": "00000"},
+        ]
+        with path_with_blanks.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(rows[0]) + "\n")
+            fh.write("\n")
+            fh.write("   \n")
+            fh.write(json.dumps(rows[1]) + "\n")
+        kept = list(iter_hanshi_meta_rows(path_with_blanks, stride=1))
+        self.assertEqual([doc_id for _, doc_id, _ in kept], ["a", "b"])
+        self.assertEqual([k for k, _, _ in kept], [0, 1])
+
+
+class HanshiVirtualShardNamingTest(unittest.TestCase):
+    def test_virtual_shard_index_groups_kept_idx_into_fixed_windows(self):
+        self.assertEqual(hanshi_virtual_shard_index(0, 6), 0)
+        self.assertEqual(hanshi_virtual_shard_index(5, 6), 0)
+        self.assertEqual(hanshi_virtual_shard_index(6, 6), 1)
+        self.assertEqual(hanshi_virtual_shard_index(29, 6), 4)
+
+    def test_output_shard_number_uses_offset_and_never_collides_with_tar_range(self):
+        self.assertEqual(hanshi_output_shard_number(0, 10_000), 10_000)
+        self.assertEqual(hanshi_output_shard_number(4, 10_000), 10_004)
+        # Tar-mode shards run 0..4053; default offset must stay clear of it.
+        self.assertGreater(hanshi_output_shard_number(0, 10_000), 4053)
+
+    def test_image_path_joins_pages_root_bucket_and_doc_id(self):
+        p = hanshi_image_path("/nas/hanshi/pages", "00042", "line_00000000_v0")
+        self.assertEqual(p, Path("/nas/hanshi/pages/00042/line_00000000_v0.png"))
+
+
+class HanshiProcessVirtualShardTest(unittest.TestCase):
+    """Full pipeline against the synthetic 30-row hanshi corpus, virtual shard 3."""
+
+    def setUp(self):
+        self.tokenizer = make_fixture_tokenizer()
+        self.encode_target = make_ocr_target_encoder(self.tokenizer)
+        self._td = TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.tmp_dir = Path(self._td.name)
+        self.meta_path, self.pages_root, self.rows = _make_hanshi_corpus(self.tmp_dir)
+        self.out_dir = self.tmp_dir / "out"
+
+    def _kept_rows_for_virtual_shard(self, virtual_index: int) -> list[tuple[str, dict]]:
+        all_kept = list(iter_hanshi_meta_rows(self.meta_path, stride=1))
+        return [
+            (doc_id, meta)
+            for kept_idx, doc_id, meta in all_kept
+            if hanshi_virtual_shard_index(kept_idx, HANSHI_SHARD_SIZE) == virtual_index
+        ]
+
+    def _run(self, virtual_index: int, **overrides):
+        rows = self._kept_rows_for_virtual_shard(virtual_index)
+        output_shard_number = hanshi_output_shard_number(virtual_index, HANSHI_SHARD_OFFSET)
+        kwargs = dict(
+            n_image_tokens=N_IMAGE_TOKENS,
+            image_size=IMAGE_SIZE,
+            max_seq_len=MAX_SEQ_LEN,
+            val_src_doc_min=VAL_MIN,
+            test_src_doc_min=TEST_MIN,
+            val_cap_per_shard=1000,
+            ssl_quota_per_shard=1000,
+            instruction_ids=[],
+        )
+        kwargs.update(overrides)
+        return output_shard_number, process_hanshi_virtual_shard(
+            output_shard_number,
+            rows,
+            self.pages_root,
+            self.out_dir,
+            self.encode_target,
+            **kwargs,
+        )
+
+    # -- routing + orphan counts (virtual shard 3: val/test/non-line/over-length/missing-image) --
+
+    def test_routing_and_orphan_counts_on_edge_case_shard(self):
+        _, counters = self._run(3)
+        # virtual shard 3 = rows 18..23: val, test, page(non-line),
+        # over-length, missing-image, clean.
+        self.assertEqual(counters.n_samples_seen, 6)
+        self.assertEqual(counters.n_test_skipped, 1)
+        self.assertEqual(counters.n_non_line_skipped, 1)
+        self.assertEqual(counters.n_over_length_skipped, 1)
+        self.assertEqual(counters.n_orphans, 1)  # the missing-image row
+        self.assertEqual(counters.n_val, 1)
+        self.assertEqual(counters.n_train, 1)  # only the final clean row
+        self.assertEqual(counters.n_align_written, 1)
+        self.assertEqual(counters.n_val_written, 1)
+
+    def test_missing_image_does_not_abort_the_shard(self):
+        # The whole point of the orphan path: a missing file must not raise
+        # -- the shard must still complete and write a sentinel.
+        output_shard_number, counters = self._run(3)
+        sentinel_path = self.out_dir / "done" / f"shard-{output_shard_number:05d}.json"
+        self.assertTrue(sentinel_path.is_file())
+        self.assertEqual(counters.n_orphans, 1)
+
+    def test_clean_shard_routing_counts(self):
+        # virtual shard 0 = rows 0..5, all clean train-band "line" rows.
+        _, counters = self._run(0)
+        self.assertEqual(counters.n_samples_seen, 6)
+        self.assertEqual(counters.n_orphans, 0)
+        self.assertEqual(counters.n_train, 6)
+        self.assertEqual(counters.n_val, 0)
+        self.assertEqual(counters.n_test_skipped, 0)
+        self.assertEqual(counters.n_align_written, 6)
+        self.assertEqual(counters.n_ssl_written, 6)
+
+    # -- output naming uses the offset ------------------------------------
+
+    def test_outputs_are_named_with_shard_offset(self):
+        output_shard_number, _ = self._run(0)
+        self.assertEqual(output_shard_number, 10_000)
+        self.assertTrue(
+            (self.out_dir / "jsonl" / "align" / "shard-10000.jsonl").is_file()
+        )
+        self.assertTrue((self.out_dir / "images" / "shard-10000").is_dir())
+        self.assertTrue((self.out_dir / "done" / "shard-10000.json").is_file())
+
+    # -- byte-exact decode, same contract as tar mode ----------------------
+
+    def test_align_row_decode_is_byte_exact(self):
+        output_shard_number, _ = self._run(0)
+        rows = self._read_jsonl(
+            self.out_dir / "jsonl" / "align" / f"shard-{output_shard_number:05d}.jsonl"
+        )
+        self.assertEqual(len(rows), 6)
+        expected_texts = [
+            SEEDED_LETTERS[i % 2] + SEEDED_LETTERS[(i + 1) % 2] for i in range(6)
+        ]
+        for row, expected_text in zip(rows, expected_texts):
+            n_masked = sum(1 for lab in row["labels"] if lab == IGNORE_INDEX)
+            target_and_eos = row["input_ids"][n_masked:]
+            decoded = self.tokenizer.decode(target_and_eos[:-1])
+            self.assertEqual(decoded, expected_text)
+            self.assertEqual(
+                decoded.encode("utf-8", "surrogatepass"),
+                expected_text.encode("utf-8", "surrogatepass"),
+            )
+
+    def test_align_image_is_letterboxed_square_and_file_exists(self):
+        output_shard_number, _ = self._run(0)
+        rows = self._read_jsonl(
+            self.out_dir / "jsonl" / "align" / f"shard-{output_shard_number:05d}.jsonl"
+        )
+        row = rows[0]
+        self.assertTrue(os.path.isabs(row["images"][0]))
+        with Image.open(row["images"][0]) as img:
+            self.assertEqual(img.size, (IMAGE_SIZE, IMAGE_SIZE))
+            self.assertEqual(img.mode, "L")
+
+    # -- ssl row schema, same contract as tar mode -------------------------
+
+    def test_ssl_row_schema(self):
+        output_shard_number, _ = self._run(0)
+        ssl_rows = self._read_jsonl(
+            self.out_dir / "jsonl" / "ssl" / f"shard-{output_shard_number:05d}.jsonl"
+        )
+        self.assertEqual(len(ssl_rows), 6)
+        self.assertEqual(set(ssl_rows[0].keys()), {"images", "image_sizes", "ocr_labels"})
+        self.assertEqual(ssl_rows[0]["image_sizes"], [[IMAGE_SIZE, IMAGE_SIZE]])
+
+    # -- val-cap / ssl-quota are per-virtual-shard, not divided ------------
+
+    def test_val_cap_and_ssl_quota_are_used_directly_per_virtual_shard(self):
+        # virtual shard 3 has exactly one val row; a cap of 0 must skip
+        # writing it but still count it, identically to tar mode's
+        # val_cap_per_shard=0 semantics (ValCapTest above) -- just fed the
+        # raw --val-cap value directly instead of a divided one.
+        _, counters = self._run(3, val_cap_per_shard=0)
+        self.assertEqual(counters.n_val, 1)
+        self.assertEqual(counters.n_val_written, 0)
+        self.assertEqual(counters.n_val_cap_skipped, 1)
+
+    # -- sentinel + idempotent resume, same contract as tar mode -----------
+
+    def test_sentinel_written_with_counters(self):
+        output_shard_number, counters = self._run(0)
+        sentinel_path = self.out_dir / "done" / f"shard-{output_shard_number:05d}.json"
+        with sentinel_path.open() as fh:
+            payload = json.load(fh)
+        self.assertEqual(payload["n_align_written"], counters.n_align_written)
+        self.assertEqual(payload["n_samples_seen"], 6)
+
+    def test_rerun_via_build_one_hanshi_virtual_shard_skips_and_counters_unchanged(self):
+        rows = self._kept_rows_for_virtual_shard(0)
+        output_shard_number = hanshi_output_shard_number(0, HANSHI_SHARD_OFFSET)
+        kwargs = dict(
+            n_image_tokens=N_IMAGE_TOKENS,
+            image_size=IMAGE_SIZE,
+            max_seq_len=MAX_SEQ_LEN,
+            val_src_doc_min=VAL_MIN,
+            test_src_doc_min=TEST_MIN,
+            val_cap_per_shard=1000,
+            ssl_quota_per_shard=1000,
+            instruction_ids=[],
+        )
+        first = build_one_hanshi_virtual_shard(
+            output_shard_number, rows, self.pages_root, self.out_dir,
+            self.encode_target, **kwargs,
+        )
+        align_path = self.out_dir / "jsonl" / "align" / f"shard-{output_shard_number:05d}.jsonl"
+        mtime_before = align_path.stat().st_mtime_ns
+
+        # Second call passes an EMPTY rows list to prove the sentinel short-
+        # circuits actual (re)processing rather than happening to reprocess
+        # identical rows and land on the same counters by coincidence.
+        second = build_one_hanshi_virtual_shard(
+            output_shard_number, [], self.pages_root, self.out_dir,
+            self.encode_target, **kwargs,
+        )
+
+        self.assertEqual(first.as_dict(), second.as_dict())
+        self.assertEqual(align_path.stat().st_mtime_ns, mtime_before)
+
+    def test_crashed_virtual_shard_partial_outputs_are_rebuilt_not_left_stale(self):
+        align_dir = self.out_dir / "jsonl" / "align"
+        align_dir.mkdir(parents=True, exist_ok=True)
+        output_shard_number = hanshi_output_shard_number(0, HANSHI_SHARD_OFFSET)
+        stale_path = align_dir / f"shard-{output_shard_number:05d}.jsonl"
+        stale_path.write_text('{"stale": true}\n', encoding="utf-8")
+
+        rows = self._kept_rows_for_virtual_shard(0)
+        kwargs = dict(
+            n_image_tokens=N_IMAGE_TOKENS,
+            image_size=IMAGE_SIZE,
+            max_seq_len=MAX_SEQ_LEN,
+            val_src_doc_min=VAL_MIN,
+            test_src_doc_min=TEST_MIN,
+            val_cap_per_shard=1000,
+            ssl_quota_per_shard=1000,
+            instruction_ids=[],
+        )
+        counters = build_one_hanshi_virtual_shard(
+            output_shard_number, rows, self.pages_root, self.out_dir,
+            self.encode_target, **kwargs,
+        )
+        self.assertEqual(counters.n_align_written, 6)
+        rows_out = self._read_jsonl(stale_path)
+        self.assertEqual(len(rows_out), 6)
+        self.assertNotIn("stale", rows_out[0])
+
+    # -- helpers ------------------------------------------------------
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict]:
+        rows = []
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        return rows
+
+
+class HanshiArgparseTest(unittest.TestCase):
+    """--hanshi-* and --shards-dir/--shard-indices are mutually exclusive."""
+
+    def test_both_modes_given_is_an_argparse_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            parse_args(
+                [
+                    "--shards-dir", "/tmp/x",
+                    "--shard-indices", "0:1",
+                    "--hanshi-meta", "/tmp/meta.jsonl",
+                    "--hanshi-pages", "/tmp/pages",
+                    "--out", "/tmp/out",
+                    "--tokenizer-bundle", "/tmp/bundle",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_neither_mode_given_is_an_argparse_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            parse_args(["--out", "/tmp/out", "--tokenizer-bundle", "/tmp/bundle"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_hanshi_mode_alone_parses(self):
+        ns = parse_args(
+            [
+                "--hanshi-meta", "/tmp/meta.jsonl",
+                "--hanshi-pages", "/tmp/pages",
+                "--out", "/tmp/out",
+                "--tokenizer-bundle", "/tmp/bundle",
+            ]
+        )
+        self.assertEqual(ns.hanshi_meta, "/tmp/meta.jsonl")
+        self.assertEqual(ns.hanshi_pages, "/tmp/pages")
+        self.assertIsNone(ns.shards_dir)
+        self.assertIsNone(ns.shard_indices)
+        # defaults from the task spec
+        self.assertEqual(ns.hanshi_stride, 1)
+        self.assertEqual(ns.hanshi_shard_size, 100_000)
+        self.assertEqual(ns.shard_offset, 10_000)
+
+    def test_tar_mode_alone_still_parses(self):
+        ns = parse_args(
+            [
+                "--shards-dir", "/tmp/x",
+                "--shard-indices", "0:1",
+                "--out", "/tmp/out",
+                "--tokenizer-bundle", "/tmp/bundle",
+            ]
+        )
+        self.assertEqual(ns.shards_dir, "/tmp/x")
+        self.assertIsNone(ns.hanshi_meta)
+
+    def test_hanshi_meta_without_hanshi_pages_is_an_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            parse_args(
+                [
+                    "--hanshi-meta", "/tmp/meta.jsonl",
+                    "--out", "/tmp/out",
+                    "--tokenizer-bundle", "/tmp/bundle",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_shards_dir_without_shard_indices_is_an_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            parse_args(
+                [
+                    "--shards-dir", "/tmp/x",
+                    "--out", "/tmp/out",
+                    "--tokenizer-bundle", "/tmp/bundle",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_stride_below_one_rejected(self):
+        with self.assertRaises(SystemExit) as ctx:
+            parse_args(
+                [
+                    "--hanshi-meta", "/tmp/meta.jsonl",
+                    "--hanshi-pages", "/tmp/pages",
+                    "--hanshi-stride", "0",
+                    "--out", "/tmp/out",
+                    "--tokenizer-bundle", "/tmp/bundle",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_shard_size_below_one_rejected(self):
+        with self.assertRaises(SystemExit) as ctx:
+            parse_args(
+                [
+                    "--hanshi-meta", "/tmp/meta.jsonl",
+                    "--hanshi-pages", "/tmp/pages",
+                    "--hanshi-shard-size", "0",
+                    "--out", "/tmp/out",
+                    "--tokenizer-bundle", "/tmp/bundle",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
 
 
 if __name__ == "__main__":
