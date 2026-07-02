@@ -654,6 +654,11 @@ def two_stage_pretrain_config() -> RDTConfig:
         recurrent_drift_mode="mhc",
         mhc_n_streams=4,
         mhc_sinkhorn_iters=20,
+        # Generate/eval-time adaptive depth only (no effect on training): the
+        # cache-free decode path exits the refinement loop once successive-step
+        # output KL falls below this, which is what keeps full-vocab OCR
+        # generation affordable on this config.
+        kl_exit_threshold=0.05,
     )
 
 
