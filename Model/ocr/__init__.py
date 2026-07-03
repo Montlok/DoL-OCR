@@ -15,7 +15,9 @@ from Model.ocr.segment import (
     chunk_column_by_height,
     detect_columns,
     detect_line_columns,
+    is_plausible_line,
     lines_from_column,
+    trim_scan_borders,
 )
 
 __all__ = [
@@ -27,8 +29,10 @@ __all__ = [
     "detect_line_columns",
     "edit_distance",
     "grapheme_clusters",
+    "is_plausible_line",
     "lines_from_column",
     "nominal_normalize",
     "ocr_report",
+    "trim_scan_borders",
     "wer",
 ]

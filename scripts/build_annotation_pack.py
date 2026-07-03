@@ -13,11 +13,26 @@ source pixels.
 Pipeline per document::
 
     render sampled pages (pdftoppm subprocess, fallback PyMuPDF)
+        -> trim_scan_borders (Model.ocr.segment; strips solid scan-border/
+           scanner-bed strips BEFORE column detection)
         -> detect_line_columns (Model.ocr.segment)
         -> chunk_column_by_height (splits page-spanning columns)
+        -> is_plausible_line (Model.ocr.segment; rejects blank/solid-bar/
+           geometry-outlier chunks BEFORE sampling, so lines_per_page fills
+           from real candidates, not garbage; rejections counted per page)
         -> sample --lines-per-page chunks
         -> crop raw strip + letterbox_to_square 224px preview
         -> assign id doc__page__col__chunk
+
+Real scanned-book PDFs (as opposed to clean synthetic pages) carry solid
+black scan-border strips, gutter shadows, and wide blank margins that a
+column/chunk detector tuned on clean ink bars will happily segment as if
+they were text -- see :mod:`Model.ocr.segment`'s module docstring for the
+failure modes this causes and why border trimming + per-chunk plausibility
+filtering, not smarter column detection alone, is the fix. Every document's
+run also emits ``qa_montage_<doc_stem>.png`` under ``--out`` -- up to
+:data:`_QA_MONTAGE_MAX_CROPS` sampled KEPT crops composed into one strip, so
+a human can eyeball pack quality without opening files under ``lines/``.
 
 Two input modes, mutually exclusive:
 
@@ -89,6 +104,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -97,10 +114,17 @@ from Model.ocr.segment import (  # noqa: E402
     Box,
     chunk_column_by_height,
     detect_line_columns,
+    is_plausible_line,
+    trim_scan_borders,
 )
 from scripts.build_ocr_data_from_pairs import letterbox_to_square  # noqa: E402
 
 _LETTERBOX_SIZE = 224
+
+# Cap on how many kept crops from one document are composed into its
+# qa_montage_<doc_stem>.png -- enough for a human to eyeball pack quality at
+# a glance without opening every file under lines/, not an exhaustive dump.
+_QA_MONTAGE_MAX_CROPS = 12
 
 # Pages within this fraction of the start/end of a document are treated as
 # covers/TOC and never sampled (mirrors common front/back-matter placement in
@@ -378,6 +402,65 @@ class DocResult:
     sampled_pages: list[int] = field(default_factory=list)
     pages_no_segmentation: list[int] = field(default_factory=list)
     lines: list[dict[str, Any]] = field(default_factory=list)
+    # {page_index: {"blank": n, "solid_bar": n, "too_narrow": n, "too_wide":
+    # n, "too_short": n}} -- per-page counts of chunks dropped by
+    # is_plausible_line, keyed the same as Model.ocr.segment.lines_from_column's
+    # rejection dict, for the manifest and end-of-run observability.
+    rejections_by_page: dict[int, dict[str, int]] = field(default_factory=dict)
+    # Kept-crop PIL images sampled for this doc's qa_montage.png (not every
+    # kept line -- see _QA_MONTAGE_MAX_CROPS -- just enough to eyeball pack
+    # quality without opening the whole lines/ directory).
+    montage_crops: list[Any] = field(default_factory=list)
+
+
+# ===========================================================================
+# QA montage: one glance at pack quality, per document
+# ===========================================================================
+
+
+def write_qa_montage(crops: list[Any], out_path: Path, *, strip_height: int = 96) -> bool:
+    """Compose up to ``_QA_MONTAGE_MAX_CROPS`` kept line crops into one PNG.
+
+    Each crop is letterboxed to a fixed height (``strip_height``, preserving
+    aspect ratio, white-padded) and laid out top to bottom in one tall strip
+    so a human can eyeball a document's line-crop quality in one glance
+    rather than opening individual files in ``lines/``. Returns ``False``
+    (writes nothing) when ``crops`` is empty -- a document that produced zero
+    kept lines has nothing to montage, which is itself visible in the
+    manifest's counts, not something this function should paper over with a
+    blank image.
+    """
+    from PIL import Image
+
+    if not crops:
+        return False
+    if strip_height < 1:
+        raise ValueError("strip_height must be >= 1")
+
+    resample = (
+        Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+    )
+    resized = []
+    for crop in crops:
+        w, h = crop.size
+        if h <= 0:
+            continue
+        new_w = max(1, round(w * (strip_height / h)))
+        resized.append(crop.convert("L").resize((new_w, strip_height), resample))
+    if not resized:
+        return False
+
+    pad = 4
+    montage_w = max(im.width for im in resized) + 2 * pad
+    montage_h = sum(im.height for im in resized) + pad * (len(resized) + 1)
+    montage = Image.new("L", (montage_w, montage_h), 255)
+    y = pad
+    for im in resized:
+        montage.paste(im, (pad, y))
+        y += im.height + pad
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    montage.save(out_path)
+    return True
 
 
 # ===========================================================================
@@ -416,7 +499,20 @@ def process_document(
     call may write in total across all its pages -- ``--limit`` is enforced
     as a running budget threaded through every document, not a per-document
     cap, so the smoke flag reliably bounds the whole run's line count.
+
+    Each page is border-trimmed (:func:`Model.ocr.segment.trim_scan_borders`)
+    BEFORE column detection, and every candidate chunk is quality-filtered
+    (:func:`Model.ocr.segment.is_plausible_line`) BEFORE line sampling --
+    filtering before, not after, sampling means a page with N good chunks and
+    a pile of blank/border-artifact chunks still tries to fill
+    ``lines_per_page`` from the N good ones, rather than possibly sampling
+    mostly garbage and yielding far fewer than requested. Per-page rejection
+    counts land in ``result.rejections_by_page``; a sample of kept crops
+    (see ``_QA_MONTAGE_MAX_CROPS``) lands in ``result.montage_crops`` for
+    :func:`build_pack` to render as ``qa_montage.png``.
     """
+    from PIL import Image
+
     result = DocResult(doc_stem=doc_stem, source_name=source_name, n_pages_total=n_pages_total)
     result.sampled_pages = list(sampled_pages)
     if not sampled_pages:
@@ -436,8 +532,20 @@ def process_document(
             continue
         page_img = pages[page_idx]
 
+        # Real scanned-book pages carry solid black scan-border/scanner-bed
+        # strips that a clean synthetic page never has; trimmed BEFORE
+        # column detection so they never seed a false column or dominate the
+        # ink profile. y_off/x_off map trimmed-local boxes back to this
+        # page's own pixel coordinates for the manifest and for cropping out
+        # of the untouched original `page_img` (crop from the original, not
+        # a numpy round-trip of it, to avoid any lossy re-encode).
+        page_arr = np.asarray(page_img.convert("L"))
+        trimmed_arr, (y_off, x_off) = trim_scan_borders(page_arr)
+        trimmed_img = Image.fromarray(trimmed_arr, mode="L")
+        page_h, page_w = page_arr.shape
+
         try:
-            columns = detect_line_columns(page_img)
+            columns = detect_line_columns(trimmed_img)
         except Exception as exc:
             print(
                 f"[annopack] segmentation error {source_name} page {page_idx}: {exc}",
@@ -448,10 +556,33 @@ def process_document(
 
         flat_chunks: list[Box] = []
         chunk_owner_col: list[int] = []
+        chunk_crops: list[Any] = []
+        page_rejections = {
+            "blank": 0,
+            "solid_bar": 0,
+            "too_narrow": 0,
+            "too_wide": 0,
+            "too_short": 0,
+        }
         for col_idx, col_box in enumerate(columns):
             for chunk_box in chunk_column_by_height(col_box):
-                flat_chunks.append(chunk_box)
+                # chunk_box is in trimmed-local coordinates (detect_line_columns
+                # ran on trimmed_img); add the trim offset back to crop from
+                # the original, untrimmed page_img and to record
+                # original-page-space geometry in the manifest.
+                cx0, cy0, cx1, cy1 = chunk_box
+                orig_box = (cx0 + x_off, cy0 + y_off, cx1 + x_off, cy1 + y_off)
+                crop = page_img.crop(orig_box).convert("L")
+                plausible, reason = is_plausible_line(
+                    np.asarray(crop), page_w, page_h
+                )
+                if not plausible:
+                    page_rejections[reason] += 1
+                    continue
+                flat_chunks.append(orig_box)
                 chunk_owner_col.append(col_idx)
+                chunk_crops.append(crop)
+        result.rejections_by_page[page_idx] = page_rejections
 
         if not flat_chunks:
             result.pages_no_segmentation.append(page_idx)
@@ -472,8 +603,7 @@ def process_document(
             col_idx = chunk_owner_col[flat_i]
             line_id = f"{doc_stem}__p{page_idx:04d}__c{col_idx:02d}__l{chunk_pos:03d}"
 
-            x0, y0, x1, y1 = chunk_box
-            crop = page_img.crop((x0, y0, x1, y1)).convert("L")
+            crop = chunk_crops[flat_i]
 
             raw_path = lines_dir / f"{line_id}_raw.png"
             crop.save(raw_path)
@@ -484,12 +614,21 @@ def process_document(
             preview_path = lines_dir / f"{line_id}_224.png"
             preview.save(preview_path)
 
+            if len(result.montage_crops) < _QA_MONTAGE_MAX_CROPS:
+                result.montage_crops.append(crop)
+
+            col_box_orig = (
+                columns[col_idx][0] + x_off,
+                columns[col_idx][1] + y_off,
+                columns[col_idx][2] + x_off,
+                columns[col_idx][3] + y_off,
+            )
             result.lines.append(
                 {
                     "id": line_id,
                     "pdf": source_name,
                     "page": page_idx,
-                    "col_box": list(columns[col_idx]),
+                    "col_box": list(col_box_orig),
                     "line_box": list(chunk_box),
                     "dpi": dpi,
                     "raw_path": str(raw_path.relative_to(out_dir)),
@@ -649,8 +788,17 @@ def build_pack(args: argparse.Namespace) -> dict[str, Any]:
                 results.append(result)
 
     all_lines: list[dict[str, Any]] = []
+    montage_paths: dict[str, str] = {}
     for r in results:
         all_lines.extend(r.lines)
+        # One flat file per document directly under out_dir (not nested in
+        # lines/), so it is the first thing a human sees browsing the pack.
+        # Single-document runs (--image-dir mode) produce exactly one file
+        # named "qa_montage_<doc_stem>.png"; multi-document --pdf-dir runs
+        # get one per PDF, disambiguated the same way.
+        montage_out = out_dir / f"qa_montage_{r.doc_stem}.png"
+        if write_qa_montage(r.montage_crops, montage_out):
+            montage_paths[r.doc_stem] = str(montage_out.relative_to(out_dir))
 
     # Global double-annotate draw: a single fresh Random(seed) over the
     # WHOLE run's kept lines, computed once at the end -- not per-page, so
@@ -682,6 +830,21 @@ def build_pack(args: argparse.Namespace) -> dict[str, Any]:
             if row["double_annotate"]:
                 fb.write(f"{row['id']}\t{row['preview_path']}\t\t\n")
 
+    # Aggregate is_plausible_line rejection reasons across every page of
+    # every document, for a run-level "how much garbage did the filter
+    # catch" summary alongside the per-page breakdown each doc entry carries.
+    total_rejections = {
+        "blank": 0,
+        "solid_bar": 0,
+        "too_narrow": 0,
+        "too_wide": 0,
+        "too_short": 0,
+    }
+    for r in results:
+        for page_counts in r.rejections_by_page.values():
+            for reason, n in page_counts.items():
+                total_rejections[reason] += n
+
     manifest = {
         "tool_git_rev": _git_metadata(),
         "seed": args.seed,
@@ -695,6 +858,15 @@ def build_pack(args: argparse.Namespace) -> dict[str, Any]:
                 "n_pages_total": r.n_pages_total,
                 "sampled_pages": r.sampled_pages,
                 "pages_no_segmentation": r.pages_no_segmentation,
+                # JSON object keys are always strings; page indices are
+                # stringified here explicitly (rather than left to json.dump's
+                # implicit int-key coercion) so the on-disk shape matches what
+                # round-trips back through json.load without surprises.
+                "rejections_by_page": {
+                    str(page_idx): counts
+                    for page_idx, counts in r.rejections_by_page.items()
+                },
+                "qa_montage_path": montage_paths.get(r.doc_stem),
             }
             for r in results
         ],
@@ -705,6 +877,8 @@ def build_pack(args: argparse.Namespace) -> dict[str, Any]:
             "n_pages_empty": sum(len(r.pages_no_segmentation) for r in results),
             "n_lines": len(all_lines),
             "n_double_annotate": len(double_ids),
+            "n_rejected_total": sum(total_rejections.values()),
+            "rejections_by_reason": total_rejections,
         },
     }
     with (out_dir / "manifest.json").open("w", encoding="utf-8") as fh:
@@ -716,6 +890,8 @@ def build_pack(args: argparse.Namespace) -> dict[str, Any]:
         f"pages_empty={manifest['counts']['n_pages_empty']} "
         f"lines={manifest['counts']['n_lines']} "
         f"double_annotate={manifest['counts']['n_double_annotate']} "
+        f"rejected={manifest['counts']['n_rejected_total']} {total_rejections} "
+        f"qa_montages={len(montage_paths)} "
         f"under {out_dir}",
         flush=True,
     )

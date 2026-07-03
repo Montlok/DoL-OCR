@@ -243,7 +243,12 @@ def main(argv=None) -> int:
                 raw.load()
                 pils.append(raw.convert("L"))
         column = stack_lines(pils, args.gap_px)
-        spans = lines_from_column(
+        # No page_w/page_h: this column is a synthetic reconstruction (K val
+        # line images vertically stacked), not a crop from a real page, so
+        # there is no meaningful "page width" to check the width-outlier
+        # rule against -- the ink-fraction/absolute-width/height checks in
+        # Model.ocr.segment.is_plausible_line still apply unconditionally.
+        spans, _rejections = lines_from_column(
             column,
             target_line_px,
             ink_threshold=args.ink_threshold,

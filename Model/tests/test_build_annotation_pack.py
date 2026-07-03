@@ -28,6 +28,7 @@ from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
 from Model.ocr.segment import (  # noqa: E402
@@ -56,13 +57,47 @@ _ID_PATTERN = re.compile(r"^[A-Za-z0-9_]+__p\d{4}__c\d{2}__l\d{3}$")
 
 
 def _draw_three_column_page(size=(200, 300)) -> Image.Image:
-    """A synthetic page with 3 vertical ink blocks simulating text columns."""
+    """A synthetic page with 3 vertical ink blocks simulating text columns.
+
+    Each block is a horizontal-dash pattern (solid across the FULL block
+    width, on/off down its height), not a solid ``fill=0`` rectangle: a
+    solid-filled block has ink_fraction ~1.0 within its own bounding box,
+    which ``Model.ocr.segment.is_plausible_line`` (now wired into
+    ``build_annotation_pack``'s per-chunk filtering) correctly rejects as
+    indistinguishable from a solid scan-border/gutter-shadow artifact --
+    that rejection is exactly the new behavior this fixture must exercise
+    without tripping over.
+
+    Dashes, not a fine vertical stripe: this fixture is also exercised via
+    the REAL ``--pdf-dir`` path (``PdfDirEndToEndTest``), where the PNG is
+    embedded into a PDF page and re-rasterized by ``pdftoppm``/``fitz`` at a
+    different DPI (a ~2x upscale for the sizes/DPIs this test file uses) --
+    a fine 1px-on/2px-off vertical stripe is high-frequency detail that
+    upscarce resampling blurs below ``detect_line_columns``'s ink-density
+    floor (verified: it collapsed 3 columns into one whole-page fallback).
+    Being solid across the full block WIDTH keeps column detection exactly
+    as robust as the original solid fixture; being dashed down the HEIGHT
+    (coarse enough to survive the resample) keeps ink_fraction ~0.2-0.4,
+    comfortably inside is_plausible_line's plausible 0.015-0.55 band, in
+    both the direct-PNG (``--image-dir``) and PDF-roundtrip paths (both
+    verified empirically before committing to these constants).
+    """
     img = Image.new("L", size, 255)
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([20, 30, 45, 270], fill=0)
-    draw.rectangle([90, 40, 115, 260], fill=0)
-    draw.rectangle([160, 50, 180, 200], fill=0)
-    return img
+    arr = np.asarray(img).copy()
+
+    def _dashed_rect(
+        x0: int, x1: int, y0: int, y1: int, dash_on: int = 6, dash_period: int = 16
+    ) -> None:
+        y = y0
+        while y < y1:
+            y_end = min(y + dash_on, y1)
+            arr[y:y_end, x0:x1] = 0
+            y += dash_period
+
+    _dashed_rect(20, 45, 30, 270)
+    _dashed_rect(90, 115, 40, 260)
+    _dashed_rect(160, 180, 50, 200)
+    return Image.fromarray(arr, mode="L")
 
 
 # ===========================================================================
@@ -398,12 +433,25 @@ class ImageDirEndToEndTest(unittest.TestCase):
             manifest = self._run(
                 image_dir, out_dir, **{"--pages-per-doc": 6, "--lines-per-page": 8}
             )
-            # All-blank pages fall back to one whole-page column each -- not
-            # "no segmentation found" (that fallback exists precisely so a
-            # blank/noisy page doesn't crash the run), so every sampled page
-            # still yields exactly one line.
-            self.assertEqual(manifest["counts"]["n_pages_empty"], 0)
-            self.assertEqual(manifest["counts"]["n_lines"], 6)
+            # All-blank pages still fall back to one whole-page column each
+            # (detect_line_columns never raises/crashes on them) -- but that
+            # single fallback "column" chunk is itself pure white
+            # (ink_fraction 0), which is_plausible_line now correctly rejects
+            # as "blank" rather than emitting a useless-to-annotate blank
+            # line. Zero usable chunks survive filtering, so the page is
+            # counted the same as "no segmentation found" -- this manifest
+            # field means "contributed nothing to annotate", which is true
+            # here regardless of whether the cause was zero detected columns
+            # or (as here) columns detected but entirely blank content. This
+            # is the intended, and desired, effect of the new quality filter
+            # -- NOT a regression of the original "don't crash" guarantee,
+            # which the "run completes, no exception" assertion below still
+            # covers.
+            self.assertEqual(manifest["counts"]["n_pages_empty"], 6)
+            self.assertEqual(manifest["counts"]["n_lines"], 0)
+            self.assertEqual(
+                manifest["counts"]["rejections_by_reason"]["blank"], 6
+            )
 
     def test_stem_collision_across_pdf_dir_is_hard_error(self):
         with TemporaryDirectory() as tmp_s:

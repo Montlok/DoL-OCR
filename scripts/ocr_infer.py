@@ -268,8 +268,13 @@ def segment_page(
     Returns ``[{"column", "line", "box", "strip"}, ...]`` where ``box`` is
     ``[x0, y0, x1, y1]`` in page coordinates and ``strip`` is the cropped
     numpy array. Shared by :mod:`scripts.eval_l2_deploy` — single
-    implementation of the deployment segmentation order.
+    implementation of the deployment segmentation order. ``page``'s true
+    dimensions are forwarded to :func:`Model.ocr.segment.lines_from_column`
+    as ``page_w``/``page_h`` so its quality filter's width-vs-page-width
+    outlier check is active here (real page geometry is available, unlike
+    :mod:`scripts.eval_l2_deploy`'s synthetic reconstructed columns).
     """
+    page_h, page_w = page.shape
     columns = detect_columns(
         page,
         ink_threshold=ink_threshold,
@@ -280,12 +285,14 @@ def segment_page(
     records: list[dict] = []
     for ci, (x0, y0, x1, y1) in enumerate(order_columns(columns, column_order)):
         column = page[y0:y1, x0:x1]
-        spans = lines_from_column(
+        spans, _rejections = lines_from_column(
             column,
             target_line_px,
             ink_threshold=ink_threshold,
             valley_frac=valley_frac,
             min_height=min_line_height,
+            page_w=page_w,
+            page_h=page_h,
         )
         for li, (ly0, ly1) in enumerate(spans):
             records.append(
