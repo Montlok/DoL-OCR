@@ -172,6 +172,7 @@ _stage_frozen() {
         --data "$DATA" \
         --image-size "$IMAGE_SIZE" --n-image-tokens "$N_IMAGE_TOKENS" \
         --seq-len "$SEQ_LEN" \
+        --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
         --device cuda --precision bf16 \
         "${INIT_ARGS[@]}" \
         --freeze-rdt --steps "$FROZEN_STEPS" --batch-size 32 --grad-ckpt \
@@ -216,6 +217,7 @@ _stage_verify_tower_restore() {
         --data "$DATA" \
         --image-size "$IMAGE_SIZE" --n-image-tokens "$N_IMAGE_TOKENS" \
         --seq-len "$SEQ_LEN" \
+        --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
         --device cuda --precision bf16 \
         --init-omvt-checkpoint "$SSL_CHECKPOINT" --use-ema-tower \
         --freeze-rdt --steps 2 --batch-size 8 --grad-ckpt \
@@ -349,6 +351,7 @@ _stage_unfreeze() {
         --data "$DATA" \
         --image-size "$IMAGE_SIZE" --n-image-tokens "$N_IMAGE_TOKENS" \
         --seq-len "$SEQ_LEN" \
+        --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
         --device cuda --precision bf16 \
         --init-rdt-checkpoint "$final_ckpt" \
         --grad-ckpt --lr 2e-4 --warmup-steps 4000 --steps 120000 \
@@ -377,6 +380,7 @@ _stage_resume_unfreeze() {
         --data "$DATA" \
         --image-size "$IMAGE_SIZE" --n-image-tokens "$N_IMAGE_TOKENS" \
         --seq-len "$SEQ_LEN" \
+        --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
         --device cuda --precision bf16 \
         --grad-ckpt --lr 2e-4 --warmup-steps 4000 --steps 120000 \
         --batch-size 32 --save-every 5000 \
