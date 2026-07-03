@@ -224,8 +224,8 @@ _stage_verify_tower_restore() {
 
     echo "==> loading it the Phase 3b way and diffing vision.omvt.tower.*"
     SAVED_CKPT="$VERIFY_RUN_DIR/latest" \
-    IMAGE_SIZE="$IMAGE_SIZE" N_IMAGE_TOKENS="$N_IMAGE_TOKENS" \
-    D_VISION="$D_VISION" PATCH_PRESET="$PATCH_PRESET" SEQ_LEN="$SEQ_LEN" \
+    VT_IMAGE_SIZE="$IMAGE_SIZE" VT_N_IMAGE_TOKENS="$N_IMAGE_TOKENS" \
+    VT_D_VISION="$D_VISION" VT_PATCH_PRESET="$PATCH_PRESET" VT_SEQ_LEN="$SEQ_LEN" \
     "$PY" - <<'PYEOF'
 import os
 import sys
@@ -242,11 +242,11 @@ from Model.training.checkpoint import load_checkpoint
 from Model.training.multimodal_cli import make_omvt_cfg
 
 saved_ckpt = os.environ["SAVED_CKPT"]
-image_size = int(os.environ["IMAGE_SIZE"])
-n_image_tokens = int(os.environ["N_IMAGE_TOKENS"])
-d_vision = int(os.environ["D_VISION"])
-patch_preset = os.environ["PATCH_PRESET"]
-seq_len = int(os.environ["SEQ_LEN"])
+image_size = int(os.environ["VT_IMAGE_SIZE"])
+n_image_tokens = int(os.environ["VT_N_IMAGE_TOKENS"])
+d_vision = int(os.environ["VT_D_VISION"])
+patch_preset = os.environ["VT_PATCH_PRESET"]
+seq_len = int(os.environ["VT_SEQ_LEN"])
 
 # The tensors we compare against: the tower state as it was actually saved
 # inside the RDT checkpoint (vision.omvt.tower.* keys of model.pt).
