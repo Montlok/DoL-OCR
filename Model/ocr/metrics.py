@@ -35,6 +35,14 @@ We report three character error rates:
 
 Plus word accuracy (WER over whitespace tokens) and an exact line-match rate.
 
+A single blended CER hides *where* the errors are: a checkpoint mistranscribing
+every CJK gloss but nailing the Mongolian body text looks identical, in the
+headline number, to the reverse. :func:`script_bucket_cer` (surfaced on
+``OCRReport.script_cer``) splits grapheme CER by script — ``"mn"``/``"cjk"``/
+``"latin"``/``"other"`` (see :func:`script_of`) — by projecting each side down
+to one script's characters and scoring the projections independently; see
+that function's docstring for the method's cross-script-substitution caveat.
+
 This module is intentionally torch-free so it can be unit-tested without loading
 a model.
 """
@@ -235,6 +243,173 @@ def _corpus_rate(
     return rate, total_dist, total_len
 
 
+# Script-bucket boundaries for script_of/script_bucket_cer. Traditional
+# Mongolian ranges: the main Mongolian block (U+1800-18AF, which also holds
+# FVS/MVS) and the Mongolian Supplement block added for GB/T 25914-2023
+# (U+11660-1167F). NNBSP (U+202F) is bucketed as "mn" too even though its code
+# point is outside both blocks: it is the Mongolian-specific narrow no-break
+# space used as a word-boundary marker inside Mongolian text (see NNBSP in the
+# module docstring), so charging it to "other" would misattribute a
+# Mongolian-text error to an unrelated bucket.
+_MN_RANGES = ((0x1800, 0x18AF), (0x11660, 0x1167F))
+_MN_EXTRA = _FVS | _MVS | {_NNBSP}
+
+# CJK: unified ideograph blocks (BMP + extensions on common planes), CJK
+# punctuation, and fullwidth forms (fullwidth Latin/digits/punctuation used in
+# CJK typesetting count as "cjk", not "latin" — they are visually and
+# functionally CJK-context characters).
+_CJK_RANGES = (
+    (0x2E80, 0x2EFF),  # CJK Radicals Supplement
+    (0x3000, 0x303F),  # CJK Symbols and Punctuation
+    (0x3400, 0x4DBF),  # CJK Unified Ideographs Extension A
+    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
+    (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
+    (0xFF00, 0xFFEF),  # Halfwidth and Fullwidth Forms
+    (0x20000, 0x2A6DF),  # CJK Unified Ideographs Extension B
+)
+
+# Latin: ASCII letters/digits plus Latin-1 Supplement and Latin Extended-A/B
+# letters (accented Latin text). ASCII punctuation/space/symbols are "other",
+# not "latin" — only letters and digits count as this bucket's content.
+_LATIN_RANGES = (
+    (0x0041, 0x005A),  # ASCII A-Z
+    (0x0061, 0x007A),  # ASCII a-z
+    (0x0030, 0x0039),  # ASCII 0-9
+    (0x00C0, 0x00FF),  # Latin-1 Supplement letters (excludes × U+00D7, ÷ U+00F7)
+    (0x0100, 0x024F),  # Latin Extended-A + Extended-B
+)
+_LATIN_EXCLUDE = {0x00D7, 0x00F7}  # multiplication/division signs, not letters
+
+
+def _in_ranges(cp: int, ranges: tuple[tuple[int, int], ...]) -> bool:
+    return any(lo <= cp <= hi for lo, hi in ranges)
+
+
+def script_of(ch: str) -> str:
+    """Classify one character into a script bucket for error-rate breakdowns.
+
+    Returns one of:
+
+    - ``"mn"``: traditional Mongolian letters (main block + GB/T 25914-2023
+      Supplement block) plus FVS/MVS/NNBSP, which only occur embedded in
+      Mongolian text.
+    - ``"cjk"``: CJK unified ideographs (+ common extensions/compatibility
+      blocks), CJK punctuation, and fullwidth forms.
+    - ``"latin"``: ASCII letters/digits and accented Latin letters
+      (Latin-1 Supplement, Extended-A/B).
+    - ``"other"``: everything else — ASCII punctuation, whitespace, symbols,
+      and any script not called out above.
+
+    Classifies a single ``str`` character (one Python code point), not a
+    grapheme cluster; callers doing grapheme-unit bucketing classify by the
+    cluster's first character (its base letter carries the script identity —
+    combining marks/FVS do not change what script a cluster belongs to).
+    """
+    if len(ch) != 1:
+        raise ValueError(f"script_of expects a single character, got {ch!r}")
+    cp = ord(ch)
+    if cp in _MN_EXTRA or _in_ranges(cp, _MN_RANGES):
+        return "mn"
+    if _in_ranges(cp, _CJK_RANGES):
+        return "cjk"
+    if cp not in _LATIN_EXCLUDE and _in_ranges(cp, _LATIN_RANGES):
+        return "latin"
+    return "other"
+
+
+def _cluster_script(cluster: str) -> str:
+    """Script bucket for a grapheme cluster: the base (first) character's script."""
+    return script_of(cluster[0])
+
+
+def _project_bucket(units: list, bucket: str, unit: str) -> list:
+    """Keep only the elements of ``units`` (chars or grapheme clusters) whose
+    script is ``bucket``, preserving order."""
+    if unit == "grapheme":
+        return [u for u in units if _cluster_script(u) == bucket]
+    return [u for u in units if script_of(u) == bucket]
+
+
+def script_bucket_cer(
+    preds: Sequence[str],
+    refs: Sequence[str],
+    *,
+    normalize: bool = True,
+    backend: str = "auto",
+    unit: str = "grapheme",
+) -> dict[str, dict[str, float | int]]:
+    """Per-script-bucket CER: where do the errors live (mn/cjk/latin/other)?
+
+    For each bucket, both ``preds`` and ``refs`` are *projected* down to only
+    the characters/clusters classified into that bucket by :func:`script_of`
+    (order preserved within each sample), then scored with the same
+    micro-averaged corpus rate as :func:`cer` (:func:`_corpus_rate`).
+
+    This is a **filtering/projection** method, not an alignment of the full
+    pred/ref edit path split by bucket. It is deterministic and needs no
+    backtrace over the Levenshtein DP (this module has none), and it directly
+    answers "how well does the model transcribe bucket-B content" — but it
+    has one honest caveat: a cross-script substitution (e.g. a Mongolian
+    letter OCR'd as a similar-looking CJK character) is *not* attributed to a
+    single bucket's error count the way a true alignment would. Instead each
+    side contributes its own character to its own bucket's projected
+    sequence, so the error surfaces as an edit in *both* buckets' projections
+    (a "phantom" deletion in one, insertion in the other) rather than being
+    charged once to whichever bucket is "correct". For content that is
+    overwhelmingly single-script per bucket (the expected case for this
+    corpus) this does not matter; for heavily-interleaved or confused
+    cross-script content this can inflate two buckets' error rates for what
+    is really one mistake. Buckets with zero reference units are omitted
+    entirely (there is nothing to compute a rate over) rather than reported
+    as a misleading 0.0.
+
+    ``unit``: ``"grapheme"`` (default) buckets on :func:`grapheme_clusters`
+    output, classifying each cluster by its base character's script (see
+    :func:`_cluster_script`) — this matches the ``grapheme_cer`` headline
+    convention. ``"codepoint"`` buckets on raw characters instead.
+
+    Returns ``{bucket: {"cer": float, "n_ref": int}}``, one entry per bucket
+    with ``n_ref > 0`` among ``"mn"``, ``"cjk"``, ``"latin"``, ``"other"``.
+    """
+    if unit not in ("codepoint", "grapheme"):
+        raise ValueError(f"unknown unit {unit!r}; expected 'codepoint' or 'grapheme'")
+    if normalize:
+        preds, refs, _ = _fold_pair(preds, refs, backend=backend)
+    else:
+        preds, refs = list(preds), list(refs)
+
+    if unit == "grapheme":
+        pred_units = [grapheme_clusters(p) for p in preds]
+        ref_units = [grapheme_clusters(r) for r in refs]
+    else:
+        pred_units = [list(p) for p in preds]
+        ref_units = [list(r) for r in refs]
+
+    return _bucket_cer_from_units(pred_units, ref_units, unit=unit)
+
+
+def _bucket_cer_from_units(
+    pred_units: list[list[str]], ref_units: list[list[str]], *, unit: str
+) -> dict[str, dict[str, float | int]]:
+    """Shared core of :func:`script_bucket_cer`: bucket already-split
+    (grapheme or codepoint) unit lists and score each bucket's projection.
+
+    Split out so :func:`ocr_report` can reuse the grapheme clusters it
+    already computed for ``grapheme_cer`` instead of re-clustering the same
+    raw text a second time.
+    """
+    out: dict[str, dict[str, float | int]] = {}
+    for bucket in ("mn", "cjk", "latin", "other"):
+        bucket_preds = [_project_bucket(p, bucket, unit) for p in pred_units]
+        bucket_refs = [_project_bucket(r, bucket, unit) for r in ref_units]
+        n_ref = sum(len(r) for r in bucket_refs)
+        if n_ref == 0:
+            continue
+        rate, _, _ = _corpus_rate(bucket_preds, bucket_refs)
+        out[bucket] = {"cer": rate, "n_ref": n_ref}
+    return out
+
+
 def cer(
     preds: Sequence[str],
     refs: Sequence[str],
@@ -287,6 +462,7 @@ class OCRReport:
     line_exact: float
     rejection_rate: float
     backend: str
+    script_cer: dict[str, dict[str, float | int]] | None = None
 
 
 def ocr_report(
@@ -338,6 +514,10 @@ def ocr_report(
     )
     exact = sum(1 for p, r in zip(norm_p, norm_r) if p == r)
     line_exact = exact / len(keep) if keep else 0.0
+    # Reuse the same raw-text grapheme clusters as grapheme_cer above (same
+    # convention: unfolded text) rather than re-clustering via a second
+    # script_bucket_cer(..., unit="grapheme") call.
+    script_cer_map = _bucket_cer_from_units(grapheme_p, grapheme_r, unit="grapheme")
 
     return OCRReport(
         n=len(keep),
@@ -348,6 +528,7 @@ def ocr_report(
         line_exact=line_exact,
         rejection_rate=rejection_rate,
         backend=used_backend,
+        script_cer=script_cer_map,
     )
 
 
@@ -358,5 +539,7 @@ __all__ = [
     "grapheme_clusters",
     "nominal_normalize",
     "ocr_report",
+    "script_bucket_cer",
+    "script_of",
     "wer",
 ]

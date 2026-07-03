@@ -10,6 +10,8 @@ from Model.ocr.metrics import (
     grapheme_clusters,
     nominal_normalize,
     ocr_report,
+    script_bucket_cer,
+    script_of,
     wer,
 )
 
@@ -21,6 +23,8 @@ MVS = "\u180e"
 NNBSP = "\u202f"
 # A short traditional-Mongolian letter run (nominal code points).
 MONG = "\u182d\u1820\u1837"  # GA A RA
+# A short CJK run (Han characters) for script-bucket tests.
+HAN = "\u6c49\u5b57"  # \u6c49\u5b57 ("Chinese characters")
 
 
 class TestEditDistance(unittest.TestCase):
@@ -185,6 +189,92 @@ class TestOCRReport(unittest.TestCase):
             rep.grapheme_cer,
             cer(preds, refs, normalize=False, unit="grapheme"),
         )
+
+
+class TestScriptOf(unittest.TestCase):
+    def test_mongolian_letter_is_mn(self):
+        self.assertEqual(script_of(MONG[0]), "mn")
+
+    def test_fvs_is_mn(self):
+        self.assertEqual(script_of(FVS1), "mn")
+        self.assertEqual(script_of(FVS4), "mn")
+
+    def test_nnbsp_is_mn(self):
+        self.assertEqual(script_of(NNBSP), "mn")
+
+    def test_mvs_is_mn(self):
+        self.assertEqual(script_of(MVS), "mn")
+
+    def test_han_character_is_cjk(self):
+        self.assertEqual(script_of(HAN[0]), "cjk")
+
+    def test_cjk_punctuation_is_cjk(self):
+        self.assertEqual(script_of("、"), "cjk")  # IDEOGRAPHIC COMMA
+
+    def test_ascii_letter_and_digit_are_latin(self):
+        self.assertEqual(script_of("A"), "latin")
+        self.assertEqual(script_of("7"), "latin")
+
+    def test_ascii_punctuation_and_space_are_other(self):
+        self.assertEqual(script_of(","), "other")
+        self.assertEqual(script_of(" "), "other")
+
+    def test_rejects_multi_character_input(self):
+        with self.assertRaises(ValueError):
+            script_of("ab")
+
+
+class TestScriptBucketCER(unittest.TestCase):
+    def test_mn_perfect_cjk_one_error(self):
+        # Mongolian run identical on both sides; one Han substitution (子 ->
+        # 字) plus untouched Latin/digit/punctuation tails.
+        pred = [MONG + "汉子A1,"]
+        ref = [MONG + "汉字A1,"]
+        buckets = script_bucket_cer(pred, ref, backend="python")
+        self.assertAlmostEqual(buckets["mn"]["cer"], 0.0)
+        self.assertEqual(buckets["mn"]["n_ref"], len(MONG))
+        self.assertGreater(buckets["cjk"]["cer"], 0.0)
+        self.assertEqual(buckets["cjk"]["n_ref"], 2)
+        self.assertAlmostEqual(buckets["latin"]["cer"], 0.0)
+        self.assertAlmostEqual(buckets["other"]["cer"], 0.0)
+
+    def test_empty_bucket_omitted(self):
+        # Pure-Mongolian pair: cjk/latin/other buckets have n_ref == 0 and
+        # must not appear in the result at all.
+        buckets = script_bucket_cer([MONG], [MONG], backend="python")
+        self.assertEqual(set(buckets), {"mn"})
+        self.assertEqual(buckets["mn"]["n_ref"], len(MONG))
+
+    def test_unknown_unit_raises(self):
+        with self.assertRaises(ValueError):
+            script_bucket_cer(["a"], ["a"], unit="bogus")
+
+    def test_codepoint_unit_does_not_cluster(self):
+        # Under unit="codepoint", a base+FVS pair is two separate code points,
+        # both bucketed "mn" -- unlike unit="grapheme" where they merge into
+        # one cluster. normalize=False so the fold doesn't strip the FVS
+        # before bucketing. n_ref for "mn" should reflect 2 code points, not 1.
+        pred = [MONG[0] + FVS1]
+        ref = [MONG[0] + FVS1]
+        buckets = script_bucket_cer(pred, ref, normalize=False, unit="codepoint")
+        self.assertEqual(buckets["mn"]["n_ref"], 2)
+
+
+class TestOCRReportScriptCER(unittest.TestCase):
+    def test_script_cer_matches_direct_call(self):
+        preds = [MONG + "汉子A1,", "abc"]
+        refs = [MONG + "汉字A1,", "abd"]
+        rep = ocr_report(preds, refs, backend="python")
+        # script_cer is computed on the same RAW (unfolded) kept texts as
+        # grapheme_cer, so it must equal a direct script_bucket_cer call with
+        # normalize=False on the same pairs.
+        direct = script_bucket_cer(preds, refs, normalize=False, unit="grapheme")
+        self.assertEqual(rep.script_cer, direct)
+
+    def test_script_cer_is_populated_by_default(self):
+        rep = ocr_report([MONG], [MONG], backend="python")
+        self.assertIsNotNone(rep.script_cer)
+        self.assertEqual(set(rep.script_cer), {"mn"})
 
 
 if __name__ == "__main__":

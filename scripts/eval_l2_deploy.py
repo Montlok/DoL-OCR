@@ -27,9 +27,10 @@ supervised target ids. Rows are grouped in file order; a trailing partial
 group is dropped (reported).
 
 Reported: headline ``ocr_report`` numbers over concatenated columns,
-per-column grapheme-CER distribution, n-lines-recovered stats (the segmenter
-is not told K), and an index-0 spot check (decoded text only — never
-confidence proxies).
+per-script-bucket grapheme CER (mn/cjk/latin/other, see
+:func:`Model.ocr.metrics.script_bucket_cer`), per-column grapheme-CER
+distribution, n-lines-recovered stats (the segmenter is not told K), and an
+index-0 spot check (decoded text only — never confidence proxies).
 
 Usage::
 
@@ -69,6 +70,7 @@ from scripts.eval_vlm_ocr import (  # noqa: E402
     _decode_batches,
     _load_rows,
     _pixel_batch,
+    print_script_cer,
 )
 from scripts.ocr_infer import (  # noqa: E402
     autocast_ctx_for,
@@ -299,6 +301,7 @@ def main(argv=None) -> int:
         f"wer={rep.wer:.4f} column_exact={rep.line_exact:.4f} "
         f"(backend={rep.backend})"
     )
+    print_script_cer("[l2]", rep)
     per_col = [per_sample_grapheme_cer(p, r) for p, r in zip(preds, refs)]
     print(f"[l2] per-column grapheme CER: {_percentiles(per_col)}")
 

@@ -160,6 +160,23 @@ def _cut_continuation(seq: list[int]) -> list[int]:
     return [t for t in seq if t != PAD_ID]
 
 
+def print_script_cer(tag: str, rep) -> None:
+    """Print one compact line per non-empty script bucket in ``rep.script_cer``.
+
+    Shared by :mod:`scripts.eval_vlm_ocr` and :mod:`scripts.eval_l2_deploy` so
+    the two CLIs report per-script CER in the same format. Buckets with
+    ``n_ref == 0`` are already omitted from ``rep.script_cer`` (see
+    :func:`Model.ocr.metrics.script_bucket_cer`), so nothing to skip here.
+    """
+    if not rep.script_cer:
+        return
+    for bucket, stats in rep.script_cer.items():
+        print(
+            f"{tag} script={bucket} grapheme_cer={stats['cer']:.4f} "
+            f"n_ref={stats['n_ref']}"
+        )
+
+
 @torch.no_grad()
 def _decode_batches(model, prompts, pixel_fn, args, device, autocast_ctx):
     """Generate continuations for uniform-length prompt rows.
@@ -310,6 +327,7 @@ def main(argv=None) -> int:
         f"norm_cer={rep.norm_cer:.4f} raw_cer={rep.raw_cer:.4f} "
         f"wer={rep.wer:.4f} line_exact={rep.line_exact:.4f}"
     )
+    print_script_cer("[eval]", rep)
 
     preds_blank = None
     if args.blank_baseline:
@@ -327,6 +345,7 @@ def main(argv=None) -> int:
             f"norm_cer={rep_blank.norm_cer:.4f} "
             f"raw_cer={rep_blank.raw_cer:.4f} wer={rep_blank.wer:.4f}"
         )
+        print_script_cer("[eval/blank]", rep_blank)
         print(
             "[eval] visual contribution (blank_cer - real_cer): "
             f"{rep_blank.norm_cer - rep.norm_cer:+.4f}"
