@@ -32,6 +32,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -324,6 +325,7 @@ def save_checkpoint(
     *,
     d_vision: int,
     hidden: int,
+    tower: OMVTVisionTower | None = None,
 ) -> Path:
     out = Path(output)
     step_dir = out / f"step_{step:08d}"
@@ -333,6 +335,7 @@ def save_checkpoint(
         "head": head.state_dict(),
         "optimizer": optimizer.state_dict(),
         "omvt_config": asdict(omvt_cfg),
+        **({"tower_state": tower.state_dict()} if tower is not None else {}),
         "byte_vocab": {
             "n_byte_classes": N_BYTE_CLASSES,
             "blank_id": BLANK_ID,
@@ -376,11 +379,15 @@ def load_checkpoint_into(
     path: str | Path,
     head: CTCHead,
     optimizer: torch.optim.Optimizer | None = None,
+    tower: "OMVTVisionTower | None" = None,
 ) -> int:
     payload = load_ctc_payload(path)
     head.load_state_dict(payload["head"])
     if optimizer is not None and payload.get("optimizer") is not None:
         optimizer.load_state_dict(payload["optimizer"])
+    if tower is not None and payload.get("tower_state") is not None:
+        tower.load_state_dict(payload["tower_state"])
+        print("[ctc-head] restored fine-tuned tower_state from checkpoint")
     return int(payload.get("step", 0))
 
 
@@ -402,6 +409,13 @@ def parse_args(argv=None):
     )
     p.add_argument("--output", default="outputs/ctc_head")
     p.add_argument("--resume", default="")
+    p.add_argument(
+        "--unfreeze-tower",
+        action="store_true",
+        help="fine-tune the tower jointly (param group at --tower-lr-scale x lr); "
+        "checkpoints then carry 'tower_state' and eval must use it",
+    )
+    p.add_argument("--tower-lr-scale", type=float, default=0.1)
 
     p.add_argument("--hidden", type=int, default=384, help="BiLSTM hidden size (per direction)")
     p.add_argument("--lr", type=float, default=3e-4)
@@ -469,6 +483,7 @@ def _train_step(
     batch: dict[str, torch.Tensor],
     device: torch.device,
     use_bf16: bool,
+    tower_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One forward: frozen-tower features (no grad) -> head -> CTC loss.
 
@@ -477,7 +492,8 @@ def _train_step(
     """
 
     pixels = batch["pixels"].to(device)
-    with torch.no_grad():
+    grad_ctx = contextlib.nullcontext() if tower_grad else torch.no_grad()
+    with grad_ctx:
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
         ):
@@ -608,7 +624,17 @@ def main(argv=None) -> int:
     )
 
     head = CTCHead(d_vision=omvt_cfg.d_vision, hidden=args.hidden).to(device)
-    print(f"[ctc-head] trainable params: {num_trainable_params(head):,}")
+    if args.unfreeze_tower:
+        for prm in tower.parameters():
+            prm.requires_grad_(True)
+        tower.train()
+        print(
+            f"[ctc-head] tower UNFROZEN (lr x{args.tower_lr_scale}); trainable "
+            f"params: head={num_trainable_params(head):,} "
+            f"tower={num_trainable_params(tower):,}"
+        )
+    else:
+        print(f"[ctc-head] trainable params: {num_trainable_params(head):,}")
 
     dataset = CTCOcrDataset(
         args.data,
@@ -630,12 +656,27 @@ def main(argv=None) -> int:
     batch_iter = iter(loader)
 
     train_cfg = _build_scheduler_cfg(args)
-    optimizer = build_optimizer(head, train_cfg)
+    if args.unfreeze_tower:
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": head.parameters(), "lr": args.lr},
+                {"params": tower.parameters(), "lr": args.lr * args.tower_lr_scale},
+            ],
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = build_optimizer(head, train_cfg)
     scheduler = build_scheduler(optimizer, train_cfg)
+    clip_module = (
+        torch.nn.ModuleList([head, tower]) if args.unfreeze_tower else head
+    )
 
     start_step = 0
     if args.resume:
-        start_step = load_checkpoint_into(args.resume, head, optimizer)
+        start_step = load_checkpoint_into(
+            args.resume, head, optimizer,
+            tower=tower if args.unfreeze_tower else None,
+        )
         for _ in range(start_step):
             scheduler.step()
         print(f"[ctc-head] resumed from step {start_step}")
@@ -648,13 +689,15 @@ def main(argv=None) -> int:
     for step in range(start_step + 1, args.steps + 1):
         last_step = step
         batch = next(batch_iter)
-        loss, logits, features = _train_step(tower, head, batch, device, use_bf16)
+        loss, logits, features = _train_step(
+            tower, head, batch, device, use_bf16, tower_grad=args.unfreeze_tower
+        )
         if not bool(torch.isfinite(loss.detach())):
             raise FloatingPointError(f"non-finite CTC loss at step {step}")
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        grad_norm = clip_or_check_grad_norm(head, args.grad_clip, step=step)
+        grad_norm = clip_or_check_grad_norm(clip_module, args.grad_clip, step=step)
         optimizer.step()
         scheduler.step()
 
@@ -671,6 +714,7 @@ def main(argv=None) -> int:
             save_checkpoint(
                 args.output, step, head, optimizer, omvt_cfg,
                 d_vision=omvt_cfg.d_vision, hidden=args.hidden,
+                tower=tower if args.unfreeze_tower else None,
             )
             if dataset.n_skipped_long:
                 print(f"[ctc-head] rows skipped (target > {omvt_cfg.compress_to} bytes): "
@@ -679,6 +723,7 @@ def main(argv=None) -> int:
     save_checkpoint(
         args.output, last_step, head, optimizer, omvt_cfg,
         d_vision=omvt_cfg.d_vision, hidden=args.hidden,
+        tower=tower if args.unfreeze_tower else None,
     )
     logger.close()
     dt = time.time() - t0

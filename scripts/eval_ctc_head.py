@@ -176,6 +176,11 @@ def main(argv=None) -> int:
     if use_ema:
         print("[eval] using EMA tower weights")
     tower.load_state_dict(tower_state_from_payload(omvt_payload, use_ema=use_ema))
+    if payload.get("tower_state") is not None:
+        # A jointly fine-tuned run saved its own tower; that supersedes the
+        # SSL weights or the eval would silently score the wrong vision.
+        tower.load_state_dict(payload["tower_state"])
+        print("[eval] using fine-tuned tower_state from CTC checkpoint")
     for p in tower.parameters():
         p.requires_grad_(False)
 
