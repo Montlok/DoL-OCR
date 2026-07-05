@@ -8,6 +8,17 @@
 # invocation and must never run while a GPU process is alive.
 set -euo pipefail
 
+# Two phases, gated by $1:
+#   prep    steps 0-3 (stop CTC, val check, build, probe) -- ends after the
+#           probe so the step budget is recomputed from measured s/step
+#           BEFORE any long run starts
+#   train   steps 4-5 (launch full run, print sentinel gate instructions)
+PHASE="${1:-}"
+if [ "$PHASE" != "prep" ] && [ "$PHASE" != "train" ]; then
+    echo "usage: $0 {prep|train}" >&2
+    exit 2
+fi
+
 REPO="${REPO:-$HOME/DoL-OCR}"
 DATA="$HOME/dolocr/data_v1"
 RUNS="$HOME/dolocr/runs"
@@ -18,6 +29,8 @@ EVICT="${EVICT:-python3 $HOME/dolocr/evict_cache.py}"
 ALIGN_GLOB="${ALIGN_GLOB:-align_*.jsonl}"     # must not match val/test files
 
 cd "$REPO"
+
+if [ "$PHASE" = "prep" ]; then
 
 echo "=== step 0: stop CTC training (user order) ==="
 pkill -f "scripts.train_ctc_head" || true
@@ -83,7 +96,9 @@ echo "=== step 3: throughput probe (100 joint steps) ==="
 DATA="$DATA" RUNS="$RUNS" SSL_CHECKPOINT="$SSL" EVICT="$EVICT" \
     ALIGN_GLOB="$ALIGN_GLOB" MICRO="${MICRO:-8}" ACCUM="${ACCUM:-2}" \
     bash scripts/run_dol_ocr_joint.sh probe
-# STOP HERE. Report s/step, recompute the step budget, then launch step 4.
+echo "PREP_DONE. Report s/step above, recompute the step budget, then run: $0 train"
+exit 0
+fi
 
 echo "=== step 4: launch full joint run (background) ==="
 nohup env DATA="$DATA" RUNS="$RUNS" SSL_CHECKPOINT="$SSL" EVICT="$EVICT" \
