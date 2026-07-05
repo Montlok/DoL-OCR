@@ -77,12 +77,14 @@ _log() {
 
 _real_cer() {
     # grapheme_cer from the real-image aggregate line: "[eval] n=... grapheme_cer=..."
-    grep '^\[eval\] n=' "$1" | grep -o "grapheme_cer=[0-9.]*" | head -1 | cut -d= -f2
+    # `|| true`: under pipefail a no-match grep would otherwise kill the
+    # sentinel via set -e; empty output is handled by the caller.
+    grep '^\[eval\] n=' "$1" 2>/dev/null | grep -o "grapheme_cer=[0-9.]*" | head -1 | cut -d= -f2 || true
 }
 
 _blank_cer() {
     # grapheme_cer from the blank-baseline aggregate line: "[eval/blank] n=..."
-    grep '^\[eval/blank\] n=' "$1" | grep -o "grapheme_cer=[0-9.]*" | head -1 | cut -d= -f2
+    grep '^\[eval/blank\] n=' "$1" 2>/dev/null | grep -o "grapheme_cer=[0-9.]*" | head -1 | cut -d= -f2 || true
 }
 
 _stop_training() {
@@ -113,6 +115,9 @@ below_count=0
 best_contrib="-1e9"
 if [ -f "$BEST_FILE" ]; then
     best_contrib="$(cut -d' ' -f1 "$BEST_FILE" 2>/dev/null || echo "-1e9")"
+    case "$best_contrib" in
+        ''|*[!0-9.eE+-]*) best_contrib="-1e9" ;;
+    esac
 fi
 _log "watching $RUN_DIR (limit=$LIMIT poll=${POLL_SEC}s once=$ONCE stop_below=${STOP_BELOW:-off} best=$best_contrib)"
 
@@ -136,6 +141,7 @@ while true; do
             >"$out" 2>&1
         rc=$?
         set -e
+        eval_ok=0
         if [ "$rc" -ne 0 ]; then
             _log "$tag eval FAILED (rc=$rc), see $out"
         else
@@ -144,6 +150,7 @@ while true; do
             if [ -z "$real_cer" ] || [ -z "$blank_cer" ]; then
                 _log "$tag eval output missing aggregate lines (real='$real_cer' blank='$blank_cer'), see $out"
             else
+                eval_ok=1
                 contrib="$("$PY" -c "print(f'{(${blank_cer} - ${real_cer}) * 100:.1f}')")"
                 _log "$tag real_cer=$real_cer blank_cer=$blank_cer contribution=${contrib}pts"
                 is_best="$("$PY" -c "print(1 if $best_contrib < $contrib else 0)")"
@@ -172,9 +179,9 @@ while true; do
             fi
         fi
         if [ "$ONCE" = "1" ]; then
-            if [ "$rc" -ne 0 ]; then
-                _log "ONCE mode: eval failed (rc=$rc)"
-                exit "$rc"
+            if [ "$eval_ok" != "1" ]; then
+                _log "ONCE mode: eval unusable (rc=$rc, parse=$eval_ok)"
+                exit 5
             fi
             _log "ONCE mode: exiting after one evaluation"
             exit 0
