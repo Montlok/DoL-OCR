@@ -74,7 +74,12 @@ def extract_target(row: dict) -> list[int]:
         split += 1
     if split == 0 or split == len(labels):
         raise ValueError("row has no masked prompt or no supervised tail")
+    tail_labels = [int(t) for t in labels[split:]]
+    if any(t == IGNORE_INDEX for t in tail_labels):
+        raise ValueError("supervised tail is not contiguous (IGNORE after split)")
     target = [int(t) for t in input_ids[split:]]
+    if tail_labels != target:
+        raise ValueError("labels tail != input_ids tail (shifted rows?)")
     bad = FORBIDDEN_IDS.intersection(target)
     if bad:
         raise ValueError(f"target contains forbidden ids: {sorted(bad)}")

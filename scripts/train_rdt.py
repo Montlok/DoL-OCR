@@ -139,6 +139,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--save-every", type=int, default=1000)
+    p.add_argument(
+        "--keep-last-n",
+        type=int,
+        default=None,
+        help="periodic-checkpoint retention (default: TrainingConfig value; "
+        "0 keeps everything). Size the run's disk budget before raising.",
+    )
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--eval-max-batches", type=int, default=32)
@@ -377,6 +384,7 @@ def _build_train_cfg(args: argparse.Namespace, model_cfg: RDTConfig) -> Training
         seed=args.seed,
         resume=args.resume,
         resume_skip_data=not args.no_resume_skip_data,
+        **({"keep_last_n": args.keep_last_n} if args.keep_last_n is not None else {}),
     )
 
 
