@@ -31,7 +31,15 @@
 #   CKPT_KEEP      long-lived checkpoint root (required for frozen/unfreeze)
 #   EVICT          page-cache evict command, run before every GPU stage
 #                  (default: "true"; the box sets this to its evict_cache.py)
-#   FROZEN_STEPS   Phase 3a step count (default: 2000)
+#   RUN_TAG        run-dir generation tag (default: v2). v1 dirs are the
+#                  from-scratch-LM line, kept for comparison.
+#   SSL_CHECKPOINT Phase 1 SSL tower checkpoint (required for frozen)
+#   RDT_CHECKPOINT text-pretraining checkpoint to init the LM side
+#                  (required for frozen; see run_dol_ocr_phase2_text.sh)
+#   FROZEN_STEPS   Phase 3a step count (default: 6000)
+#   UNFREEZE_LR    Phase 3b learning rate (default: 6e-5)
+#   UNFREEZE_WARMUP / UNFREEZE_STEPS / UNFREEZE_SAVE_EVERY
+#                  Phase 3b schedule (defaults: 2000 / 40000 / 2000)
 #   KEEP_LAST_N    checkpoint-pruning helper: how many most-recent step dirs
 #                  to keep, in addition to every-25000 milestones (default: 3)
 
@@ -42,8 +50,15 @@ cd "$ROOT"
 
 PY="${PY:-python3}"
 EVICT="${EVICT:-true}"
-FROZEN_STEPS="${FROZEN_STEPS:-2000}"
+FROZEN_STEPS="${FROZEN_STEPS:-6000}"
 KEEP_LAST_N="${KEEP_LAST_N:-3}"
+# Run-dir generation tag: v1 dirs belong to the from-scratch-LM run line and
+# are kept for comparison; v2 is the text-cold-start line (RDT_CHECKPOINT).
+RUN_TAG="${RUN_TAG:-v2}"
+UNFREEZE_LR="${UNFREEZE_LR:-6e-5}"
+UNFREEZE_WARMUP="${UNFREEZE_WARMUP:-2000}"
+UNFREEZE_STEPS="${UNFREEZE_STEPS:-40000}"
+UNFREEZE_SAVE_EVERY="${UNFREEZE_SAVE_EVERY:-2000}"
 
 # ---------------------------------------------------------------------------
 # Geometry: single source of truth. Every invocation below derives its flags
@@ -71,9 +86,9 @@ if [ -z "${RUNS:-}" ]; then
     exit 2
 fi
 
-FROZEN_RUN_DIR="$RUNS/align_frozen_v1"
-UNFREEZE_RUN_DIR="$RUNS/align_unfreeze_v1"
-VERIFY_RUN_DIR="$RUNS/verify_tower_restore"
+FROZEN_RUN_DIR="$RUNS/align_frozen_$RUN_TAG"
+UNFREEZE_RUN_DIR="$RUNS/align_unfreeze_$RUN_TAG"
+VERIFY_RUN_DIR="$RUNS/verify_tower_restore_$RUN_TAG"
 mkdir -p "$RUNS"
 
 _require_data() {
@@ -148,10 +163,16 @@ _stage_frozen() {
              "Phase 2 SSL 'latest' checkpoint path" >&2
         exit 2
     fi
+    if [ -z "${RDT_CHECKPOINT:-}" ]; then
+        echo "run_dol_ocr_phase3: RDT_CHECKPOINT env var must be set to the " \
+             "text-pretraining 'latest' checkpoint (freezing a random LM is " \
+             "not a meaningful alignment target; that is the v1 failure mode)" >&2
+        exit 2
+    fi
     _check_no_prior_failure "$FROZEN_RUN_DIR"
     mkdir -p "$FROZEN_RUN_DIR"
     local done_marker="$FROZEN_RUN_DIR/.done"
-    local final_ckpt="$CKPT_KEEP/align_frozen_final"
+    local final_ckpt="$CKPT_KEEP/align_frozen_final_$RUN_TAG"
 
     if [ -f "$done_marker" ] && [ -d "$final_ckpt" ]; then
         echo "frozen stage already done ($final_ckpt exists), skipping"
@@ -161,7 +182,10 @@ _stage_frozen() {
 
     bash -c "$EVICT"
     RESUME_ARGS=()
-    INIT_ARGS=(--init-omvt-checkpoint "$SSL_CHECKPOINT" --use-ema-tower)
+    INIT_ARGS=(
+        --init-omvt-checkpoint "$SSL_CHECKPOINT" --use-ema-tower
+        --init-rdt-checkpoint "$RDT_CHECKPOINT"
+    )
     if [ -e "$FROZEN_RUN_DIR/latest" ]; then
         echo "found existing $FROZEN_RUN_DIR/latest, resuming (dropping --init flags)"
         RESUME_ARGS=(--resume "$FROZEN_RUN_DIR/latest")
@@ -323,7 +347,7 @@ PYEOF
 _stage_unfreeze() {
     _require_data
     _require_ckpt_keep
-    local final_ckpt="$CKPT_KEEP/align_frozen_final"
+    local final_ckpt="$CKPT_KEEP/align_frozen_final_$RUN_TAG"
     if [ ! -d "$final_ckpt" ]; then
         echo "run_dol_ocr_phase3: $final_ckpt does not exist; run the " \
              "'frozen' stage first" >&2
@@ -354,8 +378,9 @@ _stage_unfreeze() {
         --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
         --device cuda --precision bf16 \
         --init-rdt-checkpoint "$final_ckpt" \
-        --grad-ckpt --lr 2e-4 --warmup-steps 4000 --steps 120000 \
-        --batch-size 32 --save-every 5000 \
+        --grad-ckpt --lr "$UNFREEZE_LR" --warmup-steps "$UNFREEZE_WARMUP" \
+        --steps "$UNFREEZE_STEPS" \
+        --batch-size 32 --save-every "$UNFREEZE_SAVE_EVERY" \
         --output "$UNFREEZE_RUN_DIR"
     trap - ERR
     echo "run_dol_ocr_phase3: unfreeze OK -> $UNFREEZE_RUN_DIR"
@@ -382,8 +407,9 @@ _stage_resume_unfreeze() {
         --seq-len "$SEQ_LEN" \
         --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
         --device cuda --precision bf16 \
-        --grad-ckpt --lr 2e-4 --warmup-steps 4000 --steps 120000 \
-        --batch-size 32 --save-every 5000 \
+        --grad-ckpt --lr "$UNFREEZE_LR" --warmup-steps "$UNFREEZE_WARMUP" \
+        --steps "$UNFREEZE_STEPS" \
+        --batch-size 32 --save-every "$UNFREEZE_SAVE_EVERY" \
         --output "$UNFREEZE_RUN_DIR" \
         --resume "$UNFREEZE_RUN_DIR/latest"
     trap - ERR
