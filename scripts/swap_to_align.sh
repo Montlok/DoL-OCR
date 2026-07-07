@@ -53,7 +53,8 @@ _resume_pretrain() {
     fi
     LOG "resuming pretraining from $PRETRAIN_RUN/latest"
     local before
-    before=$(grep -c "step=" "$HOME/dolocr/mn_pretrain_v1.log" 2>/dev/null || echo 0)
+    before=$(grep -c "step=" "$HOME/dolocr/mn_pretrain_v1.log" 2>/dev/null || true)
+    before=${before:-0}
     nohup "$V" -m scripts.train_rdt \
         --config two_stage_pretrain --mamba official \
         --data "$PRETRAIN_DATA/mn_part_*.jsonl" \
@@ -67,8 +68,8 @@ _resume_pretrain() {
         --output "$PRETRAIN_RUN" --resume "$PRETRAIN_RUN/latest" \
         >> "$HOME/dolocr/mn_pretrain_v1.log" 2>&1 &
     LOG "PRETRAIN_PID=$! -- verifying liveness (fast-forward takes minutes)"
-    local waited=0
-    while [ "$waited" -lt 900 ]; do
+    local waited=0 ff_seen=0
+    while [ "$waited" -lt 1800 ]; do
         sleep 60
         waited=$((waited + 60))
         if ! pgrep -f "scripts\.train_rdt" >/dev/null 2>&1; then
@@ -77,14 +78,19 @@ _resume_pretrain() {
             return 1
         fi
         local now
-        now=$(grep -c "step=" "$HOME/dolocr/mn_pretrain_v1.log" 2>/dev/null || echo 0)
+        now=$(grep -c "step=" "$HOME/dolocr/mn_pretrain_v1.log" 2>/dev/null || true)
+        now=${now:-0}
         if [ "$now" -gt "$before" ]; then
             LOG "resume verified: new step lines appearing"
             return 0
         fi
+        if [ "$ff_seen" = "0" ] && tail -3 "$HOME/dolocr/mn_pretrain_v1.log" 2>/dev/null \
+                | grep -q "resume fast-forward"; then
+            ff_seen=1
+            LOG "fast-forward in progress (data replay); still waiting for first step line"
+        fi
     done
-    LOG "resume liveness unconfirmed after 15min (process alive, no step line yet"
-    LOG "-- fast-forward of ~18k batches can take this long; check panel.sh)"
+    LOG "resume liveness unconfirmed after 30min (process alive, no step line yet); check panel.sh"
     return 0
 }
 

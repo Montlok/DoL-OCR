@@ -51,7 +51,7 @@ tail -f ~/dolocr/swap.log                                        # 看进度
 # FROZEN_STEPS=3000 / SKIP_GEN=1 可加在 nohup env 前
 ```
 
-任何一步失败,链的退出钩子会自动恢复预训练(幂等,绝不双开);恢复后会验证新 step 行出现才算成功。
+任何一步失败,链的退出钩子会自动恢复预训练(幂等,绝不双开);恢复后验证进程存活并等待推进证据(fast-forward 进度或新 step 行),30 分钟内未确认会提示人工看 panel.sh,进程死亡则以非零退出。
 
 结果判读(`~/dolocr/runs/align_frozen_v2/sentinel.log` 最后一行):
 
