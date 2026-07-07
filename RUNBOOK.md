@@ -45,10 +45,13 @@ RESUME_ONLY=1 bash scripts/swap_to_align.sh
 一条命令:优雅停预训练 → 清缓存 → val 泄漏检查 → 生成验证 → 冻结对齐 6000 步(约 7h)→ 哨兵评测 → 自动恢复预训练。总计约 8 小时,预训练无损。
 
 ```bash
-cd ~/DoL-OCR && bash scripts/swap_to_align.sh          # 全链
-# FROZEN_STEPS=3000 bash scripts/swap_to_align.sh      # 缩短对齐(粗验证)
-# SKIP_GEN=1 ...                                        # 跳过生成验证
+cd ~/DoL-OCR
+nohup bash scripts/swap_to_align.sh > ~/dolocr/swap.log 2>&1 &   # 全链(必须 nohup:ssh 断开不孤儿化)
+tail -f ~/dolocr/swap.log                                        # 看进度
+# FROZEN_STEPS=3000 / SKIP_GEN=1 可加在 nohup env 前
 ```
+
+任何一步失败,链的退出钩子会自动恢复预训练(幂等,绝不双开);恢复后会验证新 step 行出现才算成功。
 
 结果判读(`~/dolocr/runs/align_frozen_v2/sentinel.log` 最后一行):
 
