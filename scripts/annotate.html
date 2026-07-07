@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>DoL 蒙文行转写标注</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root { --fg: #1a1a1a; --muted: #777; --line: #ddd; --accent: #2456a6; }
+  body { font-family: -apple-system, "PingFang SC", sans-serif; color: var(--fg); height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 10px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin-right: 8px; }
+  header .spacer { flex: 1; }
+  button, label.btn { font-size: 13px; padding: 6px 12px; border: 1px solid var(--line); background: #fff; border-radius: 6px; cursor: pointer; }
+  button:hover, label.btn:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #progress { font-size: 13px; color: var(--muted); }
+  main { flex: 1; display: flex; min-height: 0; }
+  #imgpane { flex: 1; display: flex; align-items: center; justify-content: center; background: #f4f4f2; overflow: auto; position: relative; }
+  #imgpane img { max-height: 92%; max-width: 92%; image-rendering: auto; box-shadow: 0 1px 8px rgba(0,0,0,.15); background: #fff; transition: transform .15s; }
+  #imgpane img.rot { transform: rotate(90deg); max-height: 60%; }
+  #imgpane .imgmeta { position: absolute; top: 8px; left: 12px; font-size: 12px; color: var(--muted); }
+  #editpane { width: 420px; border-left: 1px solid var(--line); display: flex; flex-direction: column; padding: 14px; gap: 10px; }
+  #vertical { flex: 1; min-height: 80px; border: 1px dashed var(--line); border-radius: 6px; padding: 10px;
+              writing-mode: vertical-lr; font-size: 26px; line-height: 1.9; overflow: auto;
+              font-family: "Noto Sans Mongolian", "Menk Qagan Tig", "Mongolian Baiti", sans-serif; }
+  textarea#text { height: 110px; font-size: 22px; padding: 10px; border: 1px solid var(--line); border-radius: 6px; resize: none;
+                  font-family: "Noto Sans Mongolian", "Menk Qagan Tig", "Mongolian Baiti", sans-serif; }
+  input#notes { font-size: 13px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; }
+  #editpane .row { display: flex; gap: 8px; }
+  #editpane .row button { flex: 1; }
+  .hint { font-size: 12px; color: var(--muted); line-height: 1.5; }
+  #welcome { margin: auto; max-width: 560px; padding: 24px; line-height: 1.8; font-size: 14px; }
+  #welcome ol { margin-left: 20px; }
+  .done-badge { color: #17803d; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>蒙文行转写</h1>
+  <label class="btn">选 pack 文件夹<input type="file" id="dir" webkitdirectory multiple hidden></label>
+  <label class="btn">导入 TSV 预填<input type="file" id="tsvin" accept=".tsv,.txt" hidden></label>
+  <button id="export" class="primary">导出 TSV</button>
+  <button id="rot">旋转</button>
+  <button id="nextun">下一个未标</button>
+  <span id="progress"></span>
+  <span class="spacer"></span>
+  <span class="hint">Enter 保存下一张 / Cmd+← → 翻页</span>
+</header>
+<main>
+  <div id="imgpane">
+    <div id="welcome">
+      <p><b>使用步骤</b></p>
+      <ol>
+        <li>把 box 上的 <code>~/dolocr/annotation_pack_v1</code> 整个拉到本机(命令见 RUNBOOK)。</li>
+        <li>点「选 pack 文件夹」,选中 <code>annotation_pack_v1</code> 根目录(含 sheets/ 与 lines/)。</li>
+        <li>看图打字:输入框在右侧,上方竖排框实时预览你输入的文本,和图对着核。</li>
+        <li>Enter = 保存并跳下一张;进度自动存在浏览器里(localStorage),关页面不丢。</li>
+        <li>图片糊/裂/切坏:转写留空,notes 里写 <code>bad</code>,Enter 跳过。</li>
+        <li>标完点「导出 TSV」,把下载的文件发回(格式与 annotator_A.tsv 相同)。</li>
+      </ol>
+      <p class="hint">编码提示:任意蒙文输入法均可,提交后会统一跑 nominal-Unicode 归一化校验,不必手工处理编码。</p>
+    </div>
+    <img id="img" hidden>
+    <div class="imgmeta" id="imgmeta"></div>
+  </div>
+  <div id="editpane" hidden>
+    <div id="vertical"></div>
+    <textarea id="text" placeholder="在此输入该行转写…" spellcheck="false"></textarea>
+    <input id="notes" placeholder="notes(可空;图裂写 bad)">
+    <div class="row">
+      <button id="prev">← 上一张</button>
+      <button id="save" class="primary">保存并下一张 (Enter)</button>
+    </div>
+    <div class="hint" id="rowinfo"></div>
+  </div>
+</main>
+<script>
+"use strict";
+let rows = [];            // {id, rel, text, notes, done}
+let files = new Map();    // relpath -> File
+let cur = 0;
+const LS_KEY = "dol_annot_v1";
+
+const $ = (id) => document.getElementById(id);
+
+function lsLoad() { try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch { return {}; } }
+function lsSave() {
+  const m = {};
+  for (const r of rows) if (r.done) m[r.id] = { t: r.text, n: r.notes };
+  localStorage.setItem(LS_KEY, JSON.stringify(m));
+}
+
+$("dir").addEventListener("change", (e) => {
+  files.clear();
+  let tsvFile = null;
+  for (const f of e.target.files) {
+    const rel = f.webkitRelativePath.split("/").slice(1).join("/");
+    files.set(rel, f);
+    if (rel === "sheets/annotator_A.tsv") tsvFile = f;
+  }
+  if (!tsvFile) { alert("没找到 sheets/annotator_A.tsv,确认选的是 pack 根目录"); return; }
+  tsvFile.text().then((txt) => {
+    rows = [];
+    const saved = lsLoad();
+    for (const line of txt.split("\n").slice(1)) {
+      if (!line.trim()) continue;
+      const [id, rel, text, notes] = line.split("\t");
+      const s = saved[id];
+      rows.push({ id, rel, text: s ? s.t : (text || ""), notes: s ? s.n : (notes || ""), done: !!s || !!(text || "").trim() });
+    }
+    $("welcome").hidden = true; $("img").hidden = false; $("editpane").hidden = false;
+    cur = rows.findIndex((r) => !r.done); if (cur < 0) cur = 0;
+    show();
+  });
+});
+
+$("tsvin").addEventListener("change", (e) => {
+  const f = e.target.files[0]; if (!f || !rows.length) { alert("先选 pack 文件夹"); return; }
+  f.text().then((txt) => {
+    const m = new Map();
+    for (const line of txt.split("\n").slice(1)) {
+      const [id, , text, notes] = line.split("\t");
+      if (id && (text || "").trim()) m.set(id, { t: text, n: notes || "" });
+    }
+    let n = 0;
+    for (const r of rows) { const v = m.get(r.id); if (v && !r.done) { r.text = v.t; r.notes = v.n; n++; } }
+    alert(`预填 ${n} 行(校对模式:逐张确认后 Enter 保存)`);
+    show();
+  });
+});
+
+function imgFor(rel) {
+  // prefer the raw (full-res) variant for annotation
+  const raw = rel.replace(/_224\.png$/, "_raw.png");
+  return files.get(raw) || files.get(rel);
+}
+
+function show() {
+  if (!rows.length) return;
+  cur = Math.max(0, Math.min(cur, rows.length - 1));
+  const r = rows[cur];
+  const f = imgFor(r.rel);
+  if (f) $("img").src = URL.createObjectURL(f);
+  $("imgmeta").textContent = `${cur + 1}/${rows.length}  ${r.id}` + (r.done ? "  [已标]" : "");
+  $("text").value = r.text; $("notes").value = r.notes;
+  $("vertical").textContent = r.text;
+  const done = rows.filter((x) => x.done).length;
+  $("progress").textContent = `已标 ${done}/${rows.length}`;
+  $("rowinfo").textContent = f ? f.name : "图片缺失:" + r.rel;
+  $("text").focus();
+}
+
+function saveCur(advance) {
+  const r = rows[cur];
+  r.text = $("text").value.replace(/[\r\n\t]/g, " ").trim();
+  r.notes = $("notes").value.replace(/[\r\n\t]/g, " ").trim();
+  r.done = !!(r.text || r.notes);
+  lsSave();
+  if (advance) cur++;
+  show();
+}
+
+$("text").addEventListener("input", () => { $("vertical").textContent = $("text").value; });
+$("text").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); saveCur(true); }
+});
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "ArrowRight") { e.preventDefault(); saveCur(false); cur++; show(); }
+  if ((e.metaKey || e.ctrlKey) && e.key === "ArrowLeft") { e.preventDefault(); saveCur(false); cur--; show(); }
+});
+$("save").onclick = () => saveCur(true);
+$("prev").onclick = () => { saveCur(false); cur--; show(); };
+$("nextun").onclick = () => { saveCur(false); const i = rows.findIndex((r, k) => k > cur && !r.done); cur = i < 0 ? cur : i; show(); };
+$("rot").onclick = () => $("img").classList.toggle("rot");
+
+$("export").onclick = () => {
+  if (!rows.length) return;
+  let out = "id\timage_relpath\ttranscription\tnotes\n";
+  for (const r of rows) out += `${r.id}\t${r.rel}\t${r.text}\t${r.notes}\n`;
+  const blob = new Blob([out], { type: "text/tab-separated-values" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "annotator_A_filled.tsv";
+  a.click();
+};
+</script>
+</body>
+</html>
