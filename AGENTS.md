@@ -17,6 +17,10 @@
 4. Mac 上加载不了官方 mamba 训的权重(in_proj 8672 vs CPU fallback 8192),验证在 box 的 swap 窗口做。
 5. 真实标注数据很珍贵:只用于 RL(约 70%)和永不训练的 golden set 评测(约 30%),不做 SFT 燃料。
 
+## 标注工具
+
+真实扫描行的转写标注用独立仓库 Montlok/mn-annotator(private,本地 ~/projects/LLM/mn-annotator):`python3 server.py --repo ~/projects/LLM/DoL-OCR --bundle <bundle>` 启动全可视化标注台(内嵌 nominal-Unicode 归一化校验);产出 TSV 经 validate.py 终检后,~70% 进 GRPO reward、~30% 锁 golden set。
+
 ## 用户工作纪律
 
 全中文回复;不用 emoji;不用形容词与戏剧化词汇(禁:铁律/冷数字/尸检/点火/收官等);只报实测数字+差距,不吹;每次有意义改动先过一个零上下文 harsh-critic 审查(APPROVE/REJECT 循环)再推进;先小批验证(含 index 0)再放量,绝不用精选样本声称"能用"。
