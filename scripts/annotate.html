@@ -39,6 +39,7 @@
   <h1>蒙文行转写</h1>
   <label class="btn">选 pack 文件夹<input type="file" id="dir" webkitdirectory multiple hidden></label>
   <label class="btn">导入 TSV 预填<input type="file" id="tsvin" accept=".tsv,.txt" hidden></label>
+  <button id="validate">一键校验</button>
   <button id="export" class="primary">导出 TSV</button>
   <button id="rot">旋转</button>
   <button id="nextun">下一个未标</button>
@@ -141,7 +142,7 @@ function show() {
   const r = rows[cur];
   const f = imgFor(r.rel);
   if (f) $("img").src = URL.createObjectURL(f);
-  $("imgmeta").textContent = `${cur + 1}/${rows.length}  ${r.id}` + (r.done ? "  [已标]" : "");
+  $("imgmeta").textContent = `${cur + 1}/${rows.length}  ${r.id}` + (r.done ? "  [已标]" : "") + (r.err ? "  [编码问题]" : "");
   $("text").value = r.text; $("notes").value = r.notes;
   $("vertical").textContent = r.text;
   const done = rows.filter((x) => x.done).length;
@@ -172,6 +173,35 @@ $("save").onclick = () => saveCur(true);
 $("prev").onclick = () => { saveCur(false); cur--; show(); };
 $("nextun").onclick = () => { saveCur(false); const i = rows.findIndex((r, k) => k > cur && !r.done); cur = i < 0 ? cur : i; show(); };
 $("rot").onclick = () => $("img").classList.toggle("rot");
+
+$("validate").onclick = async () => {
+  if (!rows.length) return;
+  saveCur(false);
+  const filled = rows.filter((r) => r.text).map((r) => ({ id: r.id, text: r.text }));
+  if (!filled.length) { alert("还没有已填写的行"); return; }
+  $("validate").textContent = "校验中…"; $("validate").disabled = true;
+  try {
+    const resp = await fetch("/validate", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rows: filled }) });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    let fixed = 0, bad = [];
+    for (const r of rows) {
+      const v = data.results[r.id];
+      if (!v) continue;
+      if (v.norm !== r.text) { r.text = v.norm; fixed++; }
+      r.err = !v.ok;
+      if (!v.ok) bad.push(`${r.id} (unk=${v.n_unk})`);
+    }
+    lsSave(); show();
+    alert(`校验完成:${data.summary}\n归一化改写 ${fixed} 行` +
+      (bad.length ? `\n\n有编码问题的行(请修正):\n` + bad.slice(0, 20).join("\n") : "\n全部通过,可以导出"));
+    if (bad.length) { const i = rows.findIndex((r) => r.err); if (i >= 0) { cur = i; show(); } }
+  } catch (e) {
+    alert("校验失败:" + e.message + "\n请确认是通过 annotate_server.py 打开的本页(而不是直接双击 html 文件)");
+  }
+  $("validate").textContent = "一键校验"; $("validate").disabled = false;
+};
 
 $("export").onclick = () => {
   if (!rows.length) return;
