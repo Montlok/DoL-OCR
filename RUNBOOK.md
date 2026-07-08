@@ -67,6 +67,7 @@ tail -f ~/dolocr/swap.log                                        # 看进度
 - **磁盘满**(`df -h /`):可删 `~/dolocr/runs/` 下旧 run(align_unfreeze_v1 34G、rescue_refreeze 8G、verify_tower_restore 4G、ctc_* 5G——都是 v1 失败线产物);绝不删 `pretrain_data/`、`data_v1/`、`bundle_v3b`、`ckpt_keep/`。
 - **page cache 挤 CUDA(启动新 GPU 进程 OOM)**:训练运行期间不要跑任何旁路 GPU 程序(已实测必炸);需要 GPU 就走 swap 链。
 - **训练中不要跑 evict**:evict 的大分配会 OOM 训练进程(历史事故)。
+- **save 卡死**(2026-07-08 实例):checkpoint 目录只有 model.pt+optimizer.pt(缺 rng/scheduler/meta)、GPU 0%、CPU ~110% 自旋、进程 RSS 掉到 ~2G 且多次采样不变、latest 未切换 → save 中 CUDA 同步永久自旋,不可自愈。处置:`pkill -9 -f "scripts\.[t]rain_rdt"` → 删除残缺 step 目录 → `RESUME_ONLY=1 bash scripts/swap_to_align.sh`(从上一个完整 checkpoint 续)。若复发:恢复命令加 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 并把 --save-every 提到 4000。
 - Mac 上不能加载官方 mamba 权重(双后端 in_proj 形状不同),验证一律在 box 的 swap 窗口做。
 
 ## 后续路线 / Roadmap
