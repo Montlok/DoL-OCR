@@ -21,12 +21,15 @@ import torch
 from Model.config import (
     BOS_ID,
     EOS_ID,
+    IMAGE_END_ID,
     IMAGE_PATCH_ID,
+    IMAGE_START_ID,
     OMVTConfig,
     PAD_ID,
     RDTConfig,
     TrainingConfig,
 )
+from Model.ocr.data import build_ocr_row
 from Model.model import RDTForCausalLM
 from Model.omvt import OMVTInjector
 from Model.omvt.patcher import collate_omvt_batch
@@ -43,6 +46,7 @@ from Model.training import (
     save_checkpoint,
     train_one_step,
 )
+from Model.training.data import PretrainingCollator
 from Model.training.multimodal_cli import make_omvt_cfg
 from Model.training.omvt_checkpoint import (
     load_omvt_payload,
@@ -87,6 +91,12 @@ def parse_args(argv=None):
         default="",
         help="JSONL spec for real multimodal pretraining (rows must carry an 'images' field)",
     )
+    p.add_argument("--stream-wds-dir", default="")
+    p.add_argument("--stream-hanshi-meta", default="")
+    p.add_argument("--stream-hanshi-pages", default="")
+    p.add_argument("--stream-tokenizer-bundle", default="")
+    p.add_argument("--stream-max-wds-shards", type=int, default=0)
+    p.add_argument("--stream-prefetch-batches", type=int, default=4)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--output", default="outputs/vlm_align")
     p.add_argument("--init-rdt-checkpoint", default="")
@@ -406,6 +416,9 @@ def _fast_forward_stream(batch_iter, resumed_step: int, train_cfg: TrainingConfi
 
 def _resolve_omvt_state(path: str, use_ema: bool = False):
     payload = load_omvt_payload(path, weights_only=False)
+    if isinstance(payload, dict) and "tower_state" in payload:
+        print("[init] using joint byte-CTC tower_state")
+        return payload["tower_state"]
     state = tower_state_from_payload(payload, use_ema=use_ema)
     if use_ema and isinstance(payload, dict) and payload.get("tower_ema"):
         print("[init] using EMA tower weights")
@@ -420,8 +433,93 @@ def _load_omvt_init(model: RDTForCausalLM, path: str, use_ema: bool = False) -> 
     model.vision.omvt.tower.load_state_dict(_resolve_omvt_state(path, use_ema=use_ema))
 
 
+def _stream_vlm_batches(args, omvt_cfg: OMVTConfig):
+    """Build frozen-RDT OCR batches directly from x2 WDS + Hanshi NAS data."""
+
+    from Model.ocr.streaming_corpus import MixedOCRCorpus, discover_wds_shards
+    from Tokenizer.unified.bundle import TokenizerBundle
+    from scripts.build_ocr_data import make_ocr_target_encoder
+    from scripts.train_ctc_head import _prefetch_batches
+
+    paths = discover_wds_shards(
+        args.stream_wds_dir,
+        exclude_ids=[2303],
+        limit=args.stream_max_wds_shards,
+    )
+    bundle = TokenizerBundle.from_dir(args.stream_tokenizer_bundle)
+    encode_target = make_ocr_target_encoder(bundle.tokenizer)
+    max_target_len = args.seq_len - omvt_cfg.compress_to - 4
+    if max_target_len <= 0:
+        raise ValueError("stream seq_len leaves no room for an OCR target")
+    corpus = MixedOCRCorpus(
+        paths,
+        hanshi_meta=args.stream_hanshi_meta,
+        hanshi_pages=args.stream_hanshi_pages,
+        image_size=omvt_cfg.image_size,
+        seed=args.seed,
+        max_target_len=max_target_len,
+    )
+    collator = PretrainingCollator(pad_id=PAD_ID, max_seq_len=args.seq_len)
+
+    def _iter():
+        for visual in corpus.batches(args.batch_size):
+            lengths = visual["target_lengths"].tolist()
+            flat = visual["targets"].tolist()
+            rows = []
+            offset = 0
+            for length in lengths:
+                raw = bytes(flat[offset : offset + length])
+                offset += length
+                text = raw.decode("utf-8", errors="strict")
+                row = build_ocr_row(
+                    encode_target(text),
+                    omvt_cfg.compress_to,
+                    None,
+                    bos_id=BOS_ID,
+                    image_start_id=IMAGE_START_ID,
+                    image_patch_id=IMAGE_PATCH_ID,
+                    image_end_id=IMAGE_END_ID,
+                    eos_id=EOS_ID,
+                )
+                row.pop("images", None)
+                rows.append(row)
+            batch = collator(rows)
+            batch["pixel_values"] = dict(
+                collate_omvt_batch(visual["pixels"], omvt_cfg)
+            )
+            batch["corpus_cursor"] = visual["corpus_cursor"]
+            yield batch
+
+    print(
+        f"[stream] WDS shards={len(paths)} + Hanshi; mix=2:1; "
+        f"batch={args.batch_size}",
+        flush=True,
+    )
+    return iter(_prefetch_batches(_iter(), args.stream_prefetch_batches))
+
+
 def main(argv=None):
     args = parse_args(argv)
+    stream_fields = (
+        args.stream_wds_dir,
+        args.stream_hanshi_meta,
+        args.stream_hanshi_pages,
+        args.stream_tokenizer_bundle,
+    )
+    stream_mode = any(bool(value) for value in stream_fields)
+    if stream_mode and not all(bool(value) for value in stream_fields):
+        print(
+            "scripts.train_vlm_align: streaming requires WDS, Hanshi meta/pages, "
+            "and tokenizer bundle together",
+            file=sys.stderr,
+        )
+        return 2
+    if stream_mode and args.data:
+        print(
+            "scripts.train_vlm_align: --data and direct corpus streaming are exclusive",
+            file=sys.stderr,
+        )
+        return 2
     # Fast-fail validation **before** any device alloc / model construction.
     # Mirrors the train_rdt CLI pattern: misconfigured runs should not pay the
     # cost of building the model only to crash inside the first step.
@@ -518,7 +616,7 @@ def main(argv=None):
     else:
         precision = args.precision
     train_cfg = TrainingConfig(
-        train_data=args.data,
+        train_data=args.data or ("nas-stream" if stream_mode else ""),
         seq_len=args.seq_len,
         micro_batch_size=args.batch_size,
         learning_rate=args.lr,
@@ -580,7 +678,36 @@ def main(argv=None):
     t0 = time.time()
     completed = False
     try:
-        if args.data:
+        if stream_mode:
+            batch_iter = _stream_vlm_batches(args, omvt_cfg)
+            while state.step < args.steps:
+                metrics = train_one_step(
+                    model,
+                    batch_iter,
+                    optimizer,
+                    scheduler,
+                    train_cfg,
+                    state,
+                    device=device,
+                )
+                logger.log(state.step, {"loss": metrics["loss"]})
+                if args.save_every and state.step % args.save_every == 0:
+                    save_checkpoint(
+                        args.output,
+                        state.step,
+                        model,
+                        optimizer,
+                        scheduler,
+                        metadata=_alignment_metadata(
+                            args,
+                            rdt_cfg,
+                            omvt_cfg,
+                            train_cfg,
+                            inherited=source_metadata,
+                        ),
+                        keep_last_n=args.keep_last_n,
+                    )
+        elif args.data:
             # Real-data path: pull pixel-aware batches from the streaming
             # JSONL dataloader and reuse the canonical train_one_step so
             # CLI behaviour matches train_rdt.
@@ -697,7 +824,7 @@ def main(argv=None):
                 ),
                 keep_last_n=args.keep_last_n,
             )
-    mode = "real-data" if args.data else "smoke"
+    mode = "nas-stream" if stream_mode else ("real-data" if args.data else "smoke")
     print(f"VLM align {mode} run OK in {time.time() - t0:.1f}s")
     return 0
 
