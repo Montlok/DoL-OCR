@@ -34,10 +34,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import glob
+import hashlib
 import json
 import os
+import queue
 import random
+import signal
 import sys
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -67,6 +71,16 @@ N_BYTE_CLASSES = 256
 BLANK_ID = 256
 NUM_CLASSES = N_BYTE_CLASSES + 1
 _CHECKPOINT_NAME = "ctc_head.pt"
+
+
+def _sha256_file(path: str | Path, chunk_size: int = 8 << 20) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                return digest.hexdigest()
+            digest.update(chunk)
 
 
 # --------------------------------------------------------------------------
@@ -134,6 +148,31 @@ def build_tower_from_checkpoint(
         p.requires_grad_(False)
     tower.eval()
     return tower, cfg
+
+
+def build_joint_from_ctc_checkpoint(
+    path: str | Path, *, device: torch.device
+) -> tuple[OMVTVisionTower, "CTCHead", OMVTConfig, dict[str, Any]]:
+    """Strictly load a previously joint-trained tower and byte-CTC head."""
+
+    payload = load_ctc_payload(path)
+    if "tower_state" not in payload:
+        raise ValueError(
+            f"CTC checkpoint {path!s} has no tower_state; it cannot initialize "
+            "a new joint visual run"
+        )
+    if "omvt_config" not in payload or "head_config" not in payload:
+        raise ValueError(f"CTC checkpoint {path!s} is missing model geometry")
+    cfg = OMVTConfig(**payload["omvt_config"])
+    tower = OMVTVisionTower(cfg).to(device)
+    tower.load_state_dict(payload["tower_state"], strict=True)
+    head_cfg = payload["head_config"]
+    head = CTCHead(
+        d_vision=int(head_cfg.get("d_vision", cfg.d_vision)),
+        hidden=int(head_cfg["hidden"]),
+    ).to(device)
+    head.load_state_dict(payload["head"], strict=True)
+    return tower, head, cfg, payload
 
 
 # --------------------------------------------------------------------------
@@ -326,6 +365,9 @@ def save_checkpoint(
     d_vision: int,
     hidden: int,
     tower: OMVTVisionTower | None = None,
+    scheduler: Any | None = None,
+    corpus_cursor: dict[str, Any] | None = None,
+    run_metadata: dict[str, Any] | None = None,
 ) -> Path:
     out = Path(output)
     step_dir = out / f"step_{step:08d}"
@@ -342,20 +384,29 @@ def save_checkpoint(
             "num_classes": NUM_CLASSES,
         },
         "head_config": {"d_vision": d_vision, "hidden": hidden},
+        "python_random_state": random.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+        "corpus_cursor": corpus_cursor,
+        "run_metadata": run_metadata or {},
     }
-    torch.save(payload, step_dir / _CHECKPOINT_NAME)
+    if scheduler is not None:
+        payload["scheduler"] = scheduler.state_dict()
+    if torch.cuda.is_available():
+        payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    checkpoint_path = step_dir / _CHECKPOINT_NAME
+    tmp_path = step_dir / f".{_CHECKPOINT_NAME}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, checkpoint_path)
     latest = out / "latest"
-    if latest.exists() or latest.is_symlink():
-        try:
-            latest.unlink()
-        except OSError:
-            import shutil
-
-            shutil.rmtree(latest, ignore_errors=True)
+    latest_tmp = out / ".latest.tmp"
+    if latest_tmp.exists() or latest_tmp.is_symlink():
+        latest_tmp.unlink()
     try:
-        os.symlink(step_dir.name, latest)
+        os.symlink(step_dir.name, latest_tmp)
+        os.replace(latest_tmp, latest)
     except OSError:
-        pass
+        if latest_tmp.exists() or latest_tmp.is_symlink():
+            latest_tmp.unlink()
     return step_dir
 
 
@@ -380,14 +431,25 @@ def load_checkpoint_into(
     head: CTCHead,
     optimizer: torch.optim.Optimizer | None = None,
     tower: "OMVTVisionTower | None" = None,
+    scheduler: Any | None = None,
+    restore_rng: bool = False,
 ) -> int:
     payload = load_ctc_payload(path)
     head.load_state_dict(payload["head"])
     if optimizer is not None and payload.get("optimizer") is not None:
         optimizer.load_state_dict(payload["optimizer"])
+    if scheduler is not None and payload.get("scheduler") is not None:
+        scheduler.load_state_dict(payload["scheduler"])
     if tower is not None and payload.get("tower_state") is not None:
         tower.load_state_dict(payload["tower_state"])
         print("[ctc-head] restored fine-tuned tower_state from checkpoint")
+    if restore_rng:
+        if payload.get("python_random_state") is not None:
+            random.setstate(payload["python_random_state"])
+        if payload.get("torch_rng_state") is not None:
+            torch.set_rng_state(payload["torch_rng_state"])
+        if torch.cuda.is_available() and payload.get("cuda_rng_state_all") is not None:
+            torch.cuda.set_rng_state_all(payload["cuda_rng_state_all"])
     return int(payload.get("step", 0))
 
 
@@ -399,8 +461,48 @@ def load_checkpoint_into(
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--omvt-checkpoint", default="", help="train_omvt_ssl checkpoint (dir or .pt)")
+    p.add_argument(
+        "--init-ctc-checkpoint",
+        default="",
+        help="initialize tower+CTC head from a prior joint CTC checkpoint but "
+        "start a fresh optimizer/schedule/data cursor",
+    )
+    p.add_argument(
+        "--expected-init-sha256",
+        default="",
+        help="optional hard gate for --init-ctc-checkpoint's resolved file",
+    )
     p.add_argument("--data", default="", help="dir of JSONL shards (build_ocr_row rows) or a glob")
     p.add_argument("--tokenizer-bundle", default="", help="unified tokenizer bundle dir")
+    p.add_argument("--stream-wds-dir", default="", help="NAS directory containing sparse shard-*.tar files")
+    p.add_argument("--stream-hanshi-meta", default="", help="NAS Hanshi meta.jsonl")
+    p.add_argument("--stream-hanshi-pages", default="", help="NAS Hanshi pages root")
+    p.add_argument(
+        "--stream-exclude-shard-id",
+        action="append",
+        type=int,
+        default=None,
+        help="WDS shard id to exclude (repeatable; default: known-corrupt 2303)",
+    )
+    p.add_argument(
+        "--stream-max-wds-shards",
+        type=int,
+        default=0,
+        help="pilot-only cap after numeric discovery; 0 uses every usable shard",
+    )
+    p.add_argument(
+        "--stream-prefetch-batches",
+        type=int,
+        default=4,
+        help="bounded CPU/NAS batch prefetch; cursors travel with consumed batches",
+    )
+    p.add_argument("--val-src-doc-min", type=int, default=434600)
+    p.add_argument("--test-src-doc-min", type=int, default=435200)
+    p.add_argument(
+        "--tokenizer-fingerprint",
+        default="",
+        help="audited tokenizer bundle tree SHA recorded for later VLM alignment provenance",
+    )
     p.add_argument(
         "--use-ema-tower",
         type=lambda s: s.lower() not in ("0", "false", "no"),
@@ -429,6 +531,7 @@ def parse_args(argv=None):
     p.add_argument("--grad-clip", type=float, default=1.0)
 
     p.add_argument("--save-every", type=int, default=1000)
+    p.add_argument("--keep-last", type=int, default=3)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument(
         "--probe-every", type=int, default=200,
@@ -459,6 +562,63 @@ def _build_scheduler_cfg(args) -> TrainingConfig:
         warmup_steps=max(1, args.warmup_steps),
         precision="fp32",
     )
+
+
+def _write_json_atomic(path: str | Path, payload: dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, sort_keys=True, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _prune_step_dirs(output: str | Path, keep_last: int) -> None:
+    if keep_last <= 0:
+        return
+    out = Path(output)
+    dirs = sorted(
+        (path for path in out.glob("step_[0-9]*") if path.is_dir()),
+        key=lambda path: path.name,
+    )
+    for path in dirs[:-keep_last]:
+        # Checkpoint directories contain only artifacts produced by this run.
+        import shutil
+
+        shutil.rmtree(path)
+
+
+def _prefetch_batches(iterable, depth: int):
+    """Prefetch without weakening exact resume semantics.
+
+    Each stream batch already owns a post-batch cursor, so producer read-ahead
+    never leaks into the checkpoint cursor saved by the consumer.
+    """
+
+    if depth <= 0:
+        yield from iterable
+        return
+    work: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=int(depth))
+
+    def _worker() -> None:
+        try:
+            for item in iterable:
+                work.put(("item", item))
+        except BaseException as exc:  # propagate loader failures to main thread
+            work.put(("error", exc))
+        finally:
+            work.put(("done", None))
+
+    threading.Thread(target=_worker, name="ctc-stream-prefetch", daemon=True).start()
+    while True:
+        kind, payload = work.get()
+        if kind == "item":
+            yield payload
+        elif kind == "error":
+            raise payload
+        else:
+            return
 
 
 def _run_probe(
@@ -593,16 +753,55 @@ def main(argv=None) -> int:
     if args.smoke:
         return _smoke(args)
 
-    for flag in ("omvt_checkpoint", "data", "tokenizer_bundle"):
-        if not getattr(args, flag):
-            print(
-                f"scripts/train_ctc_head: --{flag.replace('_', '-')} is required "
-                "(or use --smoke)",
-                file=sys.stderr,
-            )
-            return 2
+    stream_values = (
+        args.stream_wds_dir,
+        args.stream_hanshi_meta,
+        args.stream_hanshi_pages,
+    )
+    stream_mode = any(bool(value) for value in stream_values)
+    if stream_mode and not all(bool(value) for value in stream_values):
+        print(
+            "scripts/train_ctc_head: streaming requires --stream-wds-dir, "
+            "--stream-hanshi-meta, and --stream-hanshi-pages together",
+            file=sys.stderr,
+        )
+        return 2
+    if stream_mode and args.data:
+        print("scripts/train_ctc_head: --data and streaming inputs are exclusive", file=sys.stderr)
+        return 2
+    if not stream_mode and not (args.data and args.tokenizer_bundle):
+        print(
+            "scripts/train_ctc_head: legacy mode requires --data and "
+            "--tokenizer-bundle (or provide all three streaming inputs)",
+            file=sys.stderr,
+        )
+        return 2
+    init_flags = sum(
+        bool(value) for value in (args.resume, args.init_ctc_checkpoint, args.omvt_checkpoint)
+    )
+    if init_flags != 1:
+        print(
+            "scripts/train_ctc_head: choose exactly one of --resume, "
+            "--init-ctc-checkpoint, or --omvt-checkpoint",
+            file=sys.stderr,
+        )
+        return 2
+    if args.expected_init_sha256 and not args.init_ctc_checkpoint:
+        print(
+            "scripts/train_ctc_head: --expected-init-sha256 requires "
+            "--init-ctc-checkpoint",
+            file=sys.stderr,
+        )
+        return 2
+    if args.val_src_doc_min >= args.test_src_doc_min:
+        print(
+            "scripts/train_ctc_head: val src_doc floor must be below test floor",
+            file=sys.stderr,
+        )
+        return 2
 
     torch.manual_seed(args.seed)
+    random.seed(args.seed)
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -611,19 +810,60 @@ def main(argv=None) -> int:
         args.precision == "auto" and device.type == "cuda"
     )
 
-    from Tokenizer.unified.bundle import TokenizerBundle
-
-    bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
-
-    tower, omvt_cfg = build_tower_from_checkpoint(
-        args.omvt_checkpoint, use_ema=args.use_ema_tower, device=device
-    )
+    init_payload: dict[str, Any] | None = None
+    init_checkpoint_sha = ""
+    if args.resume:
+        tower, head, omvt_cfg, init_payload = build_joint_from_ctc_checkpoint(
+            args.resume, device=device
+        )
+    elif args.init_ctc_checkpoint:
+        resolved_init = resolve_ctc_checkpoint_path(args.init_ctc_checkpoint)
+        init_checkpoint_sha = _sha256_file(resolved_init)
+        if (
+            args.expected_init_sha256
+            and init_checkpoint_sha != args.expected_init_sha256.lower()
+        ):
+            raise ValueError(
+                f"init checkpoint SHA256 mismatch: expected "
+                f"{args.expected_init_sha256.lower()} got {init_checkpoint_sha}"
+            )
+        tower, head, omvt_cfg, init_payload = build_joint_from_ctc_checkpoint(
+            resolved_init, device=device
+        )
+        print(
+            f"[ctc-head] initialized joint tower/head from {resolved_init} "
+            f"sha256={init_checkpoint_sha}"
+        )
+    else:
+        tower, omvt_cfg = build_tower_from_checkpoint(
+            args.omvt_checkpoint, use_ema=args.use_ema_tower, device=device
+        )
+        head = CTCHead(d_vision=omvt_cfg.d_vision, hidden=args.hidden).to(device)
     print(
         f"[ctc-head] tower loaded: d_vision={omvt_cfg.d_vision} "
         f"compress_to={omvt_cfg.compress_to} image_size={omvt_cfg.image_size}"
     )
 
-    head = CTCHead(d_vision=omvt_cfg.d_vision, hidden=args.hidden).to(device)
+    head_hidden = int(head.lstm.hidden_size)
+    if args.resume and init_payload is not None:
+        prior_args = (init_payload.get("run_metadata") or {}).get("args") or {}
+        for key in (
+            "unfreeze_tower",
+            "tower_lr_scale",
+            "lr",
+            "weight_decay",
+            "steps",
+            "warmup_steps",
+            "batch_size",
+            "seed",
+            "val_src_doc_min",
+            "test_src_doc_min",
+        ):
+            if key in prior_args and prior_args[key] != getattr(args, key):
+                raise ValueError(
+                    f"resume-critical argument changed: {key} "
+                    f"checkpoint={prior_args[key]!r} current={getattr(args, key)!r}"
+                )
     if args.unfreeze_tower:
         for prm in tower.parameters():
             prm.requires_grad_(True)
@@ -635,25 +875,6 @@ def main(argv=None) -> int:
         )
     else:
         print(f"[ctc-head] trainable params: {num_trainable_params(head):,}")
-
-    dataset = CTCOcrDataset(
-        args.data,
-        tokenizer_bundle=bundle,
-        image_size=omvt_cfg.image_size,
-        max_target_len=omvt_cfg.compress_to,
-        shuffle_buffer=args.shuffle_buffer,
-        seed=args.seed,
-        infinite=True,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        collate_fn=ctc_collate,
-        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
-        persistent_workers=args.num_workers > 0,
-    )
-    batch_iter = iter(loader)
 
     train_cfg = _build_scheduler_cfg(args)
     if args.unfreeze_tower:
@@ -672,23 +893,186 @@ def main(argv=None) -> int:
     )
 
     start_step = 0
+    resume_cursor: dict[str, Any] | None = None
     if args.resume:
         start_step = load_checkpoint_into(
             args.resume, head, optimizer,
             tower=tower if args.unfreeze_tower else None,
+            scheduler=scheduler,
+            restore_rng=True,
         )
-        for _ in range(start_step):
-            scheduler.step()
+        if init_payload is not None and init_payload.get("scheduler") is None:
+            for _ in range(start_step):
+                scheduler.step()
+        if init_payload is not None:
+            resume_cursor = init_payload.get("corpus_cursor")
         print(f"[ctc-head] resumed from step {start_step}")
 
-    Path(args.output).mkdir(parents=True, exist_ok=True)
+    output_path = Path(args.output)
+    if not args.resume and output_path.exists() and any(output_path.iterdir()):
+        raise FileExistsError(
+            f"refusing to initialize a new run in non-empty output {output_path}"
+        )
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    corpus_cursor: dict[str, Any] | None = resume_cursor
+    dataset: CTCOcrDataset | None = None
+    stream_manifest: dict[str, Any] | None = None
+    stream_manifest_sha = ""
+    if stream_mode:
+        from Model.ocr.streaming_corpus import (
+            MixedOCRCorpus,
+            corpus_manifest,
+            discover_wds_shards,
+        )
+
+        excluded_ids = args.stream_exclude_shard_id or [2303]
+        wds_paths = discover_wds_shards(
+            args.stream_wds_dir,
+            exclude_ids=excluded_ids,
+            limit=args.stream_max_wds_shards,
+        )
+        stream_manifest, stream_manifest_sha = corpus_manifest(
+            wds_paths,
+            hanshi_meta=args.stream_hanshi_meta,
+            hanshi_pages=args.stream_hanshi_pages,
+            excluded_shard_ids=excluded_ids,
+            val_src_doc_min=args.val_src_doc_min,
+            test_src_doc_min=args.test_src_doc_min,
+            seed=args.seed,
+        )
+        if args.resume and init_payload is not None:
+            prior_sha = (init_payload.get("run_metadata") or {}).get(
+                "corpus_manifest_sha256", ""
+            )
+            if not resume_cursor:
+                raise ValueError("streaming resume checkpoint has no corpus_cursor")
+            if prior_sha != stream_manifest_sha:
+                raise ValueError(
+                    "streaming resume manifest mismatch: "
+                    f"checkpoint={prior_sha!r} current={stream_manifest_sha!r}"
+                )
+        corpus = MixedOCRCorpus(
+            wds_paths,
+            hanshi_meta=args.stream_hanshi_meta,
+            hanshi_pages=args.stream_hanshi_pages,
+            image_size=omvt_cfg.image_size,
+            seed=args.seed,
+            val_src_doc_min=args.val_src_doc_min,
+            max_target_len=omvt_cfg.compress_to,
+            cursor=resume_cursor,
+        )
+        batch_iter = iter(
+            _prefetch_batches(
+                corpus.batches(args.batch_size), args.stream_prefetch_batches
+            )
+        )
+        print(
+            f"[ctc-head] streaming corpus: wds_shards={len(wds_paths)} "
+            f"hanshi=on manifest_sha256={stream_manifest_sha}"
+        )
+    else:
+        from Tokenizer.unified.bundle import TokenizerBundle
+
+        if args.resume:
+            raise ValueError(
+                "legacy JSONL resume is disabled because it has no exact data "
+                "cursor; use the unified streaming corpus for production resume"
+            )
+        bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
+        dataset = CTCOcrDataset(
+            args.data,
+            tokenizer_bundle=bundle,
+            image_size=omvt_cfg.image_size,
+            max_target_len=omvt_cfg.compress_to,
+            shuffle_buffer=args.shuffle_buffer,
+            seed=args.seed,
+            infinite=True,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            collate_fn=ctc_collate,
+            prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+            persistent_workers=args.num_workers > 0,
+        )
+        batch_iter = iter(loader)
+
+    prior_metadata = (init_payload or {}).get("run_metadata") or {}
+    run_metadata: dict[str, Any] = {
+        "format_version": 1,
+        "deployed_commit": os.environ.get("DOL_OCR_DEPLOY_COMMIT", ""),
+        "corpus_manifest_sha256": stream_manifest_sha,
+        "tokenizer_fingerprint": args.tokenizer_fingerprint
+        or prior_metadata.get("tokenizer_fingerprint", ""),
+        "init_checkpoint_sha256": init_checkpoint_sha
+        or prior_metadata.get("init_checkpoint_sha256", ""),
+        "trainable": ["ctc_head"]
+        + (["vision.omvt.tower"] if args.unfreeze_tower else []),
+        "args": vars(args),
+    }
+    _write_json_atomic(
+        output_path / "run_manifest.json",
+        {
+            "run_metadata": run_metadata,
+            "corpus": stream_manifest,
+            "runtime_paths": {
+                "wds": args.stream_wds_dir,
+                "hanshi_meta": args.stream_hanshi_meta,
+                "hanshi_pages": args.stream_hanshi_pages,
+            },
+        },
+    )
     logger = RankZeroLogger(args.output, enable_tensorboard=False)
 
     t0 = time.time()
     last_step = start_step
+    seen_at_start = int((resume_cursor or {}).get("counts", {}).get("total", 0))
+    stop_requested = {"value": False}
+
+    def _request_stop(signum, _frame):
+        stop_requested["value"] = True
+        print(
+            f"[ctc-head] signal {signum} received; saving after the current step",
+            flush=True,
+        )
+
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+
+    def _save(step: int) -> None:
+        save_checkpoint(
+            args.output,
+            step,
+            head,
+            optimizer,
+            omvt_cfg,
+            d_vision=omvt_cfg.d_vision,
+            hidden=head_hidden,
+            tower=tower if args.unfreeze_tower else None,
+            scheduler=scheduler,
+            corpus_cursor=corpus_cursor,
+            run_metadata=run_metadata,
+        )
+        _prune_step_dirs(args.output, args.keep_last)
+
+    exhausted = False
     for step in range(start_step + 1, args.steps + 1):
+        data_t0 = time.time()
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            exhausted = True
+            print(
+                "[ctc-head] corpus exhausted: exact one-pass visual epoch complete",
+                flush=True,
+            )
+            break
+        data_wait = time.time() - data_t0
         last_step = step
-        batch = next(batch_iter)
+        if batch.get("corpus_cursor") is not None:
+            corpus_cursor = batch["corpus_cursor"]
         loss, logits, features = _train_step(
             tower, head, batch, device, use_bf16, tower_grad=args.unfreeze_tower
         )
@@ -702,32 +1086,37 @@ def main(argv=None) -> int:
         scheduler.step()
 
         if step % args.log_every == 0 or step == start_step + 1:
+            seen_now = int((corpus_cursor or {}).get("counts", {}).get("total", 0))
+            if not stream_mode:
+                seen_now = seen_at_start + (step - start_step) * args.batch_size
+            elapsed = max(time.time() - t0, 1e-9)
             logger.log(step, {
                 "loss": float(loss.detach()),
                 "grad_norm": float(grad_norm),
                 "lr": float(scheduler.get_last_lr()[0]),
+                "data_wait_s": float(data_wait),
+                "samples_per_s": float((seen_now - seen_at_start) / elapsed),
+                "seen_samples": float(seen_now),
             })
         if args.probe_every and step % args.probe_every == 0:
             byte_targets = _unflatten_targets(batch["targets"], batch["target_lengths"])
             _run_probe(head, features, byte_targets, step)
         if args.save_every and step % args.save_every == 0:
-            save_checkpoint(
-                args.output, step, head, optimizer, omvt_cfg,
-                d_vision=omvt_cfg.d_vision, hidden=args.hidden,
-                tower=tower if args.unfreeze_tower else None,
-            )
-            if dataset.n_skipped_long:
+            _save(step)
+            if dataset is not None and dataset.n_skipped_long:
                 print(f"[ctc-head] rows skipped (target > {omvt_cfg.compress_to} bytes): "
                       f"{dataset.n_skipped_long}")
+        if stop_requested["value"]:
+            print("[ctc-head] graceful stop requested", flush=True)
+            break
 
-    save_checkpoint(
-        args.output, last_step, head, optimizer, omvt_cfg,
-        d_vision=omvt_cfg.d_vision, hidden=args.hidden,
-        tower=tower if args.unfreeze_tower else None,
-    )
+    _save(last_step)
     logger.close()
     dt = time.time() - t0
-    print(f"CTC head training OK in {dt:.1f}s ({last_step} steps)")
+    print(
+        f"CTC head training OK in {dt:.1f}s ({last_step} steps, "
+        f"corpus_exhausted={exhausted})"
+    )
     return 0
 
 
