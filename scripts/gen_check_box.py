@@ -8,6 +8,7 @@ Env:
   CKPT    checkpoint dir (default: resolved ~/dolocr/runs/mn_pretrain_v1/latest)
   EVAL    held-out packed jsonl (default: ~/dolocr/pretrain_data/eval/mn_part_15.jsonl)
   BUNDLE  tokenizer bundle dir (default: ~/dolocr/bundle_v3b)
+  RDT_STEPS recurrent refinement depth (default: 4; set 8 for full-depth A/B)
 """
 import json
 import os
@@ -31,7 +32,11 @@ EVAL = os.environ.get(
     "EVAL", os.path.expanduser("~/dolocr/pretrain_data/eval/mn_part_15.jsonl")
 )
 BUNDLE = os.environ.get("BUNDLE", os.path.expanduser("~/dolocr/bundle_v3b"))
+RDT_STEPS = int(os.environ.get("RDT_STEPS", "4"))
+if RDT_STEPS <= 0:
+    raise ValueError("RDT_STEPS must be positive")
 print(f"[gen_check] checkpoint: {CKPT}")
+print(f"[gen_check] recurrent_steps: {RDT_STEPS}")
 
 meta = torch.load(f"{CKPT}/meta.pt", map_location="cpu", weights_only=False)
 cfg_dict = meta["metadata"]["rdt_config"] if "metadata" in meta else meta["rdt_config"]
@@ -54,7 +59,8 @@ for i, pre in enumerate([row[0:24], row[900:924]]):
     t0 = time.time()
     with torch.no_grad():
         out = model.generate(
-            ids, max_new_tokens=40, greedy=True, use_cache=True,
+            ids, max_new_tokens=40, greedy=True, use_cache=False,
+            recurrent_steps=RDT_STEPS,
             repetition_penalty=1.1, eos_id=cfg.eos_id,
         )
     dt = time.time() - t0

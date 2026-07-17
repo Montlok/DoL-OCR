@@ -70,6 +70,7 @@ from scripts.eval_vlm_ocr import (  # noqa: E402
     _decode_batches,
     _load_rows,
     _pixel_batch,
+    _restore_omvt_geometry,
     print_script_cer,
 )
 from scripts.ocr_infer import (  # noqa: E402
@@ -110,6 +111,12 @@ def parse_args(argv=None):
     p.add_argument("--max-new-tokens", type=int, default=256,
                    help="per recovered strip, not per column")
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument(
+        "--recurrent-steps",
+        type=int,
+        default=None,
+        help="fixed decode depth; defaults to the checkpoint's trained depth",
+    )
     p.add_argument("--repetition-penalty", type=float, default=1.0)
     # Column synthesis + segmentation.
     p.add_argument("--lines-per-column", type=int, default=3,
@@ -182,6 +189,12 @@ def _percentiles(values: list[float]) -> str:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.recurrent_steps is not None and args.recurrent_steps <= 0:
+        print(
+            "scripts/eval_l2_deploy: --recurrent-steps must be positive",
+            file=sys.stderr,
+        )
+        return 2
     for flag in ("data", "tokenizer_bundle"):
         if not getattr(args, flag):
             print(f"scripts/eval_l2_deploy: --{flag.replace('_', '-')} is required",
@@ -194,6 +207,7 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return 2
+    _restore_omvt_geometry(args)
 
     from Tokenizer.unified.bundle import TokenizerBundle
 

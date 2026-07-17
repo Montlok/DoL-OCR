@@ -76,6 +76,15 @@ class TrainRdtCliGuardsTest(unittest.TestCase):
             train_rdt._target_recurrent_steps_for_train(model_cfg, ramp_cfg),
             model_cfg.recurrent_steps,
         )
+        poisson_cfg = train_rdt.TrainingConfig(
+            train_data="x",
+            max_steps=10,
+            recurrent_steps_sampling="poisson",
+        )
+        self.assertEqual(
+            train_rdt._target_recurrent_steps_for_train(model_cfg, poisson_cfg),
+            model_cfg.recurrent_steps,
+        )
 
     def test_auto_mamba_prefers_official_on_cuda_linux(self) -> None:
         cfg = train_rdt.CONFIG_CHOICES["segmented_tiny"]()

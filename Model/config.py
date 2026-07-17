@@ -482,10 +482,40 @@ class RDTConfig:
     @property
     def effective_depth(self) -> int:
         steps = self.act_max_steps if self.use_act else self.recurrent_steps
+        if self.core_type == "two_stage":
+            return (
+                self.n_prelude
+                + self.stage1_mamba_layers
+                + self.stage2_attn_layers * steps
+                + self.n_coda
+            )
+        if self.core_type == "segmented":
+            return (
+                self.n_prelude
+                + self.stage1_mamba_layers
+                + self.stage2_attn_layers * steps
+                + self.segmented_local_layers
+                + self.n_coda
+            )
         return self.n_prelude + self.block_layers * steps + self.n_coda
 
     @property
     def actual_layers(self) -> int:
+        if self.core_type == "two_stage":
+            return (
+                self.n_prelude
+                + self.stage1_mamba_layers
+                + self.stage2_attn_layers
+                + self.n_coda
+            )
+        if self.core_type == "segmented":
+            return (
+                self.n_prelude
+                + self.stage1_mamba_layers
+                + self.stage2_attn_layers
+                + self.segmented_local_layers
+                + self.n_coda
+            )
         return self.n_prelude + self.block_layers + self.n_coda
 
     @property

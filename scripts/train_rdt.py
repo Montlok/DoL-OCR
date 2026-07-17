@@ -464,13 +464,18 @@ def _target_recurrent_steps_for_train(
     model_cfg: RDTConfig,
     train_cfg: TrainingConfig,
 ) -> int | None:
-    """Return an explicit depth only when the training curriculum needs one.
+    """Return an explicit depth when a loop-depth schedule needs one.
 
     Passing ``steps`` unconditionally disables ``SegmentedCore`` random-r
-    sampling. Let the model resolve its own depth unless a depth ramp is active.
+    sampling. Let the model resolve its own depth for fixed/no-ramp training;
+    pass the target for a ramp or deterministic per-step Poisson sampling.
     """
 
-    if train_cfg.recurrent_steps_start is None or train_cfg.recurrent_steps_ramp <= 0:
+    ramp_active = (
+        train_cfg.recurrent_steps_start is not None
+        and train_cfg.recurrent_steps_ramp > 0
+    )
+    if train_cfg.recurrent_steps_sampling != "poisson" and not ramp_active:
         return None
     return model_cfg.recurrent_steps
 

@@ -19,6 +19,41 @@ def _tiny() -> RDTConfig:
 
 
 class TestResidualInitScaling(unittest.TestCase):
+    def test_core_aware_depth_counts(self) -> None:
+        interleaved = RDTConfig(
+            n_prelude=2,
+            n_coda=3,
+            mamba_per_block=2,
+            attn_per_block=1,
+            recurrent_steps=4,
+        )
+        self.assertEqual(interleaved.actual_layers, 8)
+        self.assertEqual(interleaved.effective_depth, 17)
+
+        two_stage = RDTConfig(
+            core_type="two_stage",
+            n_prelude=2,
+            n_coda=3,
+            stage1_mamba_layers=4,
+            stage2_attn_layers=2,
+            recurrent_steps=5,
+            recurrent_drift_mode="mhc",
+        )
+        self.assertEqual(two_stage.actual_layers, 11)
+        self.assertEqual(two_stage.effective_depth, 19)
+
+        segmented = RDTConfig(
+            core_type="segmented",
+            n_prelude=2,
+            n_coda=3,
+            stage1_mamba_layers=4,
+            stage2_attn_layers=2,
+            segmented_local_layers=3,
+            recurrent_steps=5,
+        )
+        self.assertEqual(segmented.actual_layers, 14)
+        self.assertEqual(segmented.effective_depth, 22)
+
     def test_output_projections_are_depth_scaled(self) -> None:
         torch.manual_seed(0)
         cfg = _tiny()

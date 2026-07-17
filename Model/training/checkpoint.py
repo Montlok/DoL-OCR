@@ -200,16 +200,56 @@ def save_checkpoint(
     return step_dir
 
 
-def load_checkpoint(path: str | Path) -> CheckpointPayload:
+def resolve_checkpoint_dir(path: str | Path) -> Path:
+    """Resolve an output root/``latest`` link/model file to its step dir.
+
+    Unlike :func:`load_checkpoint`, this helper performs no tensor loads.  It
+    is used by model builders that must read ``meta.pt`` before allocating a
+    model, and by initialization paths that only need ``model.pt`` (loading a
+    multi-gigabyte optimizer state there would waste both time and RAM).
+    """
+
     p = Path(path)
+    if p.is_file():
+        if p.name == "model.pt":
+            return p.parent
+        raise ValueError(f"checkpoint file must be named model.pt: {p}")
     if p.name == "latest":
         if not p.exists():
             raise FileNotFoundError(f"checkpoint not found: {p}")
         p = p.resolve()
-    elif p.is_dir() and not (p / "model.pt").exists() and (p / "latest").exists():
-        p = (p / "latest").resolve()
+    elif p.is_dir() and not (p / "model.pt").exists():
+        if (p / "latest").exists():
+            p = (p / "latest").resolve()
+        else:
+            steps = sorted(d for d in p.glob("step_*") if (d / "model.pt").exists())
+            if steps:
+                p = steps[-1]
     elif not p.exists():
         raise FileNotFoundError(f"checkpoint not found: {p}")
+    if not (p / "model.pt").exists():
+        raise FileNotFoundError(f"checkpoint model not found: {p / 'model.pt'}")
+    return p
+
+
+def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
+    """Load only a checkpoint's user metadata, without loading model weights."""
+
+    p = resolve_checkpoint_dir(path)
+    meta_path = p / "meta.pt"
+    if not meta_path.exists():
+        return {}
+    meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+    if not isinstance(meta, dict):
+        raise TypeError(f"checkpoint metadata must be a dict: {meta_path}")
+    payload = meta.get("metadata", meta)
+    if not isinstance(payload, dict):
+        raise TypeError(f"checkpoint metadata payload must be a dict: {meta_path}")
+    return payload
+
+
+def load_checkpoint(path: str | Path) -> CheckpointPayload:
+    p = resolve_checkpoint_dir(path)
 
     model_state = torch.load(p / "model.pt", map_location="cpu", weights_only=False)
     opt_path = p / "optimizer.pt"
@@ -288,6 +328,8 @@ def resume_state(
 __all__ = [
     "CheckpointPayload",
     "load_checkpoint",
+    "load_checkpoint_metadata",
+    "resolve_checkpoint_dir",
     "resume_state",
     "save_checkpoint",
 ]
