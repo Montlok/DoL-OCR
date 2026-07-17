@@ -1,6 +1,6 @@
 # RDT Model — Pretraining Guide
 
-Recurrent Depth Transformer with Mamba3 + MoE Latent Attention (MLA), an
+Recurrent Depth Transformer with Mamba3 + Multi-head Latent Attention (MLA), an
 ACT (PonderNet) controller, optional bidirectional auxiliary head, and a
 two-tier vision pathway (MLP fallback + OMVT — Orientation-aware
 Multiscript Vision Tower).
@@ -33,7 +33,7 @@ Model/
     checkpoint.py      # FSDP-aware save / resume
     loop.py            # train_one_step + evaluate (autocast + grad accum + clip)
     logging.py         # RankZeroLogger (+ optional tensorboard)
-  multimodal_cli.py  # shared --multimodal / --image-size / --n-image-tokens helpers
+    multimodal_cli.py  # shared --multimodal / --image-size / --n-image-tokens helpers
 ```
 
 ## 2. Configs

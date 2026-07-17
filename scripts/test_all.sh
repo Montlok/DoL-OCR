@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run all Tokenizer test suites: Python + Rust.
+# Run all Python and Rust test suites.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

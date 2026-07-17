@@ -31,12 +31,13 @@
 #   CKPT_KEEP      long-lived checkpoint root (required for frozen/unfreeze)
 #   EVICT          page-cache evict command, run before every GPU stage
 #                  (default: "true"; the box sets this to its evict_cache.py)
-#   RUN_TAG        run-dir generation tag (default: v2). v1 dirs are the
-#                  from-scratch-LM line, kept for comparison.
+#   RUN_TAG        run-dir generation tag (default: v3_r${RDT_STEPS}). v1/v2
+#                  dirs are older training lines, kept for comparison.
 #   SSL_CHECKPOINT Phase 1 SSL tower checkpoint (required for frozen)
 #   RDT_CHECKPOINT text-pretraining checkpoint to init the LM side
 #                  (required for frozen; see run_dol_ocr_phase2_text.sh)
 #   FROZEN_STEPS   Phase 3a step count (default: 6000)
+#   RDT_STEPS      fixed recurrent depth across train/eval (default: 4)
 #   UNFREEZE_LR    Phase 3b learning rate (default: 6e-5)
 #   UNFREEZE_WARMUP / UNFREEZE_STEPS / UNFREEZE_SAVE_EVERY
 #                  Phase 3b schedule (defaults: 2000 / 40000 / 2000)
@@ -51,10 +52,11 @@ cd "$ROOT"
 PY="${PY:-python3}"
 EVICT="${EVICT:-true}"
 FROZEN_STEPS="${FROZEN_STEPS:-6000}"
+RDT_STEPS="${RDT_STEPS:-4}"
 KEEP_LAST_N="${KEEP_LAST_N:-3}"
-# Run-dir generation tag: v1 dirs belong to the from-scratch-LM run line and
-# are kept for comparison; v2 is the text-cold-start line (RDT_CHECKPOINT).
-RUN_TAG="${RUN_TAG:-v2}"
+# v3 separates the fixed-depth/strict-checkpoint line from earlier runs so an
+# old r=8 checkpoint can never be resumed accidentally as an r=4 run.
+RUN_TAG="${RUN_TAG:-v3_r${RDT_STEPS}}"
 UNFREEZE_LR="${UNFREEZE_LR:-6e-5}"
 UNFREEZE_WARMUP="${UNFREEZE_WARMUP:-2000}"
 UNFREEZE_STEPS="${UNFREEZE_STEPS:-40000}"
@@ -80,6 +82,9 @@ if [ -z "$STAGE" ]; then
     echo "usage: $0 {probe|frozen|unfreeze|resume-unfreeze|verify-tower-restore}" >&2
     exit 2
 fi
+case "$RDT_STEPS" in
+    ''|*[!0-9]*|0) echo "run_dol_ocr_phase3: RDT_STEPS must be positive" >&2; exit 2 ;;
+esac
 
 if [ -z "${RUNS:-}" ]; then
     echo "run_dol_ocr_phase3: RUNS env var must be set (output root)" >&2
@@ -106,6 +111,18 @@ _require_ckpt_keep() {
     mkdir -p "$CKPT_KEEP"
 }
 
+_require_init_checkpoints() {
+    if [ -z "${SSL_CHECKPOINT:-}" ]; then
+        echo "run_dol_ocr_phase3: SSL_CHECKPOINT env var must be set" >&2
+        exit 2
+    fi
+    if [ -z "${RDT_CHECKPOINT:-}" ]; then
+        echo "run_dol_ocr_phase3: RDT_CHECKPOINT env var must be set to the " \
+             "text-pretraining checkpoint" >&2
+        exit 2
+    fi
+}
+
 _fail_marker_for() {
     echo "$1/.FAILED"
 }
@@ -125,7 +142,8 @@ _check_no_prior_failure() {
 # ---------------------------------------------------------------------------
 _stage_probe() {
     _require_data
-    local probe_dir="$RUNS/throughput_probe"
+    _require_init_checkpoints
+    local probe_dir="$RUNS/throughput_probe_$RUN_TAG"
     _check_no_prior_failure "$probe_dir"
     mkdir -p "$probe_dir"
     trap 'touch "$(_fail_marker_for "$probe_dir")"; echo "run_dol_ocr_phase3: probe FAILED" >&2' ERR
@@ -140,7 +158,11 @@ _stage_probe() {
             --data "$DATA" \
             --image-size "$IMAGE_SIZE" --n-image-tokens "$N_IMAGE_TOKENS" \
             --seq-len "$SEQ_LEN" \
+            --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
             --batch-size "$micro" \
+            --init-omvt-checkpoint "$SSL_CHECKPOINT" --use-ema-tower \
+            --init-rdt-checkpoint "$RDT_CHECKPOINT" \
+            --freeze-rdt --grad-ckpt --recurrent-steps "$RDT_STEPS" \
             --steps 100 --smoke \
             --device cuda --precision bf16 \
             --output "$probe_dir/micro_$micro"
@@ -158,17 +180,7 @@ _stage_probe() {
 _stage_frozen() {
     _require_data
     _require_ckpt_keep
-    if [ -z "${SSL_CHECKPOINT:-}" ]; then
-        echo "run_dol_ocr_phase3: SSL_CHECKPOINT env var must be set to the " \
-             "Phase 2 SSL 'latest' checkpoint path" >&2
-        exit 2
-    fi
-    if [ -z "${RDT_CHECKPOINT:-}" ]; then
-        echo "run_dol_ocr_phase3: RDT_CHECKPOINT env var must be set to the " \
-             "text-pretraining 'latest' checkpoint (freezing a random LM is " \
-             "not a meaningful alignment target; that is the v1 failure mode)" >&2
-        exit 2
-    fi
+    _require_init_checkpoints
     _check_no_prior_failure "$FROZEN_RUN_DIR"
     mkdir -p "$FROZEN_RUN_DIR"
     local done_marker="$FROZEN_RUN_DIR/.done"
@@ -199,8 +211,10 @@ _stage_frozen() {
         --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
         --device cuda --precision bf16 \
         "${INIT_ARGS[@]}" \
-        --freeze-rdt --steps "$FROZEN_STEPS" --batch-size 32 --grad-ckpt \
+        --freeze-rdt --recurrent-steps "$RDT_STEPS" \
+        --steps "$FROZEN_STEPS" --batch-size 32 --grad-ckpt \
         --lr 3e-4 --warmup-steps 500 --save-every 1000 \
+        --keep-last-n "$KEEP_LAST_N" \
         --output "$FROZEN_RUN_DIR" \
         "${RESUME_ARGS[@]}"
 
@@ -244,7 +258,8 @@ _stage_verify_tower_restore() {
         --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
         --device cuda --precision bf16 \
         --init-omvt-checkpoint "$SSL_CHECKPOINT" --use-ema-tower \
-        --freeze-rdt --steps 2 --batch-size 8 --grad-ckpt \
+        --freeze-rdt --recurrent-steps "$RDT_STEPS" \
+        --steps 2 --batch-size 8 --grad-ckpt \
         --lr 3e-4 --warmup-steps 1 --save-every 2 \
         --output "$VERIFY_RUN_DIR"
 
@@ -252,6 +267,7 @@ _stage_verify_tower_restore() {
     SAVED_CKPT="$VERIFY_RUN_DIR/latest" \
     VT_IMAGE_SIZE="$IMAGE_SIZE" VT_N_IMAGE_TOKENS="$N_IMAGE_TOKENS" \
     VT_D_VISION="$D_VISION" VT_PATCH_PRESET="$PATCH_PRESET" VT_SEQ_LEN="$SEQ_LEN" \
+    VT_RDT_STEPS="$RDT_STEPS" \
     "$PY" - <<'PYEOF'
 import os
 import sys
@@ -273,6 +289,7 @@ n_image_tokens = int(os.environ["VT_N_IMAGE_TOKENS"])
 d_vision = int(os.environ["VT_D_VISION"])
 patch_preset = os.environ["VT_PATCH_PRESET"]
 seq_len = int(os.environ["VT_SEQ_LEN"])
+rdt_steps = int(os.environ["VT_RDT_STEPS"])
 
 # The tensors we compare against: the tower state as it was actually saved
 # inside the RDT checkpoint (vision.omvt.tower.* keys of model.pt).
@@ -292,7 +309,9 @@ if not saved_tower_keys:
 # Rebuild a model exactly the way Phase 3b's --init-rdt-checkpoint path does:
 # construct RDT + a matching-size OMVTInjector, then load_state_dict the
 # saved checkpoint (this is what train_vlm_align.py's _load_rdt_init does).
-rdt_cfg = replace(two_stage_pretrain_config(), max_seq_len=seq_len)
+rdt_cfg = replace(
+    two_stage_pretrain_config(), max_seq_len=seq_len, recurrent_steps=rdt_steps
+)
 omvt_cfg = make_omvt_cfg(image_size, d_vision, n_image_tokens, preset=patch_preset)
 model = RDTForCausalLM(rdt_cfg)
 model.vision._omvt_cfg = omvt_cfg
@@ -378,6 +397,7 @@ _stage_unfreeze() {
         --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
         --device cuda --precision bf16 \
         --init-rdt-checkpoint "$final_ckpt" \
+        --recurrent-steps "$RDT_STEPS" \
         --grad-ckpt --lr "$UNFREEZE_LR" --warmup-steps "$UNFREEZE_WARMUP" \
         --steps "$UNFREEZE_STEPS" \
         --batch-size 32 --save-every "$UNFREEZE_SAVE_EVERY" \
@@ -407,6 +427,7 @@ _stage_resume_unfreeze() {
         --seq-len "$SEQ_LEN" \
         --d-vision "$D_VISION" --patch-preset "$PATCH_PRESET" \
         --device cuda --precision bf16 \
+        --recurrent-steps "$RDT_STEPS" \
         --grad-ckpt --lr "$UNFREEZE_LR" --warmup-steps "$UNFREEZE_WARMUP" \
         --steps "$UNFREEZE_STEPS" \
         --batch-size 32 --save-every "$UNFREEZE_SAVE_EVERY" \

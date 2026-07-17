@@ -536,9 +536,10 @@ class RDTForCausalLM(nn.Module):
         """GPT-2-style depth-scaled init, extended to the unrolled loop.
 
         Every sublayer writes ``x + f(x)`` into the residual stream. With a
-        weight-shared recurrent core the stream sees ``effective_depth``
-        layers (prelude + block_layers x recurrent_steps + coda), so leaving
-        the output projections at ``init_std`` makes the hidden-state norm
+        weight-shared recurrent core the stream sees its core-aware
+        ``effective_depth`` (including one-pass encoder/local stages and the
+        repeated refinement stage), so leaving the output projections at
+        ``init_std`` makes the hidden-state norm
         grow linearly across recurrent steps (and costs bf16 mantissa
         precision late in the loop). Scaling them by
         ``1/sqrt(2 * effective_depth)`` keeps the residual variance roughly

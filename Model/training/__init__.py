@@ -14,6 +14,8 @@ The legacy import paths are preserved:
 
 from Model.training.checkpoint import (
     load_checkpoint,
+    load_checkpoint_metadata,
+    resolve_checkpoint_dir,
     resume_state,
     save_checkpoint,
 )
@@ -68,7 +70,9 @@ __all__ = [
     "init_distributed",
     "is_main_process",
     "load_checkpoint",
+    "load_checkpoint_metadata",
     "param_groups_with_no_decay",
+    "resolve_checkpoint_dir",
     "resume_state",
     "save_checkpoint",
     "throughput_str",
