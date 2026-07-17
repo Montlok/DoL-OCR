@@ -3,7 +3,18 @@ __pycache__/
 .idea/
 *.py[cod]
 .ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.venv/
+venv/
 *.egg-info/
+.coverage
+.coverage.*
+coverage.xml
+coverage/
+htmlcov/
+/build/
+/dist/
 
 # training artifacts
 runs/
@@ -13,7 +24,14 @@ outputs/
 wandb/
 logs/
 *.pt
+*.pth
+*.ckpt
+*.safetensors
 *.bin
+*.log
+*.pid
+nohup.out
+events.out.tfevents.*
 
 # private corpora and local-only data
 *DONOTGITIT*/
@@ -35,6 +53,4 @@ credentials/
 
 # local-only (do not commit)
 .claude/
-.pytest_cache/
-download.pid
 /outputs

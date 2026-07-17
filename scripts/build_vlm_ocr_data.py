@@ -4,7 +4,7 @@
 
 The synthetic render set already pairs each page image with its exact
 transcription tokens (``ssl.jsonl`` rows carry ``images`` + clean
-``ocr_labels``). Phase-2 VLM alignment — wiring the trained OMVT tower into
+``ocr_labels``). Phase-3 VLM alignment — wiring the trained OMVT tower into
 the RDT embedding space through a generative ``image -> text`` objective —
 needs those same pairs re-expressed in the pre-tokenized row contract that
 ``scripts.train_vlm_align`` consumes (:func:`Model.ocr.data.build_ocr_row`):

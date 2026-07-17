@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the five pretraining-acceptance smoke entry points end-to-end.
+# Run the pretraining-acceptance smoke workflows end-to-end.
 # All paths use synthetic data and complete on CPU.
 set -euo pipefail
 
@@ -23,13 +23,11 @@ python3 -m scripts.train_vlm_align --smoke --steps 2 --seq-len 16 --n-image-toke
 echo "==> [4/5] OMVT vision-tower SSL smoke"
 python3 -m scripts.train_omvt_ssl --smoke --steps 3 --output "$OUT/omvt_ssl"
 
-echo "==> [5/5] OMVT → RDT end-to-end already covered by VLM align step above."
-
 if python3 -c "import PIL" >/dev/null 2>&1; then
-    echo "==> [6/6] multimodal end-to-end (PIL images → JSONL → trainers)"
+    echo "==> [5/5] multimodal end-to-end (PIL images → JSONL → trainers)"
     OUT="$OUT/mm" bash "$ROOT/scripts/smoke_multimodal.sh"
 else
-    echo "==> [6/6] multimodal smoke skipped (Pillow not installed; pip install -e .[image])"
+    echo "==> [5/5] multimodal smoke skipped (Pillow not installed; pip install -e .[image])"
 fi
 
 echo "All smoke runs OK."
