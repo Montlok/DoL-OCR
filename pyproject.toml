@@ -6,10 +6,19 @@ build-backend = "setuptools.build_meta"
 name = "llm4mglian-tokenizer"
 version = "0.8.0"
 description = "Tokenizer and recurrent-depth transformer for Mongolian + zh/en/ja + multimodal"
-readme = "Tokenizer/README.md"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "KeikaJames" }]
+keywords = ["ocr", "traditional-mongolian", "multimodal", "rdt"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 # `tokenizers` is required to load/encode any tokenizer bundle
 # (GeneralBPEModel.load()/.minimal() and TokenizerBundle.from_dir()), so it is
 # a base runtime dependency, not optional.
@@ -26,8 +35,16 @@ vis = ["timm>=1.0"]
 image = ["Pillow>=9"]
 log = ["tensorboard>=2.14"]
 cli = ["rich>=13"]
-dev = ["pytest>=8.0", "ruff>=0.5"]
+dev = ["build>=1.2", "numpy>=1.24", "pytest>=8.0", "ruff>=0.5"]
+
+[project.urls]
+Repository = "https://github.com/Montlok/DoL-OCR"
+Issues = "https://github.com/Montlok/DoL-OCR/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["Tokenizer*", "Model*"]
+
+[tool.ruff]
+target-version = "py310"
+extend-exclude = ["build", "dist"]
