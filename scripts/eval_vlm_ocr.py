@@ -8,7 +8,7 @@ held-out alignment rows (the :func:`Model.ocr.data.build_ocr_row` contract:
 ``[BOS] <image_start> <image_patch>*N <image_end> <instruction...>`` + target),
 feeds each row's masked prompt plus its page image to
 :meth:`RDTForCausalLM.generate`, and scores the sampled transcription with
-:func:`Model.ocr.metrics.ocr_report` (normalized CER as the headline number).
+:func:`Model.ocr.metrics.ocr_report` (grapheme CER as the headline number).
 
 ``--blank-baseline`` re-runs the same prompts with an all-white page so the
 visual contribution can be isolated: a model that only learned the language
@@ -219,6 +219,12 @@ def print_script_cer(tag: str, rep) -> None:
         )
 
 
+def visual_contribution(real_report, blank_report) -> float:
+    """Return the visual gain measured on the headline grapheme CER."""
+
+    return float(blank_report.grapheme_cer - real_report.grapheme_cer)
+
+
 @torch.no_grad()
 def _decode_batches(model, prompts, pixel_fn, args, device, autocast_ctx):
     """Generate continuations for uniform-length prompt rows.
@@ -402,7 +408,7 @@ def main(argv=None) -> int:
         print_script_cer("[eval/blank]", rep_blank)
         print(
             "[eval] visual contribution (blank_cer - real_cer): "
-            f"{rep_blank.norm_cer - rep.norm_cer:+.4f}"
+            f"{visual_contribution(rep, rep_blank):+.4f}"
         )
 
     if args.out:

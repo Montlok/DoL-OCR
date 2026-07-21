@@ -16,7 +16,11 @@ import torch.nn as nn
 
 from Model.config import OMVTConfig
 from Model.training import save_checkpoint
-from scripts.eval_vlm_ocr import _decode_batches, _restore_omvt_geometry
+from scripts.eval_vlm_ocr import (
+    _decode_batches,
+    _restore_omvt_geometry,
+    visual_contribution,
+)
 
 
 class _RecordingGenerator:
@@ -102,6 +106,11 @@ class EvalVlmDepthContractTest(unittest.TestCase):
             self.assertIsNotNone(restored)
             self.assertEqual(args.image_size, 16)
             self.assertEqual(args.n_image_tokens, 2)
+
+    def test_visual_contribution_uses_headline_grapheme_cer(self) -> None:
+        real = SimpleNamespace(grapheme_cer=0.25, norm_cer=0.90)
+        blank = SimpleNamespace(grapheme_cer=0.70, norm_cer=0.10)
+        self.assertAlmostEqual(visual_contribution(real, blank), 0.45)
 
 
 if __name__ == "__main__":
