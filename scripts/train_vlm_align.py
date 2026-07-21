@@ -11,10 +11,15 @@ projector/tower.
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
+import json
+import math
 import sys
 import time
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
+from typing import Any, Iterator
 
 import torch
 
@@ -68,7 +73,55 @@ def parse_args(argv=None):
             "CUDA/Linux and NaiveSSM on macOS/CPU."
         ),
     )
-    p.add_argument("--steps", type=int, default=4)
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="hard safety ceiling; plateau early stopping may finish sooner",
+    )
+    p.add_argument(
+        "--steps",
+        dest="legacy_steps",
+        type=int,
+        default=None,
+        help="deprecated alias for --max-steps",
+    )
+    p.add_argument(
+        "--min-steps",
+        type=int,
+        default=0,
+        help="minimum optimizer steps before loss-plateau patience is counted",
+    )
+    p.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="smoothed-loss observations without improvement (0 disables)",
+    )
+    p.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="minimum absolute smoothed-loss decrease considered an improvement",
+    )
+    p.add_argument(
+        "--early-stop-mode",
+        choices=("ema", "window"),
+        default="ema",
+        help="loss smoother used for plateau detection",
+    )
+    p.add_argument(
+        "--early-stop-ema-alpha",
+        type=float,
+        default=0.01,
+        help="new-observation weight for EMA smoothing",
+    )
+    p.add_argument(
+        "--early-stop-window",
+        type=int,
+        default=100,
+        help="rolling mean width when --early-stop-mode=window",
+    )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--image-size", type=int, default=56)
     p.add_argument("--seq-len", type=int, default=24)
@@ -95,8 +148,27 @@ def parse_args(argv=None):
     p.add_argument("--stream-hanshi-meta", default="")
     p.add_argument("--stream-hanshi-pages", default="")
     p.add_argument("--stream-tokenizer-bundle", default="")
-    p.add_argument("--stream-max-wds-shards", type=int, default=0)
-    p.add_argument("--stream-prefetch-batches", type=int, default=4)
+    p.add_argument(
+        "--stream-exclude-shard-id",
+        action="append",
+        type=int,
+        default=None,
+        help="WDS shard id to exclude (repeatable; default: known-corrupt 2303)",
+    )
+    p.add_argument(
+        "--stream-max-wds-shards",
+        type=int,
+        default=0,
+        help="smoke-only cap after numeric discovery; 0 uses every usable shard",
+    )
+    p.add_argument(
+        "--stream-prefetch-batches",
+        type=int,
+        default=4,
+        help="bounded read-ahead; the consumed cursor travels with every batch",
+    )
+    p.add_argument("--val-src-doc-min", type=int, default=434600)
+    p.add_argument("--test-src-doc-min", type=int, default=435200)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--output", default="outputs/vlm_align")
     p.add_argument("--init-rdt-checkpoint", default="")
@@ -158,7 +230,192 @@ def parse_args(argv=None):
         help="enable RDT gradient checkpointing (grad_ckpt_recurrent + "
         "grad_ckpt_prelude_coda) to fit long sequences on small GPUs",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.max_steps is not None and args.legacy_steps is not None:
+        p.error("--max-steps and deprecated --steps cannot be used together")
+    args.max_steps = (
+        args.max_steps
+        if args.max_steps is not None
+        else (args.legacy_steps if args.legacy_steps is not None else 4)
+    )
+    if args.max_steps <= 0:
+        p.error("--max-steps must be positive")
+    if args.min_steps < 0 or args.min_steps > args.max_steps:
+        p.error("--min-steps must be between 0 and --max-steps")
+    if args.early_stop_patience < 0:
+        p.error("--early-stop-patience must be non-negative")
+    if not math.isfinite(args.early_stop_min_delta) or args.early_stop_min_delta < 0:
+        p.error("--early-stop-min-delta must be finite and non-negative")
+    if (
+        not math.isfinite(args.early_stop_ema_alpha)
+        or not 0.0 < args.early_stop_ema_alpha <= 1.0
+    ):
+        p.error("--early-stop-ema-alpha must be in (0, 1]")
+    if args.early_stop_window <= 0:
+        p.error("--early-stop-window must be positive")
+    if args.stream_max_wds_shards < 0:
+        p.error("--stream-max-wds-shards must be non-negative")
+    if args.stream_prefetch_batches < 0:
+        p.error("--stream-prefetch-batches must be non-negative")
+    if args.val_src_doc_min < 0 or args.test_src_doc_min <= args.val_src_doc_min:
+        p.error("stream split boundaries must satisfy 0 <= val < test")
+    # Retain the historical attribute for callers that inspect parse_args().
+    args.steps = args.max_steps
+    return args
+
+
+@dataclass
+class LossPlateauEarlyStop:
+    """Serializable smoothed training-loss plateau detector.
+
+    Training loss is noisy enough that raw consecutive-step comparisons are
+    unsafe.  This detector supports either an EMA or a fixed rolling mean and
+    persists all continuation-critical state in checkpoint metadata.
+    """
+
+    mode: str
+    min_steps: int
+    patience: int
+    min_delta: float
+    ema_alpha: float
+    window_size: int
+    best: float | None = None
+    smoothed: float | None = None
+    bad_steps: int = 0
+    observations: int = 0
+    window_values: list[float] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"ema", "window"}:
+            raise ValueError(f"unsupported early-stop mode: {self.mode!r}")
+        if self.min_steps < 0:
+            raise ValueError("early-stop min_steps must be non-negative")
+        if self.patience < 0:
+            raise ValueError("early-stop patience must be non-negative")
+        if not math.isfinite(self.min_delta) or self.min_delta < 0:
+            raise ValueError("early-stop min_delta must be finite and non-negative")
+        if not math.isfinite(self.ema_alpha) or not 0.0 < self.ema_alpha <= 1.0:
+            raise ValueError("early-stop ema_alpha must be in (0, 1]")
+        if self.window_size <= 0:
+            raise ValueError("early-stop window_size must be positive")
+        self._validate_state()
+
+    def _validate_state(self) -> None:
+        for name, value in (("best", self.best), ("smoothed", self.smoothed)):
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(f"early-stop {name} must be finite when present")
+        if self.bad_steps < 0 or self.observations < 0:
+            raise ValueError("early-stop counters must be non-negative")
+        if self.bad_steps > self.observations:
+            raise ValueError("early-stop bad_steps cannot exceed observations")
+        if len(self.window_values) > self.window_size:
+            raise ValueError("early-stop rolling window is larger than window_size")
+        if any(not math.isfinite(float(value)) for value in self.window_values):
+            raise ValueError("early-stop rolling window contains a non-finite loss")
+
+    @property
+    def enabled(self) -> bool:
+        return self.patience > 0
+
+    @classmethod
+    def from_args(
+        cls,
+        args,
+        checkpoint_metadata: dict | None = None,
+    ) -> "LossPlateauEarlyStop":
+        tracker = cls(
+            mode=args.early_stop_mode,
+            min_steps=args.min_steps,
+            patience=args.early_stop_patience,
+            min_delta=args.early_stop_min_delta,
+            ema_alpha=args.early_stop_ema_alpha,
+            window_size=args.early_stop_window,
+        )
+        saved = (checkpoint_metadata or {}).get("early_stop")
+        if not isinstance(saved, dict):
+            return tracker
+        state = saved.get("state")
+        if not isinstance(state, dict):
+            return tracker
+        best = state.get("best")
+        smoothed = state.get("smoothed")
+        tracker.best = None if best is None else float(best)
+        tracker.smoothed = None if smoothed is None else float(smoothed)
+        tracker.bad_steps = int(state.get("bad_steps", 0))
+        tracker.observations = int(state.get("observations", 0))
+        raw_window = state.get("window_values", [])
+        if isinstance(raw_window, list):
+            tracker.window_values = [float(value) for value in raw_window]
+        else:
+            raise ValueError("checkpoint early-stop window_values must be a list")
+        tracker._validate_state()
+        return tracker
+
+    def config_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "mode": self.mode,
+            "min_steps": self.min_steps,
+            "patience": self.patience,
+            "min_delta": self.min_delta,
+            "ema_alpha": self.ema_alpha,
+            "window_size": self.window_size,
+        }
+
+    def state_dict(self) -> dict:
+        return {
+            "best": self.best,
+            "smoothed": self.smoothed,
+            "bad_steps": self.bad_steps,
+            "observations": self.observations,
+            # Required for bit-for-bit continuation in rolling-window mode.
+            "window_values": list(self.window_values),
+        }
+
+    def metadata_dict(self) -> dict:
+        return {"config": self.config_dict(), "state": self.state_dict()}
+
+    def observe(self, loss: float, step: int) -> bool:
+        loss = float(loss)
+        if not math.isfinite(loss):
+            raise FloatingPointError(
+                f"non-finite loss passed to early stopping at step {step}"
+            )
+        self.observations += 1
+        ready = True
+        if self.mode == "ema":
+            self.smoothed = (
+                loss
+                if self.smoothed is None
+                else self.ema_alpha * loss + (1.0 - self.ema_alpha) * self.smoothed
+            )
+        else:
+            self.window_values.append(loss)
+            if len(self.window_values) > self.window_size:
+                del self.window_values[0]
+            self.smoothed = sum(self.window_values) / len(self.window_values)
+            ready = len(self.window_values) == self.window_size
+
+        if not ready:
+            self.bad_steps = 0
+            return False
+        assert self.smoothed is not None
+        if step < self.min_steps:
+            # Burn-in follows the current loss level instead of retaining an
+            # anomalously low early value that could consume patience later.
+            self.best = self.smoothed
+            self.bad_steps = 0
+            return False
+
+        improved = self.best is None or self.smoothed < self.best - self.min_delta
+        if improved:
+            self.best = self.smoothed
+            self.bad_steps = 0
+        else:
+            self.bad_steps += 1
+        return (
+            self.enabled and step >= self.min_steps and self.bad_steps >= self.patience
+        )
 
 
 def _build_omvt_cfg(args, checkpoint_metadata: dict | None = None) -> OMVTConfig:
@@ -273,9 +530,7 @@ def _load_rdt_init(model: RDTForCausalLM, path: str) -> None:
     )
     bad_missing = [k for k in missing if k not in allowed_missing]
     if bad_missing or unexpected:
-        detail = (
-            f"missing={bad_missing[:8]} unexpected={list(unexpected)[:8]}"
-        )
+        detail = f"missing={bad_missing[:8]} unexpected={list(unexpected)[:8]}"
         raise RuntimeError(
             f"RDT checkpoint {path} does not exactly match the language model; "
             f"refusing to freeze partially loaded weights ({detail})"
@@ -301,7 +556,9 @@ def _configure_trainable_modules(model: RDTForCausalLM, args) -> list[str]:
 
     trainable_names = [name for name, p in model.named_parameters() if p.requires_grad]
     if args.freeze_rdt:
-        leaked = [name for name in trainable_names if not name.startswith("vision.omvt.")]
+        leaked = [
+            name for name in trainable_names if not name.startswith("vision.omvt.")
+        ]
         if leaked:
             raise RuntimeError(
                 "--freeze-rdt left non-OMVT parameters trainable: "
@@ -319,6 +576,9 @@ def _alignment_metadata(
     train_cfg: TrainingConfig,
     *,
     inherited: dict | None = None,
+    early_stopper: LossPlateauEarlyStop | None = None,
+    streaming: dict[str, Any] | None = None,
+    stop_reason: str = "",
     final: bool = False,
 ) -> dict:
     inherited = inherited or {}
@@ -333,18 +593,47 @@ def _alignment_metadata(
         "recurrent_steps": int(rdt_cfg.recurrent_steps),
         "mamba_backend": "official" if rdt_cfg.use_official_mamba else "naive",
         "source_rdt_checkpoint": (
-            args.init_rdt_checkpoint
-            or inherited.get("source_rdt_checkpoint", "")
+            args.init_rdt_checkpoint or inherited.get("source_rdt_checkpoint", "")
         ),
         "source_omvt_checkpoint": (
-            args.init_omvt_checkpoint
-            or inherited.get("source_omvt_checkpoint", "")
+            args.init_omvt_checkpoint or inherited.get("source_omvt_checkpoint", "")
         ),
         "use_ema_tower": bool(
             args.use_ema_tower or inherited.get("use_ema_tower", False)
         ),
+        "early_stop": (
+            early_stopper.metadata_dict() if early_stopper is not None else {}
+        ),
+        "streaming": copy.deepcopy(
+            streaming if streaming is not None else inherited.get("streaming", {})
+        ),
+        "stop_reason": stop_reason,
         "final": bool(final),
     }
+
+
+def _early_stop_resume_conflicts(
+    args,
+    checkpoint_metadata: dict,
+) -> list[str]:
+    current = LossPlateauEarlyStop.from_args(args).config_dict()
+    saved = checkpoint_metadata.get("early_stop")
+    if not isinstance(saved, dict):
+        return ["checkpoint has no early_stop metadata"] if current["enabled"] else []
+    saved_config = saved.get("config")
+    if not isinstance(saved_config, dict):
+        return ["checkpoint has no early_stop config"] if current["enabled"] else []
+    conflicts = []
+    for key, current_value in current.items():
+        if key not in saved_config:
+            conflicts.append(f"{key}: missing from checkpoint metadata")
+        elif saved_config[key] != current_value:
+            conflicts.append(
+                f"{key}: checkpoint={saved_config[key]!r} current={current_value!r}"
+            )
+    if current["enabled"] and not isinstance(saved.get("state"), dict):
+        conflicts.append("checkpoint has no early_stop state")
+    return conflicts
 
 
 _RESUME_MUTABLE_TRAINING_FIELDS = {
@@ -381,8 +670,8 @@ def _resume_training_conflicts(
         ]
     current = asdict(train_cfg)
     conflicts: list[str] = []
-    for field in fields(TrainingConfig):
-        name = field.name
+    for config_field in fields(TrainingConfig):
+        name = config_field.name
         if name in _RESUME_MUTABLE_TRAINING_FIELDS:
             continue
         if name not in saved:
@@ -394,7 +683,9 @@ def _resume_training_conflicts(
     return conflicts
 
 
-def _fast_forward_stream(batch_iter, resumed_step: int, train_cfg: TrainingConfig) -> None:
+def _fast_forward_stream(
+    batch_iter, resumed_step: int, train_cfg: TrainingConfig
+) -> None:
     skip = resumed_step * train_cfg.grad_accum_steps
     if skip <= 0:
         return
@@ -433,31 +724,148 @@ def _load_omvt_init(model: RDTForCausalLM, path: str, use_ema: bool = False) -> 
     model.vision.omvt.tower.load_state_dict(_resolve_omvt_state(path, use_ema=use_ema))
 
 
-def _stream_vlm_batches(args, omvt_cfg: OMVTConfig):
+@dataclass(frozen=True)
+class StreamingCorpusSpec:
+    paths: tuple[Path, ...]
+    manifest: dict[str, Any]
+    manifest_sha256: str
+    tokenizer_manifest_sha256: str
+    tokenizer_bundle: Any
+    resume_cursor: dict[str, Any] | None
+
+
+class CursorTrackingIterator(Iterator[dict[str, Any]]):
+    """Commit only the data cursor consumed by a completed optimizer step."""
+
+    def __init__(
+        self,
+        iterable,
+        *,
+        initial_cursor: dict[str, Any],
+    ) -> None:
+        self._iterator = iter(iterable)
+        self.pending_cursor = copy.deepcopy(initial_cursor)
+        self.committed_cursor = copy.deepcopy(initial_cursor)
+
+    def __iter__(self) -> "CursorTrackingIterator":
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        batch = next(self._iterator)
+        cursor = batch.get("corpus_cursor")
+        if not isinstance(cursor, dict):
+            raise RuntimeError("streaming batch is missing its exact corpus cursor")
+        self.pending_cursor = copy.deepcopy(cursor)
+        return batch
+
+    def commit(self) -> None:
+        self.committed_cursor = copy.deepcopy(self.pending_cursor)
+
+
+def _canonical_sha256(value: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _prepare_streaming_corpus(
+    args,
+    checkpoint_metadata: dict[str, Any],
+) -> StreamingCorpusSpec:
+    """Validate every source identity before allocating the training model."""
+
+    from Model.ocr.streaming_corpus import (
+        corpus_manifest,
+        discover_wds_shards,
+        validate_cursor,
+    )
+    from Tokenizer.unified.bundle import TokenizerBundle, read_manifest
+
+    excluded_ids = args.stream_exclude_shard_id or [2303]
+    paths = discover_wds_shards(
+        args.stream_wds_dir,
+        exclude_ids=excluded_ids,
+        limit=args.stream_max_wds_shards,
+    )
+    manifest, manifest_sha = corpus_manifest(
+        paths,
+        hanshi_meta=args.stream_hanshi_meta,
+        hanshi_pages=args.stream_hanshi_pages,
+        excluded_shard_ids=excluded_ids,
+        val_src_doc_min=args.val_src_doc_min,
+        test_src_doc_min=args.test_src_doc_min,
+        seed=args.seed,
+    )
+
+    bundle = TokenizerBundle.from_dir(args.stream_tokenizer_bundle)
+    issues = bundle.validate()
+    if issues:
+        detail = "; ".join(issues[:8])
+        raise ValueError(f"invalid streaming tokenizer bundle: {detail}")
+    tokenizer_manifest = read_manifest(args.stream_tokenizer_bundle)
+    if not tokenizer_manifest:
+        raise ValueError("streaming tokenizer bundle has no manifest.json")
+    tokenizer_sha = _canonical_sha256(tokenizer_manifest)
+
+    resume_cursor = None
+    if args.resume:
+        saved = checkpoint_metadata.get("streaming")
+        if not isinstance(saved, dict):
+            raise ValueError("streaming resume checkpoint has no streaming metadata")
+        expected = {
+            "corpus_manifest_sha256": manifest_sha,
+            "tokenizer_manifest_sha256": tokenizer_sha,
+        }
+        for key, current in expected.items():
+            previous = saved.get(key)
+            if previous != current:
+                raise ValueError(
+                    f"streaming resume {key} mismatch: "
+                    f"checkpoint={previous!r} current={current!r}"
+                )
+        raw_cursor = saved.get("corpus_cursor")
+        if not isinstance(raw_cursor, dict):
+            raise ValueError("streaming resume checkpoint has no corpus_cursor")
+        resume_cursor = validate_cursor(raw_cursor)
+
+    return StreamingCorpusSpec(
+        paths=tuple(paths),
+        manifest=manifest,
+        manifest_sha256=manifest_sha,
+        tokenizer_manifest_sha256=tokenizer_sha,
+        tokenizer_bundle=bundle,
+        resume_cursor=resume_cursor,
+    )
+
+
+def _stream_vlm_batches(
+    args,
+    omvt_cfg: OMVTConfig,
+    spec: StreamingCorpusSpec,
+) -> CursorTrackingIterator:
     """Build frozen-RDT OCR batches directly from x2 WDS + Hanshi NAS data."""
 
-    from Model.ocr.streaming_corpus import MixedOCRCorpus, discover_wds_shards
-    from Tokenizer.unified.bundle import TokenizerBundle
+    from Model.ocr.streaming_corpus import MixedOCRCorpus
     from scripts.build_ocr_data import make_ocr_target_encoder
     from scripts.train_ctc_head import _prefetch_batches
 
-    paths = discover_wds_shards(
-        args.stream_wds_dir,
-        exclude_ids=[2303],
-        limit=args.stream_max_wds_shards,
-    )
-    bundle = TokenizerBundle.from_dir(args.stream_tokenizer_bundle)
-    encode_target = make_ocr_target_encoder(bundle.tokenizer)
+    encode_target = make_ocr_target_encoder(spec.tokenizer_bundle.tokenizer)
     max_target_len = args.seq_len - omvt_cfg.compress_to - 4
     if max_target_len <= 0:
         raise ValueError("stream seq_len leaves no room for an OCR target")
     corpus = MixedOCRCorpus(
-        paths,
+        spec.paths,
         hanshi_meta=args.stream_hanshi_meta,
         hanshi_pages=args.stream_hanshi_pages,
         image_size=omvt_cfg.image_size,
         seed=args.seed,
+        val_src_doc_min=args.val_src_doc_min,
         max_target_len=max_target_len,
+        cursor=spec.resume_cursor,
     )
     collator = PretrainingCollator(pad_id=PAD_ID, max_seq_len=args.seq_len)
 
@@ -484,18 +892,18 @@ def _stream_vlm_batches(args, omvt_cfg: OMVTConfig):
                 row.pop("images", None)
                 rows.append(row)
             batch = collator(rows)
-            batch["pixel_values"] = dict(
-                collate_omvt_batch(visual["pixels"], omvt_cfg)
-            )
+            batch["pixel_values"] = dict(collate_omvt_batch(visual["pixels"], omvt_cfg))
             batch["corpus_cursor"] = visual["corpus_cursor"]
             yield batch
 
     print(
-        f"[stream] WDS shards={len(paths)} + Hanshi; mix=2:1; "
-        f"batch={args.batch_size}",
+        f"[stream] WDS shards={len(spec.paths)} + Hanshi; mix=2:1; "
+        f"batch={args.batch_size}; full_corpus={args.stream_max_wds_shards == 0}; "
+        f"manifest_sha256={spec.manifest_sha256}",
         flush=True,
     )
-    return iter(_prefetch_batches(_iter(), args.stream_prefetch_batches))
+    prefetched = _prefetch_batches(_iter(), args.stream_prefetch_batches)
+    return CursorTrackingIterator(prefetched, initial_cursor=corpus.state_dict())
 
 
 def main(argv=None):
@@ -517,6 +925,20 @@ def main(argv=None):
     if stream_mode and args.data:
         print(
             "scripts.train_vlm_align: --data and direct corpus streaming are exclusive",
+            file=sys.stderr,
+        )
+        return 2
+    if stream_mode and not args.freeze_rdt:
+        print(
+            "scripts.train_vlm_align: full-corpus visual training requires "
+            "--freeze-rdt so no language parameter can update",
+            file=sys.stderr,
+        )
+        return 2
+    if stream_mode and args.stream_max_wds_shards and not args.smoke:
+        print(
+            "scripts.train_vlm_align: --stream-max-wds-shards is restricted to "
+            "--smoke runs; production streaming must expose every usable shard",
             file=sys.stderr,
         )
         return 2
@@ -550,10 +972,13 @@ def main(argv=None):
         return 2
 
     source_path = args.resume or args.init_rdt_checkpoint
+    stream_spec: StreamingCorpusSpec | None = None
     try:
         source_metadata = _checkpoint_metadata(source_path)
+        if stream_mode:
+            stream_spec = _prepare_streaming_corpus(args, source_metadata)
         omvt_cfg = _build_omvt_cfg(args, source_metadata)
-    except (FileNotFoundError, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         print(f"scripts/train_vlm_align: {exc}", file=sys.stderr)
         return 2
     if args.n_image_tokens is None:
@@ -575,9 +1000,8 @@ def main(argv=None):
         return 2
     if args.resume and source_metadata:
         for key in ("freeze_rdt", "frozen_vision"):
-            if (
-                key in source_metadata
-                and bool(source_metadata[key]) != bool(getattr(args, key))
+            if key in source_metadata and bool(source_metadata[key]) != bool(
+                getattr(args, key)
             ):
                 print(
                     f"scripts/train_vlm_align: resume {key}={getattr(args, key)} "
@@ -621,7 +1045,7 @@ def main(argv=None):
         micro_batch_size=args.batch_size,
         learning_rate=args.lr,
         weight_decay=0.05,
-        max_steps=args.steps,
+        max_steps=args.max_steps,
         warmup_steps=max(1, args.warmup_steps),
         precision=precision,
         output_dir=args.output,
@@ -643,6 +1067,35 @@ def main(argv=None):
             if len(conflicts) > 12:
                 print(f"  - ... and {len(conflicts) - 12} more", file=sys.stderr)
             return 2
+        early_stop_conflicts = _early_stop_resume_conflicts(args, source_metadata)
+        if early_stop_conflicts:
+            print(
+                "scripts/train_vlm_align: resume early-stop state conflicts with "
+                "the checkpoint; refusing to reset plateau history:",
+                file=sys.stderr,
+            )
+            for conflict in early_stop_conflicts:
+                print(f"  - {conflict}", file=sys.stderr)
+            return 2
+        if source_metadata.get("stop_reason") == "loss_plateau":
+            print(
+                "scripts/train_vlm_align: checkpoint already completed because "
+                "loss plateaued; use it as an initialization checkpoint for a "
+                "deliberately new run",
+                file=sys.stderr,
+            )
+            return 2
+
+    try:
+        early_stopper = LossPlateauEarlyStop.from_args(
+            args,
+            source_metadata if args.resume else None,
+        )
+    except (TypeError, ValueError) as exc:
+        print(
+            f"scripts/train_vlm_align: invalid early-stop state: {exc}", file=sys.stderr
+        )
+        return 2
 
     model = RDTForCausalLM(rdt_cfg).to(device)
     # plug in matching-size OMVT injector (otherwise dispatcher would build
@@ -677,36 +1130,101 @@ def main(argv=None):
 
     t0 = time.time()
     completed = False
+    stop_reason = ""
+    stream_batch_iter: CursorTrackingIterator | None = None
+
+    def _streaming_checkpoint_metadata() -> dict[str, Any] | None:
+        if stream_spec is None:
+            return None
+        if stream_batch_iter is None:
+            cursor = stream_spec.resume_cursor
+        else:
+            cursor = stream_batch_iter.committed_cursor
+        return {
+            "corpus_manifest": stream_spec.manifest,
+            "corpus_manifest_sha256": stream_spec.manifest_sha256,
+            "tokenizer_manifest_sha256": stream_spec.tokenizer_manifest_sha256,
+            "corpus_cursor": copy.deepcopy(cursor),
+            "corpus_complete": stop_reason == "corpus_exhausted",
+        }
+
+    def _save(*, final: bool = False) -> None:
+        save_checkpoint(
+            args.output,
+            state.step,
+            model,
+            optimizer,
+            scheduler,
+            metadata=_alignment_metadata(
+                args,
+                rdt_cfg,
+                omvt_cfg,
+                train_cfg,
+                inherited=source_metadata,
+                early_stopper=early_stopper,
+                streaming=_streaming_checkpoint_metadata(),
+                stop_reason=stop_reason,
+                final=final,
+            ),
+            keep_last_n=args.keep_last_n,
+        )
+
+    def _record_completed_step(metrics: dict[str, float]) -> bool:
+        nonlocal stop_reason
+        if stream_batch_iter is not None:
+            stream_batch_iter.commit()
+        should_stop = early_stopper.observe(metrics["loss"], state.step)
+        logged = {"loss": float(metrics["loss"])}
+        for key in ("grad_norm", "lr", "tokens"):
+            value = metrics.get(key)
+            if value is not None and math.isfinite(float(value)):
+                logged[key] = float(value)
+        if early_stopper.enabled:
+            if early_stopper.smoothed is not None:
+                logged["early_stop_smoothed_loss"] = early_stopper.smoothed
+            if early_stopper.best is not None:
+                logged["early_stop_best_loss"] = early_stopper.best
+            logged["early_stop_bad_steps"] = float(early_stopper.bad_steps)
+        logger.log(state.step, logged)
+        if should_stop:
+            stop_reason = "loss_plateau"
+            print(
+                f"[early-stop] loss plateau at step {state.step}: "
+                f"smoothed={early_stopper.smoothed:.8f} "
+                f"best={early_stopper.best:.8f} "
+                f"bad_steps={early_stopper.bad_steps}/"
+                f"{early_stopper.patience}",
+                flush=True,
+            )
+        if args.save_every and state.step % args.save_every == 0:
+            _save()
+        return should_stop
+
     try:
         if stream_mode:
-            batch_iter = _stream_vlm_batches(args, omvt_cfg)
-            while state.step < args.steps:
-                metrics = train_one_step(
-                    model,
-                    batch_iter,
-                    optimizer,
-                    scheduler,
-                    train_cfg,
-                    state,
-                    device=device,
-                )
-                logger.log(state.step, {"loss": metrics["loss"]})
-                if args.save_every and state.step % args.save_every == 0:
-                    save_checkpoint(
-                        args.output,
-                        state.step,
+            assert stream_spec is not None
+            stream_batch_iter = _stream_vlm_batches(args, omvt_cfg, stream_spec)
+            while state.step < args.max_steps:
+                try:
+                    metrics = train_one_step(
                         model,
+                        stream_batch_iter,
                         optimizer,
                         scheduler,
-                        metadata=_alignment_metadata(
-                            args,
-                            rdt_cfg,
-                            omvt_cfg,
-                            train_cfg,
-                            inherited=source_metadata,
-                        ),
-                        keep_last_n=args.keep_last_n,
+                        train_cfg,
+                        state,
+                        device=device,
                     )
+                except StopIteration:
+                    stop_reason = "corpus_exhausted"
+                    print(
+                        "[stream] corpus exhausted: every eligible source row "
+                        "was exposed once",
+                        flush=True,
+                    )
+                    break
+                if _record_completed_step(metrics):
+                    break
         elif args.data:
             # Real-data path: pull pixel-aware batches from the streaming
             # JSONL dataloader and reuse the canonical train_one_step so
@@ -723,7 +1241,7 @@ def main(argv=None):
             batch_iter = iter(dataloader)
             if args.resume and train_cfg.resume_skip_data and state.step > 0:
                 _fast_forward_stream(batch_iter, state.step, train_cfg)
-            while state.step < args.steps:
+            while state.step < args.max_steps:
                 metrics = train_one_step(
                     model,
                     batch_iter,
@@ -733,25 +1251,10 @@ def main(argv=None):
                     state,
                     device=device,
                 )
-                logger.log(state.step, {"loss": metrics["loss"]})
-                if args.save_every and state.step % args.save_every == 0:
-                    save_checkpoint(
-                        args.output,
-                        state.step,
-                        model,
-                        optimizer,
-                        scheduler,
-                        metadata=_alignment_metadata(
-                            args,
-                            rdt_cfg,
-                            omvt_cfg,
-                            train_cfg,
-                            inherited=source_metadata,
-                        ),
-                        keep_last_n=args.keep_last_n,
-                    )
+                if _record_completed_step(metrics):
+                    break
         else:
-            while state.step < args.steps:
+            while state.step < args.max_steps:
                 step = state.step + 1
                 input_ids, attention_mask, labels = _make_text_batch(args)
                 input_ids = input_ids.to(device)
@@ -782,50 +1285,30 @@ def main(argv=None):
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                clip_or_check_grad_norm(model, 1.0, step=step)
+                grad_norm = clip_or_check_grad_norm(model, 1.0, step=step)
                 optimizer.step()
                 scheduler.step()
                 state.step = step
 
-                logger.log(step, {"loss": float(loss.detach())})
-                if args.save_every and step % args.save_every == 0:
-                    save_checkpoint(
-                        args.output,
-                        step,
-                        model,
-                        optimizer,
-                        scheduler,
-                        metadata=_alignment_metadata(
-                            args,
-                            rdt_cfg,
-                            omvt_cfg,
-                            train_cfg,
-                            inherited=source_metadata,
-                        ),
-                        keep_last_n=args.keep_last_n,
-                    )
+                metrics = {
+                    "loss": float(loss.detach()),
+                    "grad_norm": grad_norm,
+                    "lr": float(scheduler.get_last_lr()[0]),
+                }
+                if _record_completed_step(metrics):
+                    break
+        if not stop_reason:
+            stop_reason = "max_steps"
         completed = True
     finally:
         logger.close()
         if completed and not args.smoke:
-            save_checkpoint(
-                args.output,
-                state.step,
-                model,
-                optimizer,
-                scheduler,
-                metadata=_alignment_metadata(
-                    args,
-                    rdt_cfg,
-                    omvt_cfg,
-                    train_cfg,
-                    inherited=source_metadata,
-                    final=True,
-                ),
-                keep_last_n=args.keep_last_n,
-            )
+            _save(final=True)
     mode = "nas-stream" if stream_mode else ("real-data" if args.data else "smoke")
-    print(f"VLM align {mode} run OK in {time.time() - t0:.1f}s")
+    print(
+        f"VLM align {mode} run OK in {time.time() - t0:.1f}s "
+        f"(step={state.step}, stop_reason={stop_reason})"
+    )
     return 0
 
 

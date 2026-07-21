@@ -28,6 +28,71 @@ from scripts import train_vlm_align
 
 
 class TrainVlmAlignCliGuardsTest(unittest.TestCase):
+    def test_steps_alias_resolves_to_max_steps(self) -> None:
+        args = train_vlm_align.parse_args(["--steps", "9"])
+        self.assertEqual(args.max_steps, 9)
+        self.assertEqual(args.steps, 9)
+
+    def test_early_stop_cli_bounds_are_validated(self) -> None:
+        invalid = (
+            ["--max-steps", "0"],
+            ["--max-steps", "5", "--min-steps", "6"],
+            ["--early-stop-patience", "-1"],
+            ["--early-stop-min-delta", "nan"],
+            ["--early-stop-ema-alpha", "0"],
+            ["--early-stop-window", "0"],
+        )
+        for argv in invalid:
+            with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                train_vlm_align.parse_args(argv)
+
+    def test_full_corpus_stream_requires_frozen_language(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(train_vlm_align, "RDTForCausalLM") as model_ctor,
+            contextlib.redirect_stderr(stderr),
+        ):
+            rc = train_vlm_align.main(
+                [
+                    "--stream-wds-dir",
+                    "wds",
+                    "--stream-hanshi-meta",
+                    "meta.jsonl",
+                    "--stream-hanshi-pages",
+                    "pages",
+                    "--stream-tokenizer-bundle",
+                    "tokenizer",
+                ]
+            )
+        self.assertEqual(rc, 2)
+        model_ctor.assert_not_called()
+        self.assertIn("--freeze-rdt", stderr.getvalue())
+
+    def test_partial_wds_cap_is_smoke_only(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(train_vlm_align, "RDTForCausalLM") as model_ctor,
+            contextlib.redirect_stderr(stderr),
+        ):
+            rc = train_vlm_align.main(
+                [
+                    "--stream-wds-dir",
+                    "wds",
+                    "--stream-hanshi-meta",
+                    "meta.jsonl",
+                    "--stream-hanshi-pages",
+                    "pages",
+                    "--stream-tokenizer-bundle",
+                    "tokenizer",
+                    "--stream-max-wds-shards",
+                    "1",
+                    "--freeze-rdt",
+                ]
+            )
+        self.assertEqual(rc, 2)
+        model_ctor.assert_not_called()
+        self.assertIn("restricted to --smoke", stderr.getvalue())
+
     def test_non_positive_image_size_fails_cleanly(self) -> None:
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -52,12 +117,18 @@ class TrainVlmAlignCliGuardsTest(unittest.TestCase):
             ),
             contextlib.redirect_stderr(stderr),
         ):
-            rc = train_vlm_align.main([
-                "--mamba", "official",
-                "--image-size", "4",
-                "--n-image-tokens", "1",
-                "--seq-len", "8",
-            ])
+            rc = train_vlm_align.main(
+                [
+                    "--mamba",
+                    "official",
+                    "--image-size",
+                    "4",
+                    "--n-image-tokens",
+                    "1",
+                    "--seq-len",
+                    "8",
+                ]
+            )
         self.assertEqual(rc, 2)
         msg = stderr.getvalue()
         self.assertIn("--mamba official", msg)
@@ -66,14 +137,190 @@ class TrainVlmAlignCliGuardsTest(unittest.TestCase):
     def test_non_positive_recurrent_steps_fails_cleanly(self) -> None:
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            rc = train_vlm_align.main([
-                "--image-size", "4",
-                "--n-image-tokens", "1",
-                "--seq-len", "8",
-                "--recurrent-steps", "0",
-            ])
+            rc = train_vlm_align.main(
+                [
+                    "--image-size",
+                    "4",
+                    "--n-image-tokens",
+                    "1",
+                    "--seq-len",
+                    "8",
+                    "--recurrent-steps",
+                    "0",
+                ]
+            )
         self.assertEqual(rc, 2)
         self.assertIn("--recurrent-steps", stderr.getvalue())
+
+
+class LossPlateauEarlyStopTest(unittest.TestCase):
+    def _tracker(self, **overrides) -> train_vlm_align.LossPlateauEarlyStop:
+        values = {
+            "mode": "ema",
+            "min_steps": 0,
+            "patience": 2,
+            "min_delta": 0.0,
+            "ema_alpha": 1.0,
+            "window_size": 3,
+        }
+        values.update(overrides)
+        return train_vlm_align.LossPlateauEarlyStop(**values)
+
+    def test_burn_in_does_not_anchor_to_an_early_low_outlier(self) -> None:
+        tracker = self._tracker(min_steps=3)
+        self.assertFalse(tracker.observe(1.0, 1))
+        self.assertFalse(tracker.observe(5.0, 2))
+        self.assertEqual(tracker.best, 5.0)
+        self.assertFalse(tracker.observe(5.0, 3))
+        self.assertTrue(tracker.observe(5.0, 4))
+
+    def test_min_delta_requires_a_material_loss_improvement(self) -> None:
+        tracker = self._tracker(patience=3, min_delta=0.1)
+        self.assertFalse(tracker.observe(5.0, 1))
+        self.assertFalse(tracker.observe(4.95, 2))
+        self.assertEqual(tracker.bad_steps, 1)
+        self.assertFalse(tracker.observe(4.8, 3))
+        self.assertEqual(tracker.best, 4.8)
+        self.assertEqual(tracker.bad_steps, 0)
+
+    def test_rolling_window_state_resumes_exactly(self) -> None:
+        tracker = self._tracker(mode="window", patience=2)
+        tracker.observe(5.0, 1)
+        tracker.observe(4.0, 2)
+        args = SimpleNamespace(
+            early_stop_mode="window",
+            min_steps=0,
+            early_stop_patience=2,
+            early_stop_min_delta=0.0,
+            early_stop_ema_alpha=1.0,
+            early_stop_window=3,
+        )
+        restored = train_vlm_align.LossPlateauEarlyStop.from_args(
+            args, {"early_stop": tracker.metadata_dict()}
+        )
+        self.assertEqual(restored.state_dict(), tracker.state_dict())
+        for step, loss in enumerate((3.0, 3.0, 3.0), start=3):
+            self.assertEqual(
+                restored.observe(loss, step),
+                tracker.observe(loss, step),
+            )
+            self.assertEqual(restored.state_dict(), tracker.state_dict())
+
+    def test_enabled_resume_requires_saved_plateau_state(self) -> None:
+        args = train_vlm_align.parse_args(["--early-stop-patience", "10"])
+        conflicts = train_vlm_align._early_stop_resume_conflicts(args, {})
+        self.assertTrue(conflicts)
+        self.assertIn("no early_stop metadata", conflicts[0])
+
+    def test_cursor_advances_only_after_optimizer_commit(self) -> None:
+        initial = {"counts": {"total": 0}}
+        iterator = train_vlm_align.CursorTrackingIterator(
+            iter(
+                [
+                    {"corpus_cursor": {"counts": {"total": 2}}},
+                    {"corpus_cursor": {"counts": {"total": 4}}},
+                ]
+            ),
+            initial_cursor=initial,
+        )
+        next(iterator)
+        self.assertEqual(iterator.committed_cursor, initial)
+        iterator.commit()
+        self.assertEqual(iterator.committed_cursor["counts"]["total"], 2)
+        next(iterator)
+        self.assertEqual(iterator.committed_cursor["counts"]["total"], 2)
+
+    def test_stream_loop_stops_on_plateau_and_checkpoints_committed_cursor(
+        self,
+    ) -> None:
+        cursors = [{"version": 1, "counts": {"total": total}} for total in range(4)]
+        batch_iter = train_vlm_align.CursorTrackingIterator(
+            iter({"corpus_cursor": cursor} for cursor in cursors[1:]),
+            initial_cursor=cursors[0],
+        )
+        spec = train_vlm_align.StreamingCorpusSpec(
+            paths=(Path("shard-00000.tar"),),
+            manifest={"version": 1},
+            manifest_sha256="corpus-sha",
+            tokenizer_manifest_sha256="tokenizer-sha",
+            tokenizer_bundle=None,
+            resume_cursor=None,
+        )
+        losses = iter((1.0, 1.0, 1.0))
+
+        def fake_train_one_step(
+            _model,
+            iterator,
+            _optimizer,
+            _scheduler,
+            _train_cfg,
+            state,
+            *,
+            device,
+        ):
+            self.assertEqual(device.type, "cpu")
+            next(iterator)
+            state.step += 1
+            return {"loss": next(losses), "grad_norm": 1.0, "lr": 1e-4}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(
+                    train_vlm_align, "_checkpoint_metadata", return_value={}
+                ),
+                mock.patch.object(
+                    train_vlm_align, "_prepare_streaming_corpus", return_value=spec
+                ),
+                mock.patch.object(
+                    train_vlm_align, "_build_omvt_cfg", return_value=_tiny_omvt()
+                ),
+                mock.patch.object(
+                    train_vlm_align, "_build_rdt_cfg", return_value=_tiny_rdt()
+                ),
+                mock.patch.object(
+                    train_vlm_align,
+                    "_stream_vlm_batches",
+                    return_value=batch_iter,
+                ),
+                mock.patch.object(
+                    train_vlm_align,
+                    "train_one_step",
+                    side_effect=fake_train_one_step,
+                ),
+                mock.patch.object(train_vlm_align, "save_checkpoint") as save_mock,
+            ):
+                rc = train_vlm_align.main(
+                    [
+                        "--stream-wds-dir",
+                        "wds",
+                        "--stream-hanshi-meta",
+                        "meta.jsonl",
+                        "--stream-hanshi-pages",
+                        "pages",
+                        "--stream-tokenizer-bundle",
+                        "tokenizer",
+                        "--freeze-rdt",
+                        "--max-steps",
+                        "5",
+                        "--early-stop-patience",
+                        "2",
+                        "--early-stop-ema-alpha",
+                        "1",
+                        "--device",
+                        "cpu",
+                        "--mamba",
+                        "naive",
+                        "--output",
+                        tmp,
+                    ]
+                )
+        self.assertEqual(rc, 0)
+        save_mock.assert_called_once()
+        metadata = save_mock.call_args.kwargs["metadata"]
+        self.assertEqual(metadata["stop_reason"], "loss_plateau")
+        self.assertTrue(metadata["final"])
+        self.assertEqual(metadata["early_stop"]["state"]["bad_steps"], 2)
+        self.assertEqual(metadata["streaming"]["corpus_cursor"]["counts"]["total"], 3)
 
 
 def _tiny_rdt() -> RDTConfig:
@@ -222,9 +469,7 @@ class TrainVlmAlignFreezeContractTest(unittest.TestCase):
         self.assertTrue(any(item.startswith("warmup_steps:") for item in conflicts))
 
     def test_legacy_resume_without_training_metadata_is_rejected(self) -> None:
-        conflicts = train_vlm_align._resume_training_conflicts(
-            TrainingConfig(), {}
-        )
+        conflicts = train_vlm_align._resume_training_conflicts(TrainingConfig(), {})
         self.assertEqual(len(conflicts), 1)
         self.assertIn("--init-rdt-checkpoint", conflicts[0])
 
@@ -256,20 +501,33 @@ class TrainVlmAlignFreezeContractTest(unittest.TestCase):
                 mock.patch.object(train_vlm_align, "RDTForCausalLM") as model_ctor,
                 contextlib.redirect_stderr(stderr),
             ):
-                rc = train_vlm_align.main([
-                    "--resume", str(step),
-                    "--freeze-rdt",
-                    "--data", "align.jsonl",
-                    "--image-size", "16",
-                    "--n-image-tokens", "2",
-                    "--seq-len", "512",
-                    "--steps", "6000",
-                    "--batch-size", "16",
-                    "--warmup-steps", "500",
-                    "--precision", "bf16",
-                    "--device", "cpu",
-                    "--mamba", "naive",
-                ])
+                rc = train_vlm_align.main(
+                    [
+                        "--resume",
+                        str(step),
+                        "--freeze-rdt",
+                        "--data",
+                        "align.jsonl",
+                        "--image-size",
+                        "16",
+                        "--n-image-tokens",
+                        "2",
+                        "--seq-len",
+                        "512",
+                        "--steps",
+                        "6000",
+                        "--batch-size",
+                        "16",
+                        "--warmup-steps",
+                        "500",
+                        "--precision",
+                        "bf16",
+                        "--device",
+                        "cpu",
+                        "--mamba",
+                        "naive",
+                    ]
+                )
             self.assertEqual(rc, 2)
             model_ctor.assert_not_called()
             self.assertIn("micro_batch_size", stderr.getvalue())
@@ -311,16 +569,20 @@ class TrainVlmAlignFreezeContractTest(unittest.TestCase):
         image = torch.randn(1, 3, 16, 16)
         pixels = dict(collate_omvt_batch(image, _tiny_omvt()))
         cfg = _tiny_rdt()
-        ids = torch.tensor([[
-            cfg.bos_id,
-            cfg.image_patch_id,
-            cfg.image_patch_id,
-            300,
-            301,
-            302,
-            303,
-            cfg.eos_id,
-        ]])
+        ids = torch.tensor(
+            [
+                [
+                    cfg.bos_id,
+                    cfg.image_patch_id,
+                    cfg.image_patch_id,
+                    300,
+                    301,
+                    302,
+                    303,
+                    cfg.eos_id,
+                ]
+            ]
+        )
         out = model(
             input_ids=ids,
             attention_mask=torch.ones_like(ids),
