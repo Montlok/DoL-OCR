@@ -75,4 +75,6 @@ credentials/
 
 # local-only (do not commit)
 .claude/
+/AGENTS.local.md
+/RUNBOOK.local.md
 /outputs

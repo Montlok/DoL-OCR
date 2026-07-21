@@ -11,7 +11,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from Model.training.checkpoint import load_checkpoint, resume_state, save_checkpoint
+from Model.training.checkpoint import (
+    load_checkpoint,
+    load_checkpoint_metadata,
+    resolve_checkpoint_dir,
+    resume_state,
+    save_checkpoint,
+)
 from Model.training.loop import TrainState
 
 
@@ -89,6 +95,24 @@ class CheckpointScalerStateTest(unittest.TestCase):
             save_checkpoint(root, 3, model, optimizer, scheduler, keep_last_n=0)
             payload = load_checkpoint(root)
             self.assertEqual(payload.step, 3)
+
+    def test_metadata_and_step_dir_resolve_without_loading_optimizer(self) -> None:
+        model, optimizer, scheduler = self._make_artifacts()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_checkpoint(
+                root,
+                7,
+                model,
+                optimizer,
+                scheduler,
+                metadata={"rdt_config": {"recurrent_steps": 4}},
+            )
+            self.assertEqual(resolve_checkpoint_dir(root).name, "step_00000007")
+            self.assertEqual(
+                load_checkpoint_metadata(root),
+                {"rdt_config": {"recurrent_steps": 4}},
+            )
 
 
 if __name__ == "__main__":

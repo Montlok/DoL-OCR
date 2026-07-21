@@ -162,11 +162,10 @@ def train_one_step(
             state.extra["grad_scaler"] = scaler
 
     rec_steps = None
-    if (
-        target_recurrent_steps is not None
-        and cfg.recurrent_steps_start is not None
-        and cfg.recurrent_steps_ramp > 0
-    ):
+    schedule_active = cfg.recurrent_steps_sampling == "poisson" or (
+        cfg.recurrent_steps_start is not None and cfg.recurrent_steps_ramp > 0
+    )
+    if target_recurrent_steps is not None and schedule_active:
         rec_steps = recurrent_steps_for_step(state.step, cfg, target_recurrent_steps)
 
     is_ddp = isinstance(model, torch.nn.parallel.DistributedDataParallel)

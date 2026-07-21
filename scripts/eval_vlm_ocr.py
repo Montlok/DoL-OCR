@@ -8,7 +8,7 @@ held-out alignment rows (the :func:`Model.ocr.data.build_ocr_row` contract:
 ``[BOS] <image_start> <image_patch>*N <image_end> <instruction...>`` + target),
 feeds each row's masked prompt plus its page image to
 :meth:`RDTForCausalLM.generate`, and scores the sampled transcription with
-:func:`Model.ocr.metrics.ocr_report` (normalized CER as the headline number).
+:func:`Model.ocr.metrics.ocr_report` (grapheme CER as the headline number).
 
 ``--blank-baseline`` re-runs the same prompts with an all-white page so the
 visual contribution can be isolated: a model that only learned the language
@@ -43,13 +43,13 @@ from pathlib import Path
 
 import torch
 
-from Model.config import EOS_ID, IMAGE_PATCH_ID, PAD_ID
+from Model.config import EOS_ID, IMAGE_PATCH_ID, OMVTConfig, PAD_ID, RDTConfig
 from Model.model import RDTForCausalLM
 from Model.ocr.data import build_ocr_row, split_ocr_row
 from Model.ocr.metrics import ocr_report
 from Model.omvt import OMVTInjector
 from Model.omvt.patcher import collate_omvt_batch
-from Model.training import load_checkpoint
+from Model.training import load_checkpoint_metadata, resolve_checkpoint_dir
 from Model.training.multimodal_cli import make_omvt_cfg
 from Tokenizer.multimodal import PILImageProcessor
 from scripts.train_rdt import CONFIG_CHOICES, _resolve_mamba_backend
@@ -76,6 +76,12 @@ def parse_args(argv=None):
     p.add_argument("--patch-preset", choices=("derived", "prod"), default="prod")
     p.add_argument("--max-new-tokens", type=int, default=480)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument(
+        "--recurrent-steps",
+        type=int,
+        default=None,
+        help="fixed decode depth; defaults to the checkpoint's trained depth",
+    )
     p.add_argument("--limit", type=int, default=0, help="evaluate at most N rows (0 = all)")
     p.add_argument("--blank-baseline", action="store_true",
                    help="also decode with an all-white page (language-prior-only CER)")
@@ -86,38 +92,74 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def _resolve_checkpoint_dir(path: str) -> Path:
-    """Accept a model.pt file, a step dir, or an output root (newest step)."""
-    p = Path(path)
-    if p.is_file():
-        return p
-    if (p / "model.pt").exists():
-        return p
-    steps = sorted(d for d in p.glob("step_*") if (d / "model.pt").exists())
-    if steps:
-        return steps[-1]
-    raise FileNotFoundError(f"no train_vlm_align checkpoint under: {path}")
-
-
 def _load_model_state(path: str):
-    p = _resolve_checkpoint_dir(path)
-    if p.is_file():
-        state = torch.load(p, map_location="cpu", weights_only=False)
-        if isinstance(state, dict) and "model" in state and "embed.weight" not in state:
-            state = state["model"]
-        return state, p
-    return load_checkpoint(p).model_state, p
+    raw = Path(path)
+    if raw.is_file() and raw.name != "model.pt":
+        state = torch.load(raw, map_location="cpu", weights_only=False)
+        p = raw
+    else:
+        p = resolve_checkpoint_dir(raw)
+        state = torch.load(p / "model.pt", map_location="cpu", weights_only=False)
+    if isinstance(state, dict) and "model" in state and "embed.weight" not in state:
+        state = state["model"]
+    return state, p
+
+
+def _checkpoint_metadata(path: str) -> dict:
+    if not path:
+        return {}
+    p = Path(path)
+    if p.is_file() and p.name != "model.pt":
+        return {}
+    return load_checkpoint_metadata(path)
+
+
+def _restore_omvt_geometry(args, metadata: dict | None = None) -> OMVTConfig | None:
+    """Apply a VLM checkpoint's authoritative image geometry to ``args``.
+
+    Deployment callers must do this before building prompts or letterboxing;
+    otherwise a checkpoint with a non-default image-token count could be
+    rebuilt correctly but paired with a stale prompt/pixel preprocessing path.
+    """
+
+    metadata = (
+        _checkpoint_metadata(getattr(args, "checkpoint", ""))
+        if metadata is None
+        else metadata
+    )
+    raw_omvt = metadata.get("omvt_config")
+    if not isinstance(raw_omvt, dict):
+        return None
+    omvt_cfg = OMVTConfig(**raw_omvt)
+    args.image_size = omvt_cfg.image_size
+    args.n_image_tokens = omvt_cfg.compress_to
+    return omvt_cfg
 
 
 def _build_model(args, device: torch.device) -> RDTForCausalLM:
-    rdt_cfg = CONFIG_CHOICES[args.config]()
+    metadata = _checkpoint_metadata(getattr(args, "checkpoint", ""))
+    raw_rdt = metadata.get("rdt_config")
+    if isinstance(raw_rdt, dict):
+        rdt_cfg = RDTConfig(**raw_rdt)
+        print("[eval] using RDTConfig from checkpoint metadata")
+    else:
+        rdt_cfg = CONFIG_CHOICES[args.config]()
     rdt_cfg = replace(rdt_cfg, max_seq_len=args.seq_len)
+    if args.recurrent_steps is not None:
+        rdt_cfg = replace(rdt_cfg, recurrent_steps=args.recurrent_steps)
     rdt_cfg = _resolve_mamba_backend(
         rdt_cfg, args.mamba, device=device, context="scripts.eval_vlm_ocr"
     )
-    omvt_cfg = make_omvt_cfg(
-        args.image_size, args.d_vision, args.n_image_tokens, preset=args.patch_preset
-    )
+    omvt_cfg = _restore_omvt_geometry(args, metadata)
+    if omvt_cfg is not None:
+        print("[eval] using OMVTConfig from checkpoint metadata")
+    else:
+        omvt_cfg = make_omvt_cfg(
+            args.image_size,
+            args.d_vision,
+            args.n_image_tokens,
+            preset=args.patch_preset,
+        )
     model = RDTForCausalLM(rdt_cfg).to(device)
     model.vision._omvt_cfg = omvt_cfg
     model.vision.omvt = OMVTInjector(rdt_cfg, omvt_cfg).to(device)
@@ -160,6 +202,29 @@ def _cut_continuation(seq: list[int]) -> list[int]:
     return [t for t in seq if t != PAD_ID]
 
 
+def print_script_cer(tag: str, rep) -> None:
+    """Print one compact line per non-empty script bucket in ``rep.script_cer``.
+
+    Shared by :mod:`scripts.eval_vlm_ocr` and :mod:`scripts.eval_l2_deploy` so
+    the two CLIs report per-script CER in the same format. Buckets with
+    ``n_ref == 0`` are already omitted from ``rep.script_cer`` (see
+    :func:`Model.ocr.metrics.script_bucket_cer`), so nothing to skip here.
+    """
+    if not rep.script_cer:
+        return
+    for bucket, stats in rep.script_cer.items():
+        print(
+            f"{tag} script={bucket} grapheme_cer={stats['cer']:.4f} "
+            f"n_ref={stats['n_ref']}"
+        )
+
+
+def visual_contribution(real_report, blank_report) -> float:
+    """Return the visual gain measured on the headline grapheme CER."""
+
+    return float(blank_report.grapheme_cer - real_report.grapheme_cer)
+
+
 @torch.no_grad()
 def _decode_batches(model, prompts, pixel_fn, args, device, autocast_ctx):
     """Generate continuations for uniform-length prompt rows.
@@ -170,6 +235,11 @@ def _decode_batches(model, prompts, pixel_fn, args, device, autocast_ctx):
     preds_ids: list[list[int]] = []
     n = len(prompts)
     prompt_len = len(prompts[0])
+    recurrent_steps = (
+        args.recurrent_steps
+        if args.recurrent_steps is not None
+        else model.cfg.recurrent_steps
+    )
     t0 = time.time()
     for start in range(0, n, args.batch_size):
         end = min(start + args.batch_size, n)
@@ -182,6 +252,7 @@ def _decode_batches(model, prompts, pixel_fn, args, device, autocast_ctx):
                 eos_id=EOS_ID,
                 pad_id=PAD_ID,
                 repetition_penalty=args.repetition_penalty,
+                recurrent_steps=recurrent_steps,
                 pixel_values=pixel_fn(start, end),
             )
         for row in out[:, prompt_len:].tolist():
@@ -238,6 +309,12 @@ def _smoke(args) -> int:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.recurrent_steps is not None and args.recurrent_steps <= 0:
+        print(
+            "scripts/eval_vlm_ocr: --recurrent-steps must be positive",
+            file=sys.stderr,
+        )
+        return 2
     if args.smoke:
         return _smoke(args)
     for flag in ("checkpoint", "data", "tokenizer_bundle"):
@@ -306,9 +383,11 @@ def main(argv=None) -> int:
     refs = [decode(ids) for ids in refs_ids]
     rep = ocr_report(preds, refs)
     print(
-        f"[eval] n={rep.n} norm_cer={rep.norm_cer:.4f} raw_cer={rep.raw_cer:.4f} "
+        f"[eval] n={rep.n} grapheme_cer={rep.grapheme_cer:.4f} "
+        f"norm_cer={rep.norm_cer:.4f} raw_cer={rep.raw_cer:.4f} "
         f"wer={rep.wer:.4f} line_exact={rep.line_exact:.4f}"
     )
+    print_script_cer("[eval]", rep)
 
     preds_blank = None
     if args.blank_baseline:
@@ -322,12 +401,14 @@ def main(argv=None) -> int:
         )]
         rep_blank = ocr_report(preds_blank, refs)
         print(
-            f"[eval/blank] n={rep_blank.n} norm_cer={rep_blank.norm_cer:.4f} "
+            f"[eval/blank] n={rep_blank.n} grapheme_cer={rep_blank.grapheme_cer:.4f} "
+            f"norm_cer={rep_blank.norm_cer:.4f} "
             f"raw_cer={rep_blank.raw_cer:.4f} wer={rep_blank.wer:.4f}"
         )
+        print_script_cer("[eval/blank]", rep_blank)
         print(
             "[eval] visual contribution (blank_cer - real_cer): "
-            f"{rep_blank.norm_cer - rep.norm_cer:+.4f}"
+            f"{visual_contribution(rep, rep_blank):+.4f}"
         )
 
     if args.out:

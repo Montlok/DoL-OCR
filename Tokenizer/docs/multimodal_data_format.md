@@ -71,6 +71,9 @@ python -m Tokenizer.tools.build_ocr_data \
 ```
 使用 `--demo` 还可在指定目录生成一个 4 张 PNG 的最小合成集，方便接管前先跑通 smoke。
 
+注意区分：`Tokenizer/tools/build_ocr_data.py`（本节，仅做原始图文配对，不渲染、不分词，未改动）与
+`scripts/build_ocr_data.py`（自渲染竖排蒙文合成 OCR 训练集，内含渲染 + tokenize 两步，target 走无损字节回退编码）是两个不同脚本；后者用法见其模块 docstring。
+
 ## 与 OMVT 的耦合
 - `images` 在 collator 里被 `PILImageProcessor` 加载为 `[B, 3, H, W]` 张量，随后送入 `Model/omvt/patcher.collate_omvt_batch` 切成 4 个尺度（vertical/horizontal/square/layout）。
 - `pixel_values` 是一个 `dict[str, Tensor]`；`train_one_step` 已经会把它递归搬到模型设备并透传给 `RDTForCausalLM(pixel_values=...)`。

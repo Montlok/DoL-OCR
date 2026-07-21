@@ -86,6 +86,24 @@ class TestBuildOCRRow(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly n_image_tokens"):
             self._row([10], n=2, instr=[99, IPATCH])
 
+    def test_row_length_matches_prompt_overhead_arithmetic(self):
+        # 4 = BOS + <image_start> + <image_end> + EOS (build_ocr_row's
+        # add_eos=True default); total row length = 4 + n_image_tokens +
+        # len(instruction_ids) + len(target_ids). This is the formula
+        # scripts/build_ocr_data.py's --max-seq-len guard relies on to
+        # skip over-length rows before rendering.
+        cases = [
+            {"target": [10], "n": 4, "instr": ()},
+            {"target": [10, 11, 12], "n": 5, "instr": ()},
+            {"target": [10, 11], "n": 3, "instr": [99, 98]},
+            {"target": list(range(100, 120)), "n": 64, "instr": [1, 2, 3, 4, 5]},
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                row = self._row(case["target"], n=case["n"], instr=case["instr"])
+                expected = 4 + case["n"] + len(case["instr"]) + len(case["target"])
+                self.assertEqual(len(row["input_ids"]), expected)
+
 
 class TestSplitOCRRow(unittest.TestCase):
     def _row(self, target, instr=(), add_eos=True):

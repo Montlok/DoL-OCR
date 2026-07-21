@@ -105,7 +105,7 @@ class TrainingLoopSmokeTest(unittest.TestCase):
 
         self.assertEqual(model.seen_return_logits, [False])
 
-    def test_recurrent_steps_override_only_when_ramp_active(self):
+    def test_recurrent_steps_override_only_when_schedule_active(self):
         class RecordingModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -148,6 +148,35 @@ class TrainingLoopSmokeTest(unittest.TestCase):
             target_recurrent_steps=8,
         )
         self.assertEqual(model.seen_steps, [None])
+
+        poisson_cfg = TrainingConfig(
+            train_data="",
+            seq_len=8,
+            micro_batch_size=2,
+            grad_accum_steps=1,
+            num_workers=0,
+            learning_rate=1e-3,
+            max_steps=1,
+            warmup_steps=1,
+            precision="fp32",
+            recurrent_steps_sampling="poisson",
+            recurrent_steps_min=3,
+            recurrent_steps_max=3,
+        )
+        model = RecordingModel()
+        optim = build_optimizer(model, poisson_cfg)
+        sched = build_scheduler(optim, poisson_cfg)
+        train_one_step(
+            model,
+            _iter(),
+            optim,
+            sched,
+            poisson_cfg,
+            TrainState(),
+            device=torch.device("cpu"),
+            target_recurrent_steps=8,
+        )
+        self.assertEqual(model.seen_steps, [3])
 
         ramp_cfg = TrainingConfig(
             train_data="",

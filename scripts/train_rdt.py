@@ -139,6 +139,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--save-every", type=int, default=1000)
+    p.add_argument(
+        "--keep-last-n",
+        type=int,
+        default=None,
+        help="periodic-checkpoint retention (default: TrainingConfig value; "
+        "0 keeps everything). Size the run's disk budget before raising.",
+    )
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--eval-max-batches", type=int, default=32)
@@ -195,6 +202,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--smoke", action="store_true", help="run 4 in-memory steps")
     p.add_argument("--seed", type=int, default=42)
     add_multimodal_args(p)
+    p.add_argument(
+        "--patch-preset",
+        choices=("derived", "prod"),
+        default="derived",
+        help="OMVT tower patch geometry (see train_vlm_align)",
+    )
+    p.add_argument(
+        "--mix-data",
+        default="",
+        help="second JSONL stream (e.g. multimodal OCR rows) interleaved with "
+        "--data at optimizer-step granularity; batches stay stream-pure so "
+        "the collator's one-image-per-row invariant holds",
+    )
+    p.add_argument(
+        "--mix-every",
+        type=int,
+        default=0,
+        help="with --mix-data: every Nth optimizer step draws from the mix "
+        "stream (e.g. 3 = two text steps then one mix step); 0 disables",
+    )
+    p.add_argument(
+        "--init-omvt-checkpoint",
+        default="",
+        help="SSL tower checkpoint to initialize vision.omvt.tower from "
+        "(requires --multimodal)",
+    )
+    p.add_argument(
+        "--use-ema-tower",
+        action="store_true",
+        help="overlay tower_ema weights when --init-omvt-checkpoint has them",
+    )
     return p.parse_args(argv)
 
 
@@ -346,7 +384,52 @@ def _build_train_cfg(args: argparse.Namespace, model_cfg: RDTConfig) -> Training
         seed=args.seed,
         resume=args.resume,
         resume_skip_data=not args.no_resume_skip_data,
+        **({"keep_last_n": args.keep_last_n} if args.keep_last_n is not None else {}),
     )
+
+
+def _interleaved_batches(main_iter, mix_iter, *, grad_accum_steps: int, mix_every: int):
+    """Deterministic block-level interleave of two batch streams.
+
+    One optimizer step consumes ``grad_accum_steps`` consecutive micro
+    batches (see ``train_one_step``), so stream switching happens on block
+    boundaries: every ``mix_every``-th block comes from ``mix_iter``, the
+    rest from ``main_iter``. Batches stay stream-pure, which preserves the
+    collator's all-or-none images-per-batch invariant. The schedule is a
+    pure function of the block index, so resume fast-forward through this
+    iterator advances both underlying streams by exactly their share.
+    """
+
+    if mix_every < 2:
+        raise ValueError("mix_every must be >= 2 (1 would starve the main stream)")
+    block = 0
+    while True:
+        src = mix_iter if block % mix_every == mix_every - 1 else main_iter
+        for _ in range(grad_accum_steps):
+            yield next(src)
+        block += 1
+
+
+def _load_omvt_tower_init(model, path: str, use_ema: bool, rank: int) -> None:
+    """Load SSL tower weights into the pre-installed OMVT injector."""
+
+    if not path:
+        return
+    if model.vision.omvt is None:
+        raise ValueError(
+            "--init-omvt-checkpoint requires --multimodal (no OMVT injector installed)"
+        )
+    from Model.training.omvt_checkpoint import (
+        load_omvt_payload,
+        tower_state_from_payload,
+    )
+
+    payload = load_omvt_payload(path, weights_only=False)
+    state = tower_state_from_payload(payload, use_ema=use_ema)
+    model.vision.omvt.tower.load_state_dict(state)
+    if rank == 0:
+        ema = " (EMA)" if use_ema and isinstance(payload, dict) and payload.get("tower_ema") else ""
+        print(f"[init] loaded OMVT tower from {path}{ema}", flush=True)
 
 
 def _fast_forward_stream(batch_iter, resumed_step: int, train_cfg, rank: int) -> None:
@@ -381,13 +464,18 @@ def _target_recurrent_steps_for_train(
     model_cfg: RDTConfig,
     train_cfg: TrainingConfig,
 ) -> int | None:
-    """Return an explicit depth only when the training curriculum needs one.
+    """Return an explicit depth when a loop-depth schedule needs one.
 
     Passing ``steps`` unconditionally disables ``SegmentedCore`` random-r
-    sampling. Let the model resolve its own depth unless a depth ramp is active.
+    sampling. Let the model resolve its own depth for fixed/no-ramp training;
+    pass the target for a ramp or deterministic per-step Poisson sampling.
     """
 
-    if train_cfg.recurrent_steps_start is None or train_cfg.recurrent_steps_ramp <= 0:
+    ramp_active = (
+        train_cfg.recurrent_steps_start is not None
+        and train_cfg.recurrent_steps_ramp > 0
+    )
+    if train_cfg.recurrent_steps_sampling != "poisson" and not ramp_active:
         return None
     return model_cfg.recurrent_steps
 
@@ -496,6 +584,24 @@ def _validate_args(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if bool(args.mix_data) != bool(args.mix_every):
+        print(
+            "scripts/train_rdt: --mix-data and --mix-every must be set together",
+            file=sys.stderr,
+        )
+        return 2
+    if args.mix_every and args.mix_every < 2:
+        print(
+            "scripts/train_rdt: --mix-every must be >= 2",
+            file=sys.stderr,
+        )
+        return 2
+    if args.init_omvt_checkpoint and not getattr(args, "multimodal", False):
+        print(
+            "scripts/train_rdt: --init-omvt-checkpoint requires --multimodal",
+            file=sys.stderr,
+        )
+        return 2
     # Resolve the data spec **here** rather than waiting for build_dataloader
     # so an empty glob (typo'd shard pattern) fails *before* we allocate a
     # multi-billion-parameter model and initialize the process group.
@@ -509,6 +615,34 @@ def _validate_args(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if args.mix_data:
+            mix_shards = _resolve_shards(args.mix_data)
+            if not mix_shards:
+                print(
+                    f"scripts/train_rdt: --mix-data resolved zero shards: "
+                    f"{args.mix_data!r}",
+                    file=sys.stderr,
+                )
+                return 2
+            if args.min_supervised_rate > 0:
+                try:
+                    mix_metrics = _sample_supervision_metrics(
+                        mix_shards, args.data_gate_rows
+                    )
+                except ValueError as exc:
+                    print(
+                        f"scripts/train_rdt: mix data gate failed: {exc}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if mix_metrics["supervised_rate"] < args.min_supervised_rate:
+                    print(
+                        "scripts/train_rdt: mix supervised_rate "
+                        f"{mix_metrics['supervised_rate']:.6f} is below "
+                        f"{args.min_supervised_rate:.6f}",
+                        file=sys.stderr,
+                    )
+                    return 2
         if args.min_supervised_rate > 0:
             try:
                 metrics = _sample_supervision_metrics(shards, args.data_gate_rows)
@@ -642,6 +776,11 @@ def _run_metadata(
         "rdt_config": asdict(model_cfg),
         "training_config": asdict(train_cfg),
         "omvt_config": asdict(omvt_cfg) if omvt_cfg is not None else None,
+        "mix": (
+            {"mix_data": args.mix_data, "mix_every": args.mix_every}
+            if args.mix_data
+            else None
+        ),
         "tokenizer_bundle": _tokenizer_bundle_metadata(args.tokenizer_bundle),
         "git": _git_metadata(),
     }
@@ -689,6 +828,8 @@ def main(argv: list[str] | None = None) -> int:
 
         model.vision._omvt_cfg = omvt_cfg
         model.vision.omvt = OMVTInjector(model_cfg, omvt_cfg).to(device)
+    if args.init_omvt_checkpoint and not train_cfg.resume:
+        _load_omvt_tower_init(model, args.init_omvt_checkpoint, args.use_ema_tower, rank)
 
     optimizer = build_optimizer(model, train_cfg)
     scheduler = build_scheduler(optimizer, train_cfg)
@@ -722,6 +863,22 @@ def main(argv: list[str] | None = None) -> int:
             omvt_cfg=omvt_cfg,
         )
         batch_iter = iter(dataloader)
+        if args.mix_data:
+            mix_loader = build_dataloader(
+                args.mix_data,
+                train_cfg,
+                world_size=world_size,
+                rank=rank,
+                pad_id=PAD_ID,
+                image_processor=image_processor,
+                omvt_cfg=omvt_cfg,
+            )
+            batch_iter = _interleaved_batches(
+                batch_iter,
+                iter(mix_loader),
+                grad_accum_steps=train_cfg.grad_accum_steps,
+                mix_every=args.mix_every,
+            )
         if train_cfg.resume and train_cfg.resume_skip_data and state.step > 0:
             _fast_forward_stream(batch_iter, state.step, train_cfg, rank)
         eval_loader = None

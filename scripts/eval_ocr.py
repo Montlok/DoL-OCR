@@ -13,9 +13,12 @@ rather than transcribed.
 
 Reports (see :mod:`Model.ocr.metrics` for the rationale):
 
-- **normalized CER** (primary): both sides folded to nominal Mongolian Unicode
+- **grapheme CER** (headline): raw text clustered into user-perceived
+  graphemes before comparing, so one missed combining mark counts as one
+  error, not one per code point.
+- **normalized CER**: both sides folded to nominal Mongolian Unicode
   first, so FVS/MVS/joiner rendering differences are not charged as errors.
-- **raw CER** (secondary): unmodified code points (true encoding gap).
+- **raw CER**: unmodified code points (true encoding gap).
 - **WER**: whitespace word error rate.
 - **line-exact**: fraction of lines matching exactly after folding.
 - **rejection rate**: fraction withheld by the confidence gate.
@@ -102,6 +105,7 @@ def main() -> int:
     rep = ocr_report(preds, refs, backend=args.backend, rejected=rejected)
     print(
         f"[ocr-eval] n={rep.n} backend={rep.backend} "
+        f"grapheme_cer={rep.grapheme_cer:.4f} "
         f"norm_cer={rep.norm_cer:.4f} raw_cer={rep.raw_cer:.4f} "
         f"wer={rep.wer:.4f} line_exact={rep.line_exact:.4f} "
         f"rejection={rep.rejection_rate:.4f}"

@@ -1,6 +1,6 @@
 # RDT Model — Pretraining Guide
 
-Recurrent Depth Transformer with Mamba3 + MoE Latent Attention (MLA), an
+Recurrent Depth Transformer with Mamba3 + Multi-head Latent Attention (MLA), an
 ACT (PonderNet) controller, optional bidirectional auxiliary head, and a
 two-tier vision pathway (MLP fallback + OMVT — Orientation-aware
 Multiscript Vision Tower).
@@ -33,7 +33,7 @@ Model/
     checkpoint.py      # FSDP-aware save / resume
     loop.py            # train_one_step + evaluate (autocast + grad accum + clip)
     logging.py         # RankZeroLogger (+ optional tensorboard)
-  multimodal_cli.py  # shared --multimodal / --image-size / --n-image-tokens helpers
+    multimodal_cli.py  # shared --multimodal / --image-size / --n-image-tokens helpers
 ```
 
 ## 2. Configs
@@ -257,6 +257,19 @@ python -m Tokenizer.tools.build_pretraining_data \
 Row schema is documented in
 [`Tokenizer/docs/multimodal_data_format.md`](../Tokenizer/docs/multimodal_data_format.md).
 
+**Generative OCR (distinct from the raw-pairing tool above):**
+`scripts/build_ocr_data.py` renders synthetic transcription lines to images
+*and* tokenizes them in one step (`Tokenizer.tools.build_ocr_data` above only
+pairs pre-existing `{image, label}` files, it does not render or tokenize).
+Its OCR target is encoded through a lossless byte-fallback path — never the
+lossy MorphBPE track — so the label round-trips the rendered text exactly,
+byte-for-byte, including FVS/MVS/NNBSP; see the module docstring for the
+contract. `--max-seq-len` skips rows whose tokenized length would exceed the
+budget before the (expensive) render step, since byte-fallback can inflate a
+target to ~3x its MorphBPE-routed length. Evaluation (`scripts/eval_ocr.py`,
+`scripts/eval_vlm_ocr.py`) reports grapheme CER as the headline metric
+alongside normalized/raw CER (see `Model/ocr/metrics.py`).
+
 ### 4.4 Pick `--n-image-tokens` carefully (multimodal only)
 
 `MultimodalProcessor` expands every `<image>` placeholder into
@@ -380,7 +393,7 @@ configs and tests use the `NaiveSSM` fallback explicitly.
 ## 9. GPU 集群预训练验证清单
 
 These checks must run on the CUDA cluster before the ~1.1B `pretrain_config`
-run; the local macOS/CPU box cannot validate them.
+run; a macOS/CPU development host cannot validate them.
 
 Set `DATA_GLOB` to the real pretraining shard glob before running the commands
 below, e.g. `export DATA_GLOB="data/pretrain/*.jsonl"`.
