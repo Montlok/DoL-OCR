@@ -1,78 +1,131 @@
-# DoL-OCR 运行手册 / Operations Runbook
+# DoL-OCR operations runbook
 
-蒙文 RDT 预训练 + OCR 对齐的日常操作、故障恢复与结果判读。所有命令在训练机(box)上执行,除非注明。
+This runbook defines platform-independent procedures. Keep machine addresses,
+credentials, mount points, active run identifiers, and incident timelines in an
+untracked `RUNBOOK.local.md` or the external operations system.
 
-Day-to-day operations for the Mongolian RDT pretraining + OCR alignment line. All commands run on the training box unless noted.
+## 1. Required run record
 
-## 当前状态(2026-07-07)/ Current state
+Before launch, record the following outside Git:
 
-- **预训练**:`~/dolocr/runs/mn_pretrain_v1`,0.972B `two_stage_pretrain`,纯蒙文 v3 语料(2.14B token/epoch,15 shards + 1 held-out),吞吐 ~1.9K tok/s,一个 epoch ≈ 12-13 天,WSD 调度(stable 段任意 checkpoint 可用),每 2000 步存档、保留最近 4 个。
-- **质量基线**:step 4000 时 eval_loss 1.2315 ≈ train loss(无背诵)。
-- **数据**:packed shards `~/dolocr/pretrain_data/mn_part_*.jsonl`(训练)+ `eval/mn_part_15.jsonl`(held-out,勿动);OCR 对齐数据 `~/dolocr/data_v1/`(勿动);tokenizer `~/dolocr/bundle_v3b`。
-- **环境**:python = `~/jupyterlab/.venv/bin/python3`(torch cu130 + 官方 mamba);仓库 `~/DoL-OCR`;跑任何脚本前 `cd ~/DoL-OCR` 且 `PYTHONPATH=.`。
+- repository commit SHA and whether the worktree is clean;
+- model, tokenizer, and vision-tower configuration;
+- input manifest paths and cryptographic hashes;
+- train/validation split policy and exclusion list;
+- source checkpoint path and hash;
+- optimizer, precision, batch, schedule, save, evaluation, and stop settings;
+- output directory, log destination, operator, and start time.
 
-## 日常监控 / Monitoring
+Do not launch when any required path is ambiguous or when validation data overlaps the
+training set by source ID, file hash, document group, or resolved path.
 
-```bash
-bash ~/panel.sh                      # 实时面板:GPU/内存/磁盘/最近 step/epoch 进度(5s 刷新)
-grep "step="      ~/dolocr/mn_pretrain_v1.log | tail -5   # loss/吞吐(每 ~10 分钟一行)
-grep "eval_loss"  ~/dolocr/mn_pretrain_v1.log | tail -3   # 验证 loss(每 4000 步)
-cd ~/DoL-OCR && PYTHONPATH=. ~/jupyterlab/.venv/bin/python3 -m scripts.rdt_monitor tui --run ~/dolocr/runs/mn_pretrain_v1
-```
+## 2. Preflight
 
-健康判据:GPU ~96%;step 每 ~30 秒 +1;grad_norm < 1;train 与 eval loss 差距 < 0.1。
-eval_loss 明显低于 train(差 >0.2)或 grad_norm 持续 >5:停下来查,别硬跑。
-
-## 停止与恢复 / Stop & resume
-
-永远用控制面优雅停,不要 kill:
+Run from the repository root with an explicit Python interpreter:
 
 ```bash
-cd ~/DoL-OCR
-PYTHONPATH=. ~/jupyterlab/.venv/bin/python3 -m scripts.rdt_monitor control save --run ~/dolocr/runs/mn_pretrain_v1
-PYTHONPATH=. ~/jupyterlab/.venv/bin/python3 -m scripts.rdt_monitor control stop --run ~/dolocr/runs/mn_pretrain_v1
-# trainer 在一步内(约 30s)存档退出
+export PYTHON_BIN="${PYTHON_BIN:?set the production Python interpreter}"
+export OUTPUT_DIR="${OUTPUT_DIR:?set a new or resumable output directory}"
+
+git status --short
+git rev-parse HEAD
+"$PYTHON_BIN" -m pytest -q Model/tests Tokenizer/tests
 ```
 
-恢复(训练死机/重启后同样适用;数据流按步数精确重放):
+For a production GPU run, also verify accelerator visibility, free storage, input
+readability, tokenizer/checkpoint hashes, and that no other GPU process is active.
+Never run a memory probe or cache eviction concurrently with training.
+
+## 3. Launch
+
+Use the Python entry point that matches the phase. Pass all data, checkpoint, and output
+paths explicitly; do not rely on workstation-specific defaults.
 
 ```bash
-RESUME_ONLY=1 bash scripts/swap_to_align.sh
+# Text pretraining
+"$PYTHON_BIN" -m scripts.train_rdt \
+  --config two_stage_pretrain \
+  --data "$TRAIN_DATA" \
+  --eval-data "$VALIDATION_DATA" \
+  --output "$OUTPUT_DIR" \
+  "${EXTRA_ARGS[@]}"
+
+# Vision-tower SSL
+"$PYTHON_BIN" -m scripts.train_omvt_ssl \
+  --data "$VISION_DATA" \
+  --output "$OUTPUT_DIR" \
+  "${EXTRA_ARGS[@]}"
+
+# OMVT-to-RDT alignment
+"$PYTHON_BIN" -m scripts.train_vlm_align \
+  --data "$ALIGNMENT_DATA" \
+  --output "$OUTPUT_DIR" \
+  "${EXTRA_ARGS[@]}"
 ```
 
-## 对齐轮(借 GPU)/ Alignment round
+In shell automation, store optional arguments in an array as shown above. Do not place a
+quoted list of arguments in one scalar variable.
 
-一条命令:优雅停预训练 → 清缓存 → val 泄漏检查 → 生成验证 → 冻结对齐 6000 步(约 7h)→ 哨兵评测 → 自动恢复预训练。总计约 8 小时,预训练无损。
+## 4. Monitoring and graceful control
+
+The run directory is the control and status boundary:
 
 ```bash
-cd ~/DoL-OCR
-nohup bash scripts/swap_to_align.sh > ~/dolocr/swap.log 2>&1 &   # 全链(必须 nohup:ssh 断开不孤儿化)
-tail -f ~/dolocr/swap.log                                        # 看进度
-# FROZEN_STEPS=3000 / SKIP_GEN=1 可加在 nohup env 前
+"$PYTHON_BIN" -m scripts.rdt_monitor tui --run "$OUTPUT_DIR"
+"$PYTHON_BIN" -m scripts.rdt_monitor control save --run "$OUTPUT_DIR"
+"$PYTHON_BIN" -m scripts.rdt_monitor control stop --run "$OUTPUT_DIR"
 ```
 
-任何一步失败,链的退出钩子会自动恢复预训练(幂等,绝不双开);恢复后验证进程存活并等待推进证据(fast-forward 进度或新 step 行),30 分钟内未确认会提示人工看 panel.sh,进程死亡则以非零退出。
+Track optimizer step, loss, validation metric, gradient norm, throughput, learning rate,
+checkpoint age, free storage, and accelerator utilization. A running process without
+step or checkpoint progress is not healthy merely because it still owns the GPU.
 
-结果判读(`~/dolocr/runs/align_frozen_v2/sentinel.log` 最后一行):
+Use the control plane for planned stops. Wait until `latest` points to the new step and
+all required checkpoint files are present, then confirm process exit before releasing
+the accelerator or changing data mounts.
 
-- `contribution`(空白图 CER − 真图 CER,单位为 CER 点):**> +20 = 视觉通路在工作**,底座可用,值得跑 3b 解冻或加深底座重跑;+5~+20 = 弱信号,先加深底座(多训预训练)再重跑对齐;**≈0 或负 = 塌了**(v1 崩溃签名:-1.9),检查 SSL 塔与数据,不要解冻。
-- `real_cer`:字素错误率,1.0=全错。第一轮预期很高(底座浅),看趋势不看绝对值;对照:旧 CRNN 合成 test 1.10%。
-- 生成验证段(日志里 `PREFIX:`/`MODEL :`):模型续写应当是连贯蒙文;乱码/重复循环 = 底座有问题。
+## 5. Checkpoint and resume
 
-对齐用更深底座重跑:预训练多训几天后再执行同一条命令即可(幂等;先 `rm -rf ~/dolocr/runs/align_frozen_v2` 清上一轮)。
+A resumable checkpoint must contain model, optimizer, scheduler, RNG, data cursor,
+configuration, and metadata required by the selected precision mode. Never repoint
+`latest` to a partially written directory.
 
-## 故障处理 / Failures
+Resume with the same model shape, tokenizer, data order contract, world size when
+required, and training semantics:
 
-- **训练进程消失**:`tail -50 ~/dolocr/mn_pretrain_v1.log` 找 OOM/报错 → `RESUME_ONLY=1 bash scripts/swap_to_align.sh` 续跑。
-- **磁盘满**(`df -h /`):可删 `~/dolocr/runs/` 下旧 run(align_unfreeze_v1 34G、rescue_refreeze 8G、verify_tower_restore 4G、ctc_* 5G——都是 v1 失败线产物);绝不删 `pretrain_data/`、`data_v1/`、`bundle_v3b`、`ckpt_keep/`。
-- **page cache 挤 CUDA(启动新 GPU 进程 OOM)**:训练运行期间不要跑任何旁路 GPU 程序(已实测必炸);需要 GPU 就走 swap 链。
-- **训练中不要跑 evict**:evict 的大分配会 OOM 训练进程(历史事故)。
-- **save 卡死**(2026-07-08 实例):checkpoint 目录只有 model.pt+optimizer.pt(缺 rng/scheduler/meta)、GPU 0%、CPU ~110% 自旋、进程 RSS 掉到 ~2G 且多次采样不变、latest 未切换 → save 中 CUDA 同步永久自旋,不可自愈。处置:`pkill -9 -f "scripts\.[t]rain_rdt"` → 删除残缺 step 目录 → `RESUME_ONLY=1 bash scripts/swap_to_align.sh`(从上一个完整 checkpoint 续)。若复发:恢复命令加 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 并把 --save-every 提到 4000。
-- Mac 上不能加载官方 mamba 权重(双后端 in_proj 形状不同),验证一律在 box 的 swap 窗口做。
+```bash
+"$PYTHON_BIN" -m scripts.train_rdt \
+  --config two_stage_pretrain \
+  --data "$TRAIN_DATA" \
+  --eval-data "$VALIDATION_DATA" \
+  --output "$OUTPUT_DIR" \
+  --resume "$OUTPUT_DIR/latest" \
+  "${EXTRA_ARGS[@]}"
+```
 
-## 后续路线 / Roadmap
+After resume, verify both process liveness and new optimizer-step progress. Preserve the
+last known complete checkpoint until the resumed run has produced a newer complete one.
 
-1. **预训练**:跑到 2-3 epoch(数据受限上限 3-4 epoch);要快 = 8×A100 云上 2-3 天(shards 直接搬,DDP 现成:`--dist ddp` + torchrun;先跑 100 步双卡校验)。
-2. **对齐**:底座够深后 frozen → 小 lr(6e-5)解冻(`run_dol_ocr_phase3.sh unfreeze`,哨兵挂 STOP_BELOW=5 自动停塌掉的 run)。
-3. **真实数据**(用户定调:真实标注很珍贵,只用于 RL 与评测,不做 SFT 燃料):~30% 锁死做 golden set(分域:印刷/报纸/档案/拍照),~70% 做 GRPO reward(全参,reward=−grapheme_CER);domain gap 靠合成拟真增强 + 无标注 SSL + 自动伪标签,不消耗人工标注。
-4. **数据引擎**:字体扩到 20-40 种、退化/版式增强、GLM-OCR 蒸馏混排非蒙文部分;蒙文语料扩充只能回 RAW 挖或新采集(cleaned 蒙文全量就是 12G/2.14B token)。
+## 6. Evaluation gates
+
+- Use grapheme CER as the headline OCR metric and retain normalized/code-point metrics
+  only as diagnostics.
+- Report real-image and blank-image results together so visual contribution is visible.
+- Keep validation and locked golden data outside all training and tuning paths.
+- Record the evaluated checkpoint hash, dataset hash, generation settings, and raw
+  report. Do not overwrite an earlier evaluation report.
+- Do not promote a checkpoint on training loss alone.
+
+## 7. Failure handling
+
+1. Stop new work on the accelerator and preserve logs and the latest complete checkpoint.
+2. Determine whether the failure is data, storage, process, numerical, distributed, or
+   checkpoint related.
+3. Do not delete partial output until its exact path is verified and the previous complete
+   checkpoint is protected.
+4. Reproduce with the narrowest relevant check before restarting the full run.
+5. Resume only after validating checkpoint completeness and the unchanged data contract.
+6. Record the cause, recovery checkpoint, command, and post-resume progress evidence.
+
+Destructive cleanup and forced process termination require a machine-specific incident
+procedure; they are intentionally not encoded as copy-paste commands in this repository.

@@ -393,7 +393,7 @@ configs and tests use the `NaiveSSM` fallback explicitly.
 ## 9. GPU 集群预训练验证清单
 
 These checks must run on the CUDA cluster before the ~1.1B `pretrain_config`
-run; the local macOS/CPU box cannot validate them.
+run; a macOS/CPU development host cannot validate them.
 
 Set `DATA_GLOB` to the real pretraining shard glob before running the commands
 below, e.g. `export DATA_GLOB="data/pretrain/*.jsonl"`.

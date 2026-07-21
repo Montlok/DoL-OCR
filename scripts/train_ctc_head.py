@@ -22,10 +22,10 @@ Usage::
     python3 -m scripts.train_ctc_head --smoke   # CPU self-check, no artifacts
 
     PYTHONPATH=. python3 -m scripts.train_ctc_head \\
-        --omvt-checkpoint ~/dolocr/runs/omvt_ssl_v1/latest \\
-        --data ~/dolocr/data_v1/jsonl/align \\
-        --tokenizer-bundle ~/dolocr/bundle_v3b \\
-        --output ~/dolocr/runs/ctc_head_v1 \\
+        --omvt-checkpoint /path/to/omvt_ssl/latest \\
+        --data /path/to/alignment/data \\
+        --tokenizer-bundle /path/to/tokenizer/bundle \\
+        --output /path/to/output/ctc_head \\
         --steps 20000 --batch-size 32 --save-every 1000 --probe-every 200
 """
 

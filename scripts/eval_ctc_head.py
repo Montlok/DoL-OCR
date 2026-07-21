@@ -17,11 +17,11 @@ two numbers are directly comparable.
 Usage::
 
     PYTHONPATH=. python3 -m scripts.eval_ctc_head \\
-        --checkpoint ~/dolocr/runs/ctc_head_v1/latest \\
-        --omvt-checkpoint ~/dolocr/runs/omvt_ssl_v1/latest \\
-        --val ~/dolocr/data_v1/val.jsonl \\
-        --tokenizer-bundle ~/dolocr/bundle_v3b \\
-        --out ~/dolocr/runs/ctc_head_v1/eval_preds.jsonl
+        --checkpoint /path/to/ctc_head/latest \\
+        --omvt-checkpoint /path/to/omvt_ssl/latest \\
+        --val /path/to/validation.jsonl \\
+        --tokenizer-bundle /path/to/tokenizer/bundle \\
+        --out /path/to/output/ctc_eval.jsonl
 """
 
 from __future__ import annotations
