@@ -205,10 +205,10 @@ def main(argv=None) -> int:
     if args.bundle:
         from Tokenizer.unified import TokenizerBundle
 
-        bundle = TokenizerBundle.load(args.bundle)
+        bundle = TokenizerBundle.from_dir(args.bundle)
         assert first_src_target is not None
         body = [t for t in first_src_target if t != EOS_ID]
-        text = bundle.decode(body)
+        text = bundle.tokenizer.decode(body)
         print(f"[qa] index0 first-doc decode ({len(body)} ids): {text[:80]!r}")
     return 0
 
