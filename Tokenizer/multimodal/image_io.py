@@ -22,9 +22,10 @@ from typing import Any, Sequence
 import torch
 
 try:
-    from PIL import Image  # type: ignore
+    from PIL import Image, ImageOps  # type: ignore
 except ImportError as exc:  # pragma: no cover - hard fail at first use
     Image = None  # type: ignore
+    ImageOps = None  # type: ignore
     _PIL_IMPORT_ERROR: Exception | None = exc
 else:
     _PIL_IMPORT_ERROR = None
@@ -51,7 +52,8 @@ def _open_to_rgb(spec: Any, *, channels: int = 3) -> "Image.Image":
     We wrap every disk/bytes opener in a context manager and call
     ``raw.load()`` before returning, so the underlying file descriptor
     closes deterministically. Without this the OS fd table can fill up
-    when streaming tens of thousands of images per epoch.
+    when streaming tens of thousands of images per epoch. EXIF orientation is
+    applied before conversion so phone photos are presented as users see them.
     """
 
     _require_pil()
@@ -59,23 +61,23 @@ def _open_to_rgb(spec: Any, *, channels: int = 3) -> "Image.Image":
     if Image is not None and isinstance(spec, Image.Image):
         # Already an in-memory PIL image — convert eagerly so the caller
         # can drop the original reference.
-        return spec.convert(mode)
+        return ImageOps.exif_transpose(spec).convert(mode)
     if isinstance(spec, (bytes, bytearray, memoryview)):
         with Image.open(io.BytesIO(bytes(spec))) as raw:
             raw.load()
-            return raw.convert(mode)
+            return ImageOps.exif_transpose(raw).convert(mode)
     if isinstance(spec, (str, os.PathLike)):
         with Image.open(spec) as raw:
             raw.load()
-            return raw.convert(mode)
+            return ImageOps.exif_transpose(raw).convert(mode)
     if isinstance(spec, dict) and "bytes" in spec:
         with Image.open(io.BytesIO(bytes(spec["bytes"]))) as raw:
             raw.load()
-            return raw.convert(mode)
+            return ImageOps.exif_transpose(raw).convert(mode)
     if isinstance(spec, dict) and "path" in spec:
         with Image.open(spec["path"]) as raw:
             raw.load()
-            return raw.convert(mode)
+            return ImageOps.exif_transpose(raw).convert(mode)
     raise TypeError(
         f"unsupported image spec type {type(spec).__name__}; "
         "expected path / bytes / PIL.Image / dict with 'path' or 'bytes'."

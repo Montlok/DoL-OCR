@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Callable, Sequence
 
 import torch
@@ -77,7 +78,8 @@ class RDTForCausalLM(nn.Module):
         word_pos: torch.Tensor,
         morph_depth: torch.Tensor,
         cache,
-        pixel_values: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+        visual_features: torch.Tensor | None = None,
         steps: int | None = None,
     ) -> torch.Tensor:
         """Incremental forward over the new tokens ``input_ids`` (``[B, m]``).
@@ -100,8 +102,13 @@ class RDTForCausalLM(nn.Module):
         pos_offset = cache.seq_len
 
         h = self.embed(input_ids)
-        if pixel_values is not None:
-            h = self.vision(h, input_ids, pixel_values)
+        if pixel_values is not None or visual_features is not None:
+            h = self.vision(
+                h,
+                input_ids,
+                pixel_values,
+                visual_features=visual_features,
+            )
 
         for i, block in enumerate(self.prelude):
             h = block(
@@ -146,7 +153,8 @@ class RDTForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+        visual_features: torch.Tensor | None = None,
         word_pos: torch.Tensor | None = None,
         morph_depth: torch.Tensor | None = None,
         steps: int | None = None,
@@ -173,8 +181,13 @@ class RDTForCausalLM(nn.Module):
 
         h = self.embed(input_ids)
 
-        if pixel_values is not None:
-            h = self.vision(h, input_ids, pixel_values)
+        if pixel_values is not None or visual_features is not None:
+            h = self.vision(
+                h,
+                input_ids,
+                pixel_values,
+                visual_features=visual_features,
+            )
 
         for block in self.prelude:
             h = self._maybe_ckpt(
@@ -573,7 +586,9 @@ class RDTForCausalLM(nn.Module):
     def _adaptive_depth_logits(
         self,
         window: torch.Tensor,
-        pixel_values: torch.Tensor | None,
+        pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None,
+        visual_features: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Last-position logits with per-token adaptive recurrent depth.
 
@@ -591,12 +606,22 @@ class RDTForCausalLM(nn.Module):
         prev_logp = None
         logits = None
         for d in range(1, max_steps + 1):
-            if pixel_values is not None:
+            if pixel_values is not None or visual_features is not None:
                 out = self.forward(
-                    window, steps=d, return_logits=True, pixel_values=pixel_values
+                    window,
+                    attention_mask=attention_mask,
+                    steps=d,
+                    return_logits=True,
+                    pixel_values=pixel_values,
+                    visual_features=visual_features,
                 )
             else:
-                out = self.forward(window, steps=d, return_logits=True)
+                out = self.forward(
+                    window,
+                    attention_mask=attention_mask,
+                    steps=d,
+                    return_logits=True,
+                )
             logits = out["logits"][:, -1, :].float()
             logp = F.log_softmax(logits, dim=-1)
             if prev_logp is not None:
@@ -624,7 +649,7 @@ class RDTForCausalLM(nn.Module):
         stop_ids: Sequence[int] | None = None,
         on_token: Callable[[int, torch.Tensor], None] | None = None,
         recurrent_steps: int | None = None,
-        pixel_values: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Autoregressively continue ``input_ids`` (``[B, L]``) with sampling.
 
@@ -674,10 +699,12 @@ class RDTForCausalLM(nn.Module):
         it trades quality for speed. The override is constant for the whole call
         so the incremental KV/state cache stays consistent across positions.
 
-        ``pixel_values`` optionally supplies image features for prompts containing
+        ``pixel_values`` optionally supplies image pixels for prompts containing
         ``<image_patch>`` slots. Cached decoding consumes them only during the
         prefill step; cache-free decoding refuses sliding-window truncation with
-        images because dropping patch slots would desync the visual payload.
+        images because dropping patch slots would desync the visual payload. OMVT
+        mapping inputs are encoded/projected once per generation call and their
+        visual features are reused across decode steps.
         """
 
         if input_ids.dim() != 2:
@@ -718,6 +745,11 @@ class RDTForCausalLM(nn.Module):
         seq = input_ids
         device = seq.device
         finished = torch.zeros(seq.shape[0], dtype=torch.bool, device=device)
+        seq_attention = (
+            (seq != pad_id).long()
+            if pad_id is not None
+            else torch.ones_like(seq, dtype=torch.long)
+        )
 
         stop_token_ids: list[int] = []
         if eos_id is not None:
@@ -757,19 +789,31 @@ class RDTForCausalLM(nn.Module):
             decode_cache = DecodeCache()
 
         try:
+            # The cache-free official-Mamba path re-runs the text model for every
+            # generated token.  Re-running the unchanged OMVT tower there would
+            # multiply visual compute by max_new_tokens.  Cache only Mapping
+            # (production OMVT) inputs; retain the legacy Tensor path verbatim.
+            cached_visual_features = None
+            runtime_pixel_values = pixel_values
+            if isinstance(pixel_values, Mapping):
+                cached_visual_features = self.vision.encode_visual(pixel_values)
+                runtime_pixel_values = None
             for step in range(max_new_tokens):
                 if use_cache:
                     if decode_cache.seq_len == 0:
                         step_ids = seq
-                        step_pixels = pixel_values
+                        step_pixels = runtime_pixel_values
+                        step_features = cached_visual_features
                     else:
                         step_ids = seq[:, -1:]
                         # The image was folded into the cache at prefill; later
                         # steps process only the new token and carry no
                         # <image_patch> slots, so pixel_values must be dropped.
                         step_pixels = None
-                    mask = (seq != pad_id).long()
-                    word_pos, morph_depth = self._default_morph_info(seq, mask)
+                        step_features = None
+                    word_pos, morph_depth = self._default_morph_info(
+                        seq, seq_attention
+                    )
                     m = step_ids.shape[1]
                     logits = self._forward_decode(
                         step_ids,
@@ -777,12 +821,15 @@ class RDTForCausalLM(nn.Module):
                         morph_depth=morph_depth[:, -m:],
                         cache=decode_cache,
                         pixel_values=step_pixels,
+                        visual_features=step_features,
                         steps=recurrent_steps,
                     )[:, -1, :].float()
                 else:
                     window = seq
+                    window_attention = seq_attention
                     if window.shape[1] > cfg.max_seq_len:
                         window = window[:, -cfg.max_seq_len:]
+                        window_attention = window_attention[:, -cfg.max_seq_len:]
                         if pixel_values is not None:
                             # Left-truncation could drop <image_patch> slots while
                             # pixel_values still holds the full visual payload,
@@ -797,19 +844,27 @@ class RDTForCausalLM(nn.Module):
 
                     if self._kl_exit_active(recurrent_steps):
                         logits = self._adaptive_depth_logits(
-                            window, pixel_values
+                            window,
+                            runtime_pixel_values,
+                            visual_features=cached_visual_features,
+                            attention_mask=window_attention,
                         )
-                    elif pixel_values is not None:
+                    elif runtime_pixel_values is not None or cached_visual_features is not None:
                         out = self.forward(
                             window,
+                            attention_mask=window_attention,
                             steps=recurrent_steps,
                             return_logits=True,
-                            pixel_values=pixel_values,
+                            pixel_values=runtime_pixel_values,
+                            visual_features=cached_visual_features,
                         )
                         logits = out["logits"][:, -1, :].float()
                     else:
                         out = self.forward(
-                            window, steps=recurrent_steps, return_logits=True
+                            window,
+                            attention_mask=window_attention,
+                            steps=recurrent_steps,
+                            return_logits=True,
                         )
                         logits = out["logits"][:, -1, :].float()
 
@@ -826,11 +881,14 @@ class RDTForCausalLM(nn.Module):
                     probs = F.softmax(logits, dim=-1)
                     next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
+                was_finished = finished
                 next_token = torch.where(
-                    finished, torch.full_like(next_token, pad_id), next_token
+                    was_finished, torch.full_like(next_token, pad_id), next_token
                 )
                 next_token = next_token.to(seq.dtype)
                 seq = torch.cat([seq, next_token.unsqueeze(1)], dim=1)
+                next_attention = (~was_finished).to(seq_attention.dtype).unsqueeze(1)
+                seq_attention = torch.cat([seq_attention, next_attention], dim=1)
                 if on_token is not None:
                     on_token(step, next_token)
                 if stop_tensor is not None:

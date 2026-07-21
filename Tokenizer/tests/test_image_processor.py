@@ -68,6 +68,16 @@ class PILImageProcessorTest(unittest.TestCase):
         self.assertGreaterEqual(float(out.min()), 0.0)
         self.assertLessEqual(float(out.max()), 1.0)
 
+    def test_phone_exif_orientation_is_applied(self) -> None:
+        from Tokenizer.multimodal.image_io import _open_to_rgb
+
+        path = os.path.join(self.tmp.name, "oriented.jpg")
+        image = Image.new("RGB", (2, 3), color=(200, 100, 50))
+        exif = image.getexif()
+        exif[274] = 6  # rotate 90 degrees clockwise for display
+        image.save(path, exif=exif)
+        self.assertEqual(_open_to_rgb(path).size, (3, 2))
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

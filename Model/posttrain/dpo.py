@@ -20,6 +20,7 @@ Rigor rules enforced here:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -44,6 +45,7 @@ def _sequence_score(
     attention_mask: torch.Tensor | None,
     recurrent_steps: int | None,
     length_normalize: bool,
+    pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     summed, token_logp = completion_logprobs(
         model,
@@ -51,6 +53,7 @@ def _sequence_score(
         completion_mask,
         attention_mask=attention_mask,
         recurrent_steps=recurrent_steps,
+        pixel_values=pixel_values,
     )
     if not length_normalize:
         return summed
@@ -98,6 +101,8 @@ def dpo_step(
     cfg: DPOConfig,
     chosen_attn: torch.Tensor | None = None,
     rejected_attn: torch.Tensor | None = None,
+    chosen_pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+    rejected_pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute the DPO loss for one preference batch.
 
@@ -107,20 +112,20 @@ def dpo_step(
     """
     policy_chosen = _sequence_score(
         policy, chosen_ids, chosen_mask, chosen_attn, cfg.recurrent_steps,
-        cfg.length_normalize,
+        cfg.length_normalize, chosen_pixel_values,
     )
     policy_rejected = _sequence_score(
         policy, rejected_ids, rejected_mask, rejected_attn, cfg.recurrent_steps,
-        cfg.length_normalize,
+        cfg.length_normalize, rejected_pixel_values,
     )
     with torch.no_grad():
         ref_chosen = _sequence_score(
             reference, chosen_ids, chosen_mask, chosen_attn, cfg.recurrent_steps,
-            cfg.length_normalize,
+            cfg.length_normalize, chosen_pixel_values,
         )
         ref_rejected = _sequence_score(
             reference, rejected_ids, rejected_mask, rejected_attn,
-            cfg.recurrent_steps, cfg.length_normalize,
+            cfg.recurrent_steps, cfg.length_normalize, rejected_pixel_values,
         )
     return dpo_loss(
         policy_chosen, policy_rejected, ref_chosen, ref_rejected, beta=cfg.beta

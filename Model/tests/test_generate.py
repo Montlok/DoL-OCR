@@ -93,7 +93,7 @@ class GenerateTest(unittest.TestCase):
         prompt = self._prompt(cfg)
 
         # Make forward deterministically favor EOS, independent of tied weights.
-        def fake_forward(window, return_logits=True, steps=None):
+        def fake_forward(window, return_logits=True, steps=None, attention_mask=None):
             bsz = window.shape[0]
             logits = torch.zeros(bsz, window.shape[1], cfg.vocab_size)
             logits[:, -1, cfg.eos_id] = 100.0
@@ -115,7 +115,7 @@ class GenerateTest(unittest.TestCase):
         prompt = self._prompt(cfg)
         stop = 311  # an arbitrary non-eos "delimiter" token (e.g. </tool_call>)
 
-        def fake_forward(window, return_logits=True, steps=None):
+        def fake_forward(window, return_logits=True, steps=None, attention_mask=None):
             bsz = window.shape[0]
             logits = torch.zeros(bsz, window.shape[1], cfg.vocab_size)
             logits[:, -1, stop] = 100.0

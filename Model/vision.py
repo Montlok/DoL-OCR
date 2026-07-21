@@ -170,26 +170,31 @@ class VisionInjector(nn.Module):
 
         self.omvt = injector
 
+    def encode_visual(
+        self,
+        pixel_values: torch.Tensor | Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Encode/project pixels once, before injecting them into token slots."""
+
+        if isinstance(pixel_values, Mapping):
+            self._ensure_omvt()
+            return self.omvt(pixel_values)
+        return self.encoder(pixel_values)
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
         input_ids: torch.Tensor,
         pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+        visual_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if pixel_values is None:
+        if pixel_values is not None and visual_features is not None:
+            raise ValueError("pass pixel_values or visual_features, not both")
+        if pixel_values is None and visual_features is None:
             return inputs_embeds
-
-        if isinstance(pixel_values, Mapping):
-            self._ensure_omvt()
-            visual_features = self.omvt(pixel_values)
-            return inject_visual_features(
-                inputs_embeds=inputs_embeds,
-                input_ids=input_ids,
-                visual_features=visual_features,
-                image_patch_id=self.cfg.image_patch_id,
-            )
-
-        visual_features = self.encoder(pixel_values)
+        if visual_features is None:
+            assert pixel_values is not None
+            visual_features = self.encode_visual(pixel_values)
         return inject_visual_features(
             inputs_embeds=inputs_embeds,
             input_ids=input_ids,

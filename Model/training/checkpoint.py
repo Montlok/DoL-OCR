@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import random
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -128,6 +129,23 @@ def _rng_state() -> dict[str, Any]:
 
 
 def _restore_rng(state: dict[str, Any]) -> None:
+    if "per_rank" in state:
+        per_rank = state["per_rank"]
+        if not isinstance(per_rank, list) or not per_rank:
+            raise ValueError("checkpoint per-rank RNG state is malformed")
+        current_world = torch.distributed.get_world_size() if is_distributed() else 1
+        saved_world = int(state.get("world_size", len(per_rank)))
+        if current_world != saved_world:
+            raise ValueError(
+                "checkpoint RNG world-size mismatch: "
+                f"checkpoint={saved_world} current={current_world}"
+            )
+        rank = torch.distributed.get_rank() if is_distributed() else 0
+        if rank >= len(per_rank):
+            raise ValueError(
+                f"checkpoint has RNG for {len(per_rank)} ranks, cannot restore rank {rank}"
+            )
+        state = per_rank[rank]
     if "cpu" in state:
         torch.set_rng_state(state["cpu"])
     if "python" in state:
@@ -141,6 +159,43 @@ def _restore_rng(state: dict[str, Any]) -> None:
             pass
     if "cuda" in state and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _checkpoint_rng_state() -> dict[str, Any]:
+    """Capture one RNG stream per rank so resumed sampling does not collapse."""
+
+    local = _rng_state()
+    if not is_distributed():
+        return local
+    world_size = torch.distributed.get_world_size()
+    gathered: list[dict[str, Any] | None] = [None] * world_size
+    torch.distributed.all_gather_object(gathered, local)
+    if any(item is None for item in gathered):
+        raise RuntimeError("failed to gather checkpoint RNG state from every rank")
+    return {"per_rank": gathered, "world_size": world_size}
+
+
+def _durable_torch_save(payload: Any, path: Path) -> None:
+    """Write one checkpoint member and force its bytes to stable storage."""
+
+    torch.save(payload, path)
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry updates where the platform supports it."""
+
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        # Some filesystems/platforms do not expose directory fsync. Individual
+        # checkpoint members are still fsynced before the atomic rename.
+        pass
 
 
 def save_checkpoint(
@@ -164,40 +219,88 @@ def save_checkpoint(
         if optimizer is not None
         else None
     )
+    rng_state = _checkpoint_rng_state()
     if not is_main_process():
         return None
 
-    step_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(model_state, step_dir / "model.pt")
-    if optimizer_state is not None:
-        torch.save(optimizer_state, step_dir / "optimizer.pt")
-    if scheduler is not None:
-        torch.save(scheduler.state_dict(), step_dir / "scheduler.pt")
-    torch.save(_rng_state(), step_dir / "rng.pt")
-    if scaler is not None:
-        torch.save(scaler.state_dict(), step_dir / "scaler.pt")
-    torch.save(
-        {"step": step, "metadata": metadata or {}},
-        step_dir / "meta.pt",
+    out.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{step_dir.name}.tmp-", dir=out)
     )
+    backup = out / f".{step_dir.name}.backup"
+    swapped_old = False
+    try:
+        _durable_torch_save(model_state, staging / "model.pt")
+        if optimizer_state is not None:
+            _durable_torch_save(optimizer_state, staging / "optimizer.pt")
+        if scheduler is not None:
+            _durable_torch_save(scheduler.state_dict(), staging / "scheduler.pt")
+        _durable_torch_save(rng_state, staging / "rng.pt")
+        if scaler is not None:
+            _durable_torch_save(scaler.state_dict(), staging / "scaler.pt")
+        _durable_torch_save(
+            {"step": step, "metadata": metadata or {}},
+            staging / "meta.pt",
+        )
+        # This marker is written last.  Staging directories are hidden from
+        # normal resolution, but the marker also makes manual recovery
+        # unambiguous after a machine-level interruption.
+        marker = staging / "COMPLETE"
+        with marker.open("w", encoding="ascii") as handle:
+            handle.write(f"step={step}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_directory(staging)
 
+        if backup.exists():
+            shutil.rmtree(backup)
+        if step_dir.exists():
+            os.replace(step_dir, backup)
+            swapped_old = True
+        os.replace(staging, step_dir)
+        _fsync_directory(out)
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        if swapped_old and not step_dir.exists() and backup.exists():
+            os.replace(backup, step_dir)
+        raise
+
+    latest = out / "latest"
+    try:
+        latest_tmp = out / f".latest.tmp-{os.getpid()}"
+        if latest_tmp.exists() or latest_tmp.is_symlink():
+            latest_tmp.unlink()
+        os.symlink(step_dir.name, latest_tmp)
+        if latest.exists() and latest.is_dir() and not latest.is_symlink():
+            shutil.rmtree(latest)
+        os.replace(latest_tmp, latest)
+        _fsync_directory(out)
+    except OSError:
+        # symlinks may not be available on some filesystems
+        if latest_tmp.exists() or latest_tmp.is_symlink():
+            latest_tmp.unlink()
+
+    # Prune only after ``latest`` durably points at the new step. Otherwise an
+    # outage between deleting the old target and swapping the symlink leaves a
+    # broken run root despite a complete new checkpoint being present.
     if keep_last_n > 0:
         ckpts = sorted(out.glob("step_*"))
         for old in ckpts[:-keep_last_n]:
             shutil.rmtree(old, ignore_errors=True)
-
-    latest = out / "latest"
-    if latest.exists() or latest.is_symlink():
-        try:
-            latest.unlink()
-        except OSError:
-            shutil.rmtree(latest, ignore_errors=True)
-    try:
-        os.symlink(step_dir.name, latest)
-    except OSError:
-        # symlinks may not be available on some filesystems
-        pass
+        _fsync_directory(out)
     return step_dir
+
+
+def _interrupted_backup(path: Path) -> Path | None:
+    """Return the last complete directory left by an interrupted atomic swap."""
+
+    backup = path.parent / f".{path.name}.backup"
+    if (backup / "model.pt").exists() and (backup / "COMPLETE").exists():
+        return backup
+    return None
 
 
 def resolve_checkpoint_dir(path: str | Path) -> Path:
@@ -216,16 +319,33 @@ def resolve_checkpoint_dir(path: str | Path) -> Path:
         raise ValueError(f"checkpoint file must be named model.pt: {p}")
     if p.name == "latest":
         if not p.exists():
+            if p.is_symlink():
+                target = p.parent / os.readlink(p)
+                backup = _interrupted_backup(target)
+                if backup is not None:
+                    return backup
+                complete_steps = sorted(
+                    step
+                    for step in p.parent.glob("step_*")
+                    if (step / "model.pt").exists()
+                    and (step / "COMPLETE").exists()
+                )
+                if complete_steps:
+                    return complete_steps[-1]
             raise FileNotFoundError(f"checkpoint not found: {p}")
         p = p.resolve()
     elif p.is_dir() and not (p / "model.pt").exists():
-        if (p / "latest").exists():
-            p = (p / "latest").resolve()
+        latest = p / "latest"
+        if latest.exists() or latest.is_symlink():
+            return resolve_checkpoint_dir(latest)
         else:
             steps = sorted(d for d in p.glob("step_*") if (d / "model.pt").exists())
             if steps:
                 p = steps[-1]
     elif not p.exists():
+        backup = _interrupted_backup(p)
+        if backup is not None:
+            return backup
         raise FileNotFoundError(f"checkpoint not found: {p}")
     if not (p / "model.pt").exists():
         raise FileNotFoundError(f"checkpoint model not found: {p / 'model.pt'}")

@@ -56,6 +56,12 @@ class AdvantageTest(unittest.TestCase):
 
 
 class GRPOLossTest(unittest.TestCase):
+    def test_config_rejects_sampling_scoring_distribution_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "rollout and scoring"):
+            GRPOConfig(temperature=0.8)
+        with self.assertRaisesRegex(ValueError, "rollout and scoring"):
+            GRPOConfig(top_p=0.95)
+
     def test_no_change_no_kl_recovers_neg_advantage(self):
         logp = torch.tensor([[-1.0, -2.0]])
         adv = torch.tensor([0.5])
@@ -93,6 +99,40 @@ class GRPOLossTest(unittest.TestCase):
                             cfg=GRPOConfig(clip_eps=0.2, kl_coef=0.0))
         # Clipped surrogate caps gain at (1+clip)*adv -> loss == -1.2
         self.assertAlmostEqual(float(loss), -1.2, places=5)
+
+    def test_kl_numeric_bound_keeps_corrective_gradient(self):
+        policy = torch.tensor([[-30.0]], requires_grad=True)
+        old = policy.detach().clone()
+        reference = torch.tensor([[30.0]])
+        loss, metrics = grpo_loss(
+            policy,
+            old,
+            torch.tensor([0.0]),
+            torch.ones(1, 1),
+            ref_token_logp=reference,
+            cfg=GRPOConfig(kl_coef=1.0, log_ratio_clip=5.0),
+        )
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(metrics["kl_numeric_clip_frac"], 1.0)
+        self.assertIsNotNone(policy.grad)
+        self.assertGreater(float(policy.grad.abs().sum()), 0.0)
+
+    def test_ratio_numeric_bound_keeps_corrective_gradient(self):
+        policy = torch.tensor([[30.0]], requires_grad=True)
+        old = torch.tensor([[0.0]])
+        loss, metrics = grpo_loss(
+            policy,
+            old,
+            torch.tensor([-1.0]),
+            torch.ones(1, 1),
+            cfg=GRPOConfig(kl_coef=0.0, log_ratio_clip=5.0),
+        )
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(metrics["numeric_clip_frac"], 1.0)
+        self.assertIsNotNone(policy.grad)
+        self.assertGreater(float(policy.grad.abs().sum()), 0.0)
 
 
 class RewardTest(unittest.TestCase):

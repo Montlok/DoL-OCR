@@ -114,6 +114,44 @@ class CheckpointScalerStateTest(unittest.TestCase):
                 {"rdt_config": {"recurrent_steps": 4}},
             )
 
+    def test_atomic_save_is_complete_and_same_step_can_be_replaced(self) -> None:
+        model, optimizer, scheduler = self._make_artifacts()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_checkpoint(root, 2, model, optimizer, scheduler, metadata={"v": 1})
+            step = root / "step_00000002"
+            self.assertTrue((step / "COMPLETE").is_file())
+            save_checkpoint(root, 2, model, optimizer, scheduler, metadata={"v": 2})
+            self.assertEqual(load_checkpoint_metadata(step), {"v": 2})
+            self.assertFalse((root / ".step_00000002.backup").exists())
+            self.assertFalse(any(root.glob(".step_00000002.tmp-*")))
+
+    def test_broken_latest_recovers_complete_pre_swap_backup(self) -> None:
+        model, optimizer, scheduler = self._make_artifacts()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_checkpoint(root, 4, model, optimizer, scheduler)
+            step = root / "step_00000004"
+            backup = root / ".step_00000004.backup"
+            step.rename(backup)
+            resolved = resolve_checkpoint_dir(root)
+            self.assertEqual(resolved, backup)
+            self.assertEqual(load_checkpoint(root).step, 4)
+
+    def test_broken_latest_falls_back_to_newest_complete_step(self) -> None:
+        model, optimizer, scheduler = self._make_artifacts()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_checkpoint(root, 3, model, optimizer, scheduler, keep_last_n=0)
+            save_checkpoint(root, 4, model, optimizer, scheduler, keep_last_n=0)
+            latest = root / "latest"
+            latest.unlink()
+            latest.symlink_to("step_99999999")
+            self.assertEqual(
+                resolve_checkpoint_dir(latest),
+                root / "step_00000004",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

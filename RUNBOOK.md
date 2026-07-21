@@ -129,7 +129,92 @@ required, and training semantics:
 After resume, verify both process liveness and new optimizer-step progress. Preserve the
 last known complete checkpoint until the resumed run has produced a newer complete one.
 
-## 6. Evaluation gates
+## 6. Image-conditioned OCR GRPO
+
+Keep `rl_train`, `rl_val`, and locked `golden` manifests separate. Rows from the same
+page, capture sequence, or document must share a `group_id` and remain in one split.
+Reject overlap by ID, resolved path, file hash, or group. Each JSONL row has this form:
+
+```json
+{"id":"camera-0001-line-01","group_id":"camera-0001","split":"rl_train","image":"photos/camera-0001-line-01.jpg","sha256":"<64 hex>","reference":"ᠮᠣᠩᠭᠤᠯ","domain":"photo"}
+```
+
+Audit every image and manifest before allocating an accelerator. The validator checks
+image decoding, SHA-256 values, split isolation, and required generation length. Locked
+golden labels are not tokenized or used for model selection during this audit.
+
+```bash
+"$PYTHON_BIN" -m scripts.validate_ocr_rl_manifests \
+  --checkpoint "$INIT_CHECKPOINT" \
+  --tokenizer "$TOKENIZER_DIR" \
+  --train "$RL_TRAIN_MANIFEST" \
+  --validation "$RL_VALIDATION_MANIFEST" \
+  --golden "$GOLDEN_MANIFEST" \
+  --image-root "$IMAGE_ROOT" \
+  --out "$MANIFEST_REPORT"
+```
+
+Launch only after the validator succeeds. OCR mode freezes the language model by
+default and updates the OMVT tower and projector. The dense reward is raw grapheme
+`-CER`, with penalties for empty output, reserved tokens, and excessive length.
+
+```bash
+"$PYTHON_BIN" -m scripts.train_grpo \
+  --task ocr \
+  --tokenizer "$TOKENIZER_DIR" \
+  --data "$RL_TRAIN_MANIFEST" \
+  --validation-manifest "$RL_VALIDATION_MANIFEST" \
+  --golden-manifest "$GOLDEN_MANIFEST" \
+  --image-root "$IMAGE_ROOT" \
+  --init-checkpoint "$INIT_CHECKPOINT" \
+  --output "$OUTPUT_DIR" \
+  --train-scope vision \
+  --group-size 4 \
+  --prompts-per-step 2 \
+  --max-new-tokens "$MAX_NEW_TOKENS" \
+  --learning-rate 1e-6 \
+  --kl-coef 0.04 \
+  --eval-every 50 \
+  --early-stop-patience 5 \
+  --max-steps 1000 \
+  --save-every 200 \
+  --keep-last-n 3
+```
+
+Rollouts use `temperature=1.0` without top-p truncation so rollout and scoring
+distributions match. Advantages are normalized within each prompt group. The policy
+uses a completion-only clipped surrogate and a k3 KL penalty against an immutable
+step-zero reference. Real-image validation must outperform the blank-image baseline
+before training starts.
+
+`$OUTPUT_DIR/latest` is the resumable training state; `$OUTPUT_DIR/best/latest` is the
+eligible checkpoint with the lowest validation grapheme CER. Resume with the identical
+configuration and data contract:
+
+```bash
+"$PYTHON_BIN" -m scripts.train_grpo \
+  --task ocr \
+  --resume "$OUTPUT_DIR/latest" \
+  "${EXTRA_ARGS[@]}"
+```
+
+Checkpoints are staged and published atomically. Resume restores optimizer, scheduler,
+scaler, data cursor, per-rank RNG, health counters, early-stop state, and the immutable
+reference identity. A changed manifest, tokenizer, or reference hash aborts resume.
+
+Evaluate the locked golden set once, after checkpoint selection is complete:
+
+```bash
+"$PYTHON_BIN" -m scripts.eval_ocr_grpo \
+  --checkpoint "$OUTPUT_DIR/best/latest" \
+  --tokenizer "$TOKENIZER_DIR" \
+  --golden-manifest "$GOLDEN_MANIFEST" \
+  --out "$OUTPUT_DIR/golden_report.json"
+```
+
+Do not tune hyperparameters after reading the locked report.
+
+## 7. Evaluation gates
 
 - Use grapheme CER as the headline OCR metric and retain normalized/code-point metrics
   only as diagnostics.
@@ -139,8 +224,12 @@ last known complete checkpoint until the resumed run has produced a newer comple
   report. Do not overwrite an earlier evaluation report.
 - Do not promote a checkpoint on training loss alone. Plateau stopping only controls
   training duration; it does not replace validation or the locked evaluation gate.
+- Require validation EOS rate of at least 99% and an invalid-output rate of zero before
+  an OCR GRPO checkpoint can replace `best`.
+- For the final locked evaluation, require the selected policy to beat both the
+  immutable pre-RL reference and its own blank-image ablation.
 
-## 7. Failure handling
+## 8. Failure handling
 
 1. Stop new work on the accelerator and preserve logs and the latest complete checkpoint.
 2. Determine whether the failure is data, storage, process, numerical, distributed, or

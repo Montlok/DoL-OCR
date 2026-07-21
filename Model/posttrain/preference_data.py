@@ -19,11 +19,18 @@ GRPO (``PromptDataset``)::
 
     {"messages": [...]} | {"prompt": "..."}            # required
     {"reference": "..."}                                # optional, for verifiable reward
+
+Image-conditioned OCR GRPO (``OCRPromptDataset``)::
+
+    {"id": "camera-0001", "split": "rl_train",
+     "image": "photos/camera-0001.jpg", "reference": "ᠮᠣᠩᠭᠤᠯ"}
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -35,6 +42,7 @@ from Model.config import IGNORE_INDEX
 from .sft_data import build_sft_example
 
 Encode = Callable[[str], list[int]]
+_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 
 
 def _as_messages(obj: dict) -> list[dict[str, str]]:
@@ -171,8 +179,277 @@ class PromptDataset(Dataset):
         return self._rows[idx]
 
 
+class OCRPromptDataset(Dataset):
+    """Strict real-photo OCR prompt dataset for image-conditioned GRPO.
+
+    The prompt geometry exactly matches :func:`Model.ocr.data.build_ocr_row`:
+    ``BOS, image_start, image_patch * N, image_end, optional instruction``.
+    The reference is never appended to the prompt.  Split, unique id, and image
+    checks make accidental golden-set leakage or a silently missing NAS mount a
+    startup error instead of an online-training corruption.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        encode: Encode,
+        *,
+        n_image_tokens: int,
+        bos_id: int,
+        image_start_id: int,
+        image_patch_id: int,
+        image_end_id: int,
+        encode_reference: Encode | None = None,
+        image_root: str | Path | None = None,
+        max_prompt_len: int | None = None,
+        max_completion_len: int | None = None,
+        max_seq_len: int | None = None,
+        required_split: str | None = "rl_train",
+        excluded_ids: set[str] | None = None,
+        excluded_images: set[str] | None = None,
+        excluded_sha256: set[str] | None = None,
+        excluded_groups: set[str] | None = None,
+        validate_images: bool = True,
+        verify_image_decode: bool = False,
+        require_sha256: bool = True,
+        require_group_id: bool = False,
+        require_domain: bool = False,
+        verify_sha256: bool = True,
+        inspect_reference_tokens: bool = True,
+        retain_reference: bool = True,
+        inspect_prompt_tokens: bool = True,
+    ) -> None:
+        if n_image_tokens <= 0:
+            raise ValueError("n_image_tokens must be positive")
+        source = Path(path)
+        root = Path(image_root) if image_root is not None else source.parent
+        excluded_ids = excluded_ids or set()
+        excluded_images = excluded_images or set()
+        excluded_sha256 = {value.lower() for value in (excluded_sha256 or set())}
+        excluded_groups = excluded_groups or set()
+        encode_reference = encode if encode_reference is None else encode_reference
+
+        self._rows: list[dict] = []
+        seen_ids: set[str] = set()
+        seen_images: set[str] = set()
+        seen_sha256: set[str] = set()
+        for line_no, obj in enumerate(_iter_jsonl(source), start=1):
+            sample_id = obj.get("id")
+            if not isinstance(sample_id, str) or not sample_id.strip():
+                raise ValueError(f"{source}:{line_no}: non-empty string 'id' is required")
+            sample_id = sample_id.strip()
+            if sample_id in seen_ids:
+                raise ValueError(f"{source}:{line_no}: duplicate id {sample_id!r}")
+            if sample_id in excluded_ids:
+                raise ValueError(
+                    f"{source}:{line_no}: id {sample_id!r} overlaps the locked golden set"
+                )
+
+            group_id = obj.get("group_id")
+            if group_id is None and not require_group_id:
+                group_id = sample_id
+            if not isinstance(group_id, str) or not group_id.strip():
+                raise ValueError(
+                    f"{source}:{line_no}: non-empty string 'group_id' is required "
+                    "to prevent same-document leakage across splits"
+                )
+            group_id = group_id.strip()
+            if group_id in excluded_groups:
+                raise ValueError(
+                    f"{source}:{line_no}: group_id {group_id!r} overlaps another split"
+                )
+
+            split = obj.get("split")
+            if required_split is not None and split != required_split:
+                raise ValueError(
+                    f"{source}:{line_no}: split must be {required_split!r}, got {split!r}"
+                )
+
+            image_spec = obj.get("image", obj.get("image_path"))
+            if image_spec is None and isinstance(obj.get("images"), list):
+                images = obj["images"]
+                if len(images) != 1:
+                    raise ValueError(
+                        f"{source}:{line_no}: OCR GRPO requires exactly one image"
+                    )
+                image_spec = images[0]
+            if not isinstance(image_spec, str) or not image_spec:
+                raise ValueError(f"{source}:{line_no}: string 'image' is required")
+            image_path = Path(image_spec)
+            if not image_path.is_absolute():
+                image_path = root / image_path
+            image_key = str(image_path.absolute())
+            if image_key in seen_images:
+                raise ValueError(f"{source}:{line_no}: duplicate image {image_key!r}")
+            if image_key in excluded_images or image_spec in excluded_images:
+                raise ValueError(
+                    f"{source}:{line_no}: image overlaps the locked golden set: {image_key}"
+                )
+            if validate_images and not image_path.is_file():
+                raise FileNotFoundError(f"{source}:{line_no}: image not found: {image_path}")
+            if validate_images and verify_image_decode:
+                try:
+                    from PIL import Image
+
+                    with Image.open(image_path) as image:
+                        image.load()
+                        if image.width <= 0 or image.height <= 0:
+                            raise ValueError("image has zero width or height")
+                except Exception as exc:
+                    raise ValueError(
+                        f"{source}:{line_no}: image cannot be decoded: "
+                        f"{image_path}: {exc}"
+                    ) from exc
+
+            digest = obj.get("sha256")
+            if digest is None and require_sha256:
+                raise ValueError(f"{source}:{line_no}: sha256 is required")
+            if digest is not None:
+                if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+                    raise ValueError(f"{source}:{line_no}: sha256 must be 64 hex characters")
+                digest = digest.lower()
+                if digest in seen_sha256:
+                    raise ValueError(
+                        f"{source}:{line_no}: duplicate image sha256 {digest}"
+                    )
+                if digest in excluded_sha256:
+                    raise ValueError(
+                        f"{source}:{line_no}: image hash overlaps the locked golden set"
+                    )
+                if verify_sha256:
+                    hasher = hashlib.sha256()
+                    with image_path.open("rb") as image_handle:
+                        for chunk in iter(lambda: image_handle.read(1024 * 1024), b""):
+                            hasher.update(chunk)
+                    actual = hasher.hexdigest()
+                    if actual != digest:
+                        raise ValueError(
+                            f"{source}:{line_no}: image sha256 mismatch: "
+                            f"manifest={digest} actual={actual}"
+                        )
+
+            reference = obj.get("reference")
+            if not isinstance(reference, str):
+                raise ValueError(f"{source}:{line_no}: string 'reference' is required")
+            if not reference.strip():
+                raise ValueError(f"{source}:{line_no}: reference must not be empty")
+            if "\ufffd" in reference:
+                raise ValueError(
+                    f"{source}:{line_no}: reference contains U+FFFD, which is "
+                    "reserved as the reward-safe invalid-token sentinel"
+                )
+            instruction = obj.get("instruction", "")
+            if not isinstance(instruction, str):
+                raise ValueError(f"{source}:{line_no}: instruction must be a string")
+            domain = obj.get("domain")
+            if domain is None and not require_domain:
+                domain = "unknown"
+            if not isinstance(domain, str) or not domain.strip():
+                raise ValueError(
+                    f"{source}:{line_no}: non-empty string 'domain' is required"
+                )
+            domain = domain.strip()
+            instruction_ids = (
+                [int(token) for token in encode(instruction)]
+                if instruction and inspect_prompt_tokens
+                else []
+            )
+            reference_ids = (
+                [int(token) for token in encode_reference(reference)]
+                if inspect_reference_tokens
+                else None
+            )
+            # Leave one decode position for EOS.  A row that cannot possibly be
+            # completed under max_new_tokens would otherwise receive a permanent
+            # truncation penalty and poison group-relative advantages.
+            if (
+                max_completion_len is not None
+                and reference_ids is not None
+                and len(reference_ids) + 1 > max_completion_len
+            ):
+                raise ValueError(
+                    f"{source}:{line_no}: reference needs {len(reference_ids) + 1} "
+                    f"tokens including EOS, exceeds max_completion_len="
+                    f"{max_completion_len}"
+                )
+            if image_patch_id in instruction_ids:
+                raise ValueError(
+                    f"{source}:{line_no}: instruction encodes an image_patch token"
+                )
+
+            prompt_ids = None
+            if inspect_prompt_tokens:
+                prompt_ids = (
+                    [int(bos_id), int(image_start_id)]
+                    + [int(image_patch_id)] * int(n_image_tokens)
+                    + [int(image_end_id)]
+                    + instruction_ids
+                )
+            if (
+                prompt_ids is not None
+                and max_prompt_len is not None
+                and len(prompt_ids) > max_prompt_len
+            ):
+                raise ValueError(
+                    f"{source}:{line_no}: OCR prompt length {len(prompt_ids)} exceeds "
+                    f"max_prompt_len={max_prompt_len}; image slots must never be truncated"
+                )
+            if (
+                max_seq_len is not None
+                and max_completion_len is not None
+                and prompt_ids is not None
+                and len(prompt_ids) + max_completion_len > max_seq_len
+            ):
+                raise ValueError(
+                    f"{source}:{line_no}: prompt length {len(prompt_ids)} + "
+                    f"max_completion_len {max_completion_len} exceeds model "
+                    f"max_seq_len={max_seq_len}; image-conditioned generation "
+                    "cannot slide away visual slots"
+                )
+            if (
+                max_seq_len is not None
+                and prompt_ids is not None
+                and len(prompt_ids) > max_seq_len
+            ):
+                raise ValueError(
+                    f"{source}:{line_no}: OCR prompt length {len(prompt_ids)} "
+                    f"exceeds model max_seq_len={max_seq_len}"
+                )
+
+            seen_ids.add(sample_id)
+            seen_images.add(image_key)
+            if digest is not None:
+                seen_sha256.add(digest)
+            row = {
+                "id": sample_id,
+                "group_id": group_id,
+                "split": split,
+                "reference_token_count": (
+                    len(reference_ids) if reference_ids is not None else None
+                ),
+                "image": image_key,
+                "sha256": digest,
+                "domain": domain,
+            }
+            if prompt_ids is not None:
+                row["prompt_ids"] = prompt_ids
+            if retain_reference:
+                row["reference"] = reference
+            self._rows.append(row)
+
+        if not self._rows:
+            raise ValueError(f"OCR prompt dataset is empty: {source}")
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __getitem__(self, idx: int) -> dict:
+        return self._rows[idx]
+
+
 __all__ = [
     "PreferenceDataset",
+    "OCRPromptDataset",
     "PromptDataset",
     "build_preference_example",
     "preference_collate",

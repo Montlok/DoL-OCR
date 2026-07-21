@@ -21,6 +21,8 @@ identical between sampling, policy scoring, and reference scoring.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 import torch.nn.functional as F
 
@@ -49,6 +51,7 @@ def sequence_logprobs(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
     recurrent_steps: int | None = None,
+    pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Per-token log-probs of the realized next token.
 
@@ -61,6 +64,7 @@ def sequence_logprobs(
         attention_mask=attention_mask,
         steps=recurrent_steps,
         return_logits=True,
+        pixel_values=pixel_values,
     )
     logits = out["logits"]
     return logits_to_token_logprobs(logits[:, :-1, :], input_ids[:, 1:])
@@ -72,6 +76,7 @@ def completion_logprobs(
     completion_mask: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
     recurrent_steps: int | None = None,
+    pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Summed and per-token log-probs over completion (response) tokens only.
 
@@ -92,6 +97,7 @@ def completion_logprobs(
         input_ids,
         attention_mask=attention_mask,
         recurrent_steps=recurrent_steps,
+        pixel_values=pixel_values,
     )
     # A token at position t+1 is predicted from position t, so the mask for the
     # predicted token lives at index t+1 -> drop the first column to align.
@@ -106,6 +112,7 @@ def token_logprobs_with_mask(
     completion_mask: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
     recurrent_steps: int | None = None,
+    pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unmasked per-token log-probs plus the aligned completion mask.
 
@@ -121,6 +128,7 @@ def token_logprobs_with_mask(
         input_ids,
         attention_mask=attention_mask,
         recurrent_steps=recurrent_steps,
+        pixel_values=pixel_values,
     )
     shifted_mask = completion_mask[:, 1:].to(token_logp.dtype)
     return token_logp, shifted_mask
