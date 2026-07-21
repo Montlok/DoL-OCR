@@ -20,8 +20,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import random
 import re
+import shutil
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -36,6 +40,76 @@ from scripts.build_ocr_data_from_pairs import (
 
 _SHARD_RE = re.compile(r"^shard-(\d+)\.tar$")
 CURSOR_VERSION = 1
+_COPY_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+@contextmanager
+def _locally_staged_wds_shard(source: str | Path) -> Iterator[Path]:
+    """Copy exactly one remote shard to local scratch for tar iteration.
+
+    GVFS SMB files do not reliably implement the file operations used by
+    :mod:`tarfile`, even in streaming mode (some reads fail with ``EINVAL``).
+    A manual sequential copy avoids those operations on GVFS; tarfile then
+    reads an ordinary local file.  ``TemporaryDirectory`` bounds storage to
+    one shard and removes it on normal completion, errors, or cancellation.
+
+    ``DOL_OCR_WDS_CACHE_DIR`` may point at a dedicated local scratch volume.
+    It must not point back at the NAS mount.
+    """
+
+    source_path = Path(source)
+    source_stat = source_path.stat()
+    expected_size = int(source_stat.st_size)
+    cache_root_value = os.environ.get("DOL_OCR_WDS_CACHE_DIR")
+    cache_root = Path(cache_root_value).expanduser() if cache_root_value else None
+    if cache_root is not None:
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+    scratch_root = cache_root if cache_root is not None else Path(tempfile.gettempdir())
+    free_bytes = int(shutil.disk_usage(scratch_root).free)
+    safety_bytes = max(_COPY_CHUNK_BYTES, expected_size // 100)
+    required_bytes = expected_size + safety_bytes
+    if free_bytes < required_bytes:
+        raise OSError(
+            f"insufficient local scratch for WDS shard {source_path}: "
+            f"need at least {required_bytes} bytes, have {free_bytes} bytes under "
+            f"{scratch_root}"
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix=f"dolocr-{source_path.stem}-",
+        dir=str(cache_root) if cache_root is not None else None,
+    ) as temp_dir:
+        cached_path = Path(temp_dir) / source_path.name
+        copied = 0
+        try:
+            # Do not use shutil.copyfile/copy2 here: their fast-copy syscalls
+            # can trigger the same unsupported-operation failure on GVFS.
+            with (
+                source_path.open("rb", buffering=0) as src,
+                cached_path.open("wb", buffering=0) as dst,
+            ):
+                while True:
+                    chunk = src.read(_COPY_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    copied += len(chunk)
+        except OSError as exc:
+            raise OSError(
+                f"failed to stage WDS shard {source_path} to local scratch: {exc}"
+            ) from exc
+        if copied != expected_size:
+            raise OSError(
+                f"short copy while staging WDS shard {source_path}: "
+                f"copied {copied} of {expected_size} bytes"
+            )
+        final_source_stat = source_path.stat()
+        if int(final_source_stat.st_size) != expected_size or int(
+            final_source_stat.st_mtime_ns
+        ) != int(source_stat.st_mtime_ns):
+            raise OSError(f"WDS shard changed while it was being staged: {source_path}")
+        yield cached_path
 
 
 def discover_wds_shards(
@@ -202,31 +276,32 @@ class _WDSRecordStream:
             path = self.paths[shard_position]
             counters = ShardCounters(shard_position)
             valid_position = 0
-            for key, png_bytes, row in iter_tar_pairs(path, counters):
-                target = _valid_train_row(
-                    row,
-                    val_src_doc_min=self.val_src_doc_min,
-                    max_target_len=self.max_target_len,
-                )
-                if target is None:
-                    continue
-                if shard_position == start_shard and valid_position < start_sample:
+            with _locally_staged_wds_shard(path) as staged_path:
+                for key, png_bytes, row in iter_tar_pairs(staged_path, counters):
+                    target = _valid_train_row(
+                        row,
+                        val_src_doc_min=self.val_src_doc_min,
+                        max_target_len=self.max_target_len,
+                    )
+                    if target is None:
+                        continue
+                    if shard_position == start_shard and valid_position < start_sample:
+                        valid_position += 1
+                        continue
                     valid_position += 1
-                    continue
-                valid_position += 1
-                after = {
-                    "shard_position": shard_position,
-                    "sample_position": valid_position,
-                }
-                yield {
-                    "source": "wds",
-                    "key": f"{path.name}:{key}",
-                    "image": png_bytes,
-                    "target": target,
-                    "font": str(row.get("font", "")),
-                    "src_doc": int(row["src_doc"]),
-                    "cursor_after": after,
-                }
+                    after = {
+                        "shard_position": shard_position,
+                        "sample_position": valid_position,
+                    }
+                    yield {
+                        "source": "wds",
+                        "key": f"{path.name}:{key}",
+                        "image": png_bytes,
+                        "target": target,
+                        "font": str(row.get("font", "")),
+                        "src_doc": int(row["src_doc"]),
+                        "cursor_after": after,
+                    }
             # A checkpoint taken after the final yielded record still points at
             # that shard.  Resume re-scans only this one tar, then advances.
             start_sample = 0
@@ -299,7 +374,10 @@ class _HanshiRecordStream:
                     "src_doc": int(row["src_doc"]),
                     "cursor_after": after,
                 }
-        self.cursor = {"byte_offset": self.meta_path.stat().st_size, "line_number": line_number}
+        self.cursor = {
+            "byte_offset": self.meta_path.stat().st_size,
+            "line_number": line_number,
+        }
 
     def __iter__(self) -> "_HanshiRecordStream":
         return self
@@ -406,12 +484,14 @@ class MixedOCRCorpus:
 
 
 def _collate_stream_rows(
-    rows: list[tuple[torch.Tensor, list[int], dict[str, Any]]]
+    rows: list[tuple[torch.Tensor, list[int], dict[str, Any]]],
 ) -> dict[str, Any]:
     pixels = torch.stack([row[0] for row in rows])
     targets = [row[1] for row in rows]
     target_lengths = torch.tensor([len(row) for row in targets], dtype=torch.long)
-    flat_targets = torch.tensor([token for row in targets for token in row], dtype=torch.long)
+    flat_targets = torch.tensor(
+        [token for row in targets for token in row], dtype=torch.long
+    )
     metadata = [row[2] for row in rows]
     return {
         "pixels": pixels,

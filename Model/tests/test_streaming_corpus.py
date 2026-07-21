@@ -8,11 +8,17 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from PIL import Image
 
-from Model.ocr.streaming_corpus import MixedOCRCorpus, corpus_manifest
+from Model.ocr.streaming_corpus import (
+    MixedOCRCorpus,
+    _locally_staged_wds_shard,
+    corpus_manifest,
+)
 from Model.omvt import OMVTVisionTower
 from scripts.train_ctc_head import (
     BLANK_ID,
@@ -139,6 +145,35 @@ class StreamingCorpusTest(unittest.TestCase):
             )
             self.assertEqual(first, second)
             self.assertEqual(first_sha, second_sha)
+
+    def test_wds_shard_is_staged_and_cleaned_up(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            tempfile.TemporaryDirectory() as cache,
+        ):
+            source = Path(tmp) / "shard-00000.tar"
+            _write_wds(source, 1)
+            with mock.patch.dict(
+                "os.environ", {"DOL_OCR_WDS_CACHE_DIR": cache}, clear=False
+            ):
+                with _locally_staged_wds_shard(source) as staged:
+                    self.assertNotEqual(staged, source)
+                    self.assertEqual(staged.parent.parent, Path(cache))
+                    self.assertTrue(staged.is_file())
+                    self.assertEqual(staged.read_bytes(), source.read_bytes())
+            self.assertFalse(staged.exists())
+
+    def test_wds_staging_fails_before_copy_when_scratch_is_too_small(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "shard-00000.tar"
+            _write_wds(source, 1)
+            with mock.patch(
+                "Model.ocr.streaming_corpus.shutil.disk_usage",
+                return_value=SimpleNamespace(free=0),
+            ):
+                with self.assertRaisesRegex(OSError, "insufficient local scratch"):
+                    with _locally_staged_wds_shard(source):
+                        self.fail("staging unexpectedly entered the context")
 
     def test_streaming_cli_saves_resume_contract(self) -> None:
         from Model.tests.test_ctc_head import _tiny_omvt_config
