@@ -66,6 +66,29 @@ paths explicitly; do not rely on workstation-specific defaults.
 In shell automation, store optional arguments in an array as shown above. Do not place a
 quoted list of arguments in one scalar variable.
 
+For long VLM alignment runs, an optional smoothed training-loss plateau may be used as
+an operational stop condition while ``--steps`` remains the hard ceiling:
+
+```bash
+"$PYTHON_BIN" -m scripts.train_vlm_align \
+  --data "$ALIGNMENT_DATA" \
+  --output "$OUTPUT_DIR" \
+  --steps "$MAX_STEPS" \
+  --early-stop-min-steps "$EARLY_STOP_MIN_STEPS" \
+  --early-stop-patience "$EARLY_STOP_PATIENCE" \
+  --early-stop-min-delta "$EARLY_STOP_MIN_DELTA" \
+  --early-stop-smoothing ema \
+  --early-stop-ema-alpha "$EARLY_STOP_EMA_ALPHA" \
+  "${EXTRA_ARGS[@]}"
+```
+
+Set ``--early-stop-patience 0`` to disable the condition. Patience is counted in
+completed optimizer steps, after ``--early-stop-min-steps``. The smoother, best loss,
+patience counter, and last observed step are checkpointed; a resume must use the same
+early-stop configuration. A checkpoint whose ``stop_reason`` is ``loss_plateau`` is a
+completed run, not a continuation target. Use it as an explicit initialization source
+only when starting a deliberately new schedule.
+
 ## 4. Monitoring and graceful control
 
 The run directory is the control and status boundary:
@@ -114,7 +137,8 @@ last known complete checkpoint until the resumed run has produced a newer comple
 - Keep validation and locked golden data outside all training and tuning paths.
 - Record the evaluated checkpoint hash, dataset hash, generation settings, and raw
   report. Do not overwrite an earlier evaluation report.
-- Do not promote a checkpoint on training loss alone.
+- Do not promote a checkpoint on training loss alone. Plateau stopping only controls
+  training duration; it does not replace validation or the locked evaluation gate.
 
 ## 7. Failure handling
 
