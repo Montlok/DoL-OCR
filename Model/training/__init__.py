@@ -33,6 +33,10 @@ from Model.training.dist import (
     wrap_ddp,
     wrap_fsdp,
 )
+from Model.training.early_stopping import (
+    EarlyStoppingConfig,
+    LossPlateauStopper,
+)
 from Model.training.logging import RankZeroLogger, throughput_str
 from Model.training.loop import (
     TrainState,
@@ -52,7 +56,9 @@ from Model.training.optim import (
 )
 
 __all__ = [
+    "EarlyStoppingConfig",
     "JsonlPretrainingDataset",
+    "LossPlateauStopper",
     "PretrainingCollator",
     "RankZeroLogger",
     "StreamingJsonlDataset",

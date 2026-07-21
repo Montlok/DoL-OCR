@@ -11,6 +11,7 @@ projector/tower.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from dataclasses import asdict, fields, replace
@@ -31,6 +32,8 @@ from Model.model import RDTForCausalLM
 from Model.omvt import OMVTInjector
 from Model.omvt.patcher import collate_omvt_batch
 from Model.training import (
+    EarlyStoppingConfig,
+    LossPlateauStopper,
     RankZeroLogger,
     TrainState,
     build_dataloader,
@@ -65,6 +68,42 @@ def parse_args(argv=None):
         ),
     )
     p.add_argument("--steps", type=int, default=4)
+    p.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="smoothed-loss observations without improvement (0 disables)",
+    )
+    p.add_argument(
+        "--early-stop-min-steps",
+        type=int,
+        default=0,
+        help="minimum optimizer step before plateau patience is counted",
+    )
+    p.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="minimum absolute smoothed-loss decrease considered an improvement",
+    )
+    p.add_argument(
+        "--early-stop-smoothing",
+        choices=("ema", "window"),
+        default="ema",
+        help="smoother used for training-loss plateau detection",
+    )
+    p.add_argument(
+        "--early-stop-ema-alpha",
+        type=float,
+        default=0.01,
+        help="new-observation weight for EMA smoothing",
+    )
+    p.add_argument(
+        "--early-stop-window-size",
+        type=int,
+        default=100,
+        help="rolling-mean width when --early-stop-smoothing=window",
+    )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--image-size", type=int, default=56)
     p.add_argument("--seq-len", type=int, default=24)
@@ -149,6 +188,17 @@ def parse_args(argv=None):
         "grad_ckpt_prelude_coda) to fit long sequences on small GPUs",
     )
     return p.parse_args(argv)
+
+
+def _early_stopping_config(args) -> EarlyStoppingConfig:
+    return EarlyStoppingConfig(
+        patience=args.early_stop_patience,
+        min_steps=args.early_stop_min_steps,
+        min_delta=args.early_stop_min_delta,
+        smoothing=args.early_stop_smoothing,
+        ema_alpha=args.early_stop_ema_alpha,
+        window_size=args.early_stop_window_size,
+    )
 
 
 def _build_omvt_cfg(args, checkpoint_metadata: dict | None = None) -> OMVTConfig:
@@ -309,6 +359,8 @@ def _alignment_metadata(
     train_cfg: TrainingConfig,
     *,
     inherited: dict | None = None,
+    early_stopper: LossPlateauStopper | None = None,
+    stop_reason: str = "",
     final: bool = False,
 ) -> dict:
     inherited = inherited or {}
@@ -333,6 +385,12 @@ def _alignment_metadata(
         "use_ema_tower": bool(
             args.use_ema_tower or inherited.get("use_ema_tower", False)
         ),
+        "early_stopping": (
+            early_stopper.metadata_dict()
+            if early_stopper is not None
+            else inherited.get("early_stopping", {})
+        ),
+        "stop_reason": str(stop_reason),
         "final": bool(final),
     }
 
@@ -425,6 +483,20 @@ def main(argv=None):
     # Fast-fail validation **before** any device alloc / model construction.
     # Mirrors the train_rdt CLI pattern: misconfigured runs should not pay the
     # cost of building the model only to crash inside the first step.
+    if args.steps <= 0:
+        print("scripts.train_vlm_align: --steps must be positive", file=sys.stderr)
+        return 2
+    try:
+        early_stop_config = _early_stopping_config(args)
+    except ValueError as exc:
+        print(f"scripts.train_vlm_align: {exc}", file=sys.stderr)
+        return 2
+    if early_stop_config.min_steps > args.steps:
+        print(
+            "scripts.train_vlm_align: --early-stop-min-steps cannot exceed --steps",
+            file=sys.stderr,
+        )
+        return 2
     if args.image_size <= 0 or args.image_size % 4 != 0:
         print(
             "scripts/train_vlm_align: --image-size must be a positive multiple of 4",
@@ -546,6 +618,23 @@ def main(argv=None):
                 print(f"  - ... and {len(conflicts) - 12} more", file=sys.stderr)
             return 2
 
+    try:
+        early_stopper = LossPlateauStopper.from_metadata(
+            early_stop_config,
+            source_metadata.get("early_stopping") if args.resume else None,
+            require_state=bool(args.resume),
+        )
+    except (TypeError, ValueError) as exc:
+        print(f"scripts.train_vlm_align: {exc}", file=sys.stderr)
+        return 2
+    if args.resume and source_metadata.get("stop_reason") == "loss_plateau":
+        print(
+            "scripts.train_vlm_align: checkpoint already stopped on a loss "
+            "plateau; use it as an initialization checkpoint for a new run",
+            file=sys.stderr,
+        )
+        return 2
+
     model = RDTForCausalLM(rdt_cfg).to(device)
     # plug in matching-size OMVT injector (otherwise dispatcher would build
     # a default-sized one on first forward and fail on tiny synthetic inputs).
@@ -573,12 +662,81 @@ def main(argv=None):
             scheduler,
             state=state,
         )
+        if early_stopper.enabled and early_stopper.last_step != state.step:
+            print(
+                "scripts.train_vlm_align: checkpoint early-stop state does not "
+                f"match checkpoint step ({early_stopper.last_step} != {state.step})",
+                file=sys.stderr,
+            )
+            return 2
 
     Path(args.output).mkdir(parents=True, exist_ok=True)
     logger = RankZeroLogger(args.output, enable_tensorboard=False)
 
     t0 = time.time()
     completed = False
+    stop_reason = ""
+
+    def _save(*, final: bool = False) -> None:
+        save_checkpoint(
+            args.output,
+            state.step,
+            model,
+            optimizer,
+            scheduler,
+            metadata=_alignment_metadata(
+                args,
+                rdt_cfg,
+                omvt_cfg,
+                train_cfg,
+                inherited=source_metadata,
+                early_stopper=early_stopper,
+                stop_reason=stop_reason,
+                final=final,
+            ),
+            keep_last_n=args.keep_last_n,
+        )
+
+    def _record_completed_step(metrics: dict[str, float]) -> bool:
+        nonlocal stop_reason
+        loss_value = float(metrics["loss"])
+        should_stop = early_stopper.observe(loss_value, state.step)
+
+        logged = {"loss": loss_value}
+        for key in ("grad_norm", "lr", "tokens", "rec_steps"):
+            value = metrics.get(key)
+            if value is not None and math.isfinite(float(value)):
+                logged[key] = float(value)
+        if early_stopper.enabled:
+            if early_stopper.smoothed_loss is not None:
+                logged["early_stop_smoothed_loss"] = early_stopper.smoothed_loss
+            if early_stopper.best_loss is not None:
+                logged["early_stop_best_loss"] = early_stopper.best_loss
+            logged["early_stop_bad_steps"] = float(early_stopper.bad_steps)
+        logger.log(state.step, logged)
+
+        if should_stop:
+            stop_reason = "loss_plateau"
+            print(
+                f"[early-stop] loss plateau at step {state.step}: "
+                f"smoothed={early_stopper.smoothed_loss:.8f} "
+                f"best={early_stopper.best_loss:.8f} "
+                f"bad_steps={early_stopper.bad_steps}/"
+                f"{early_stopper.config.patience}",
+                flush=True,
+            )
+        elif state.step >= args.steps:
+            stop_reason = "max_steps"
+
+        terminal_step = should_stop or state.step >= args.steps
+        if (
+            args.save_every
+            and state.step % args.save_every == 0
+            and (not terminal_step or args.smoke)
+        ):
+            _save()
+        return should_stop
+
     try:
         if args.data:
             # Real-data path: pull pixel-aware batches from the streaming
@@ -606,23 +764,8 @@ def main(argv=None):
                     state,
                     device=device,
                 )
-                logger.log(state.step, {"loss": metrics["loss"]})
-                if args.save_every and state.step % args.save_every == 0:
-                    save_checkpoint(
-                        args.output,
-                        state.step,
-                        model,
-                        optimizer,
-                        scheduler,
-                        metadata=_alignment_metadata(
-                            args,
-                            rdt_cfg,
-                            omvt_cfg,
-                            train_cfg,
-                            inherited=source_metadata,
-                        ),
-                        keep_last_n=args.keep_last_n,
-                    )
+                if _record_completed_step(metrics):
+                    break
         else:
             while state.step < args.steps:
                 step = state.step + 1
@@ -655,50 +798,30 @@ def main(argv=None):
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                clip_or_check_grad_norm(model, 1.0, step=step)
+                grad_norm = clip_or_check_grad_norm(model, 1.0, step=step)
                 optimizer.step()
                 scheduler.step()
                 state.step = step
 
-                logger.log(step, {"loss": float(loss.detach())})
-                if args.save_every and step % args.save_every == 0:
-                    save_checkpoint(
-                        args.output,
-                        step,
-                        model,
-                        optimizer,
-                        scheduler,
-                        metadata=_alignment_metadata(
-                            args,
-                            rdt_cfg,
-                            omvt_cfg,
-                            train_cfg,
-                            inherited=source_metadata,
-                        ),
-                        keep_last_n=args.keep_last_n,
-                    )
+                metrics = {
+                    "loss": float(loss.detach()),
+                    "grad_norm": grad_norm,
+                    "lr": float(scheduler.get_last_lr()[0]),
+                }
+                if _record_completed_step(metrics):
+                    break
+        if not stop_reason:
+            stop_reason = "max_steps"
         completed = True
     finally:
         logger.close()
         if completed and not args.smoke:
-            save_checkpoint(
-                args.output,
-                state.step,
-                model,
-                optimizer,
-                scheduler,
-                metadata=_alignment_metadata(
-                    args,
-                    rdt_cfg,
-                    omvt_cfg,
-                    train_cfg,
-                    inherited=source_metadata,
-                    final=True,
-                ),
-                keep_last_n=args.keep_last_n,
-            )
+            _save(final=True)
     mode = "real-data" if args.data else "smoke"
-    print(f"VLM align {mode} run OK in {time.time() - t0:.1f}s")
+    print(
+        f"VLM align {mode} run OK in {time.time() - t0:.1f}s "
+        f"(step={state.step}, stop_reason={stop_reason})"
+    )
     return 0
 
 

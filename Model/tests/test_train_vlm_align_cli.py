@@ -28,6 +28,29 @@ from scripts import train_vlm_align
 
 
 class TrainVlmAlignCliGuardsTest(unittest.TestCase):
+    def test_invalid_early_stop_fails_before_model_allocation(self) -> None:
+        cases = (
+            (["--early-stop-patience", "-1"], "patience"),
+            (["--early-stop-min-delta", "nan"], "min_delta"),
+            (["--early-stop-ema-alpha", "0"], "ema_alpha"),
+            (["--early-stop-window-size", "0"], "window_size"),
+            (
+                ["--steps", "5", "--early-stop-min-steps", "6"],
+                "cannot exceed",
+            ),
+        )
+        for argv, expected in cases:
+            stderr = io.StringIO()
+            with (
+                self.subTest(argv=argv),
+                mock.patch.object(train_vlm_align, "RDTForCausalLM") as model_ctor,
+                contextlib.redirect_stderr(stderr),
+            ):
+                rc = train_vlm_align.main(argv)
+            self.assertEqual(rc, 2)
+            model_ctor.assert_not_called()
+            self.assertIn(expected, stderr.getvalue())
+
     def test_non_positive_image_size_fails_cleanly(self) -> None:
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -117,6 +140,85 @@ def _tiny_omvt() -> OMVTConfig:
         n_local_attn_layers=1,
         n_layout_layers=1,
     )
+
+
+class _ConstantLossInjector(torch.nn.Module):
+    def __init__(self, *_args, **_kwargs) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(()))
+
+
+class _ConstantLossVlm(torch.nn.Module):
+    def __init__(self, _cfg) -> None:
+        super().__init__()
+        self.language_weight = torch.nn.Parameter(torch.zeros(()))
+        self.vision = torch.nn.Module()
+        self.vision.omvt = None
+
+    def forward(self, **_kwargs):
+        loss = self.language_weight * 0.0 + self.vision.omvt.weight * 0.0 + 1.0
+        return {"loss": loss}
+
+
+class TrainVlmAlignEarlyStoppingIntegrationTest(unittest.TestCase):
+    def test_plateau_writes_one_final_resumable_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    train_vlm_align,
+                    "_build_omvt_cfg",
+                    return_value=_tiny_omvt(),
+                ),
+                mock.patch.object(
+                    train_vlm_align,
+                    "_build_rdt_cfg",
+                    return_value=_tiny_rdt(),
+                ),
+                mock.patch.object(
+                    train_vlm_align,
+                    "RDTForCausalLM",
+                    _ConstantLossVlm,
+                ),
+                mock.patch.object(
+                    train_vlm_align,
+                    "OMVTInjector",
+                    _ConstantLossInjector,
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                rc = train_vlm_align.main(
+                    [
+                        "--steps",
+                        "5",
+                        "--early-stop-patience",
+                        "2",
+                        "--early-stop-ema-alpha",
+                        "1",
+                        "--device",
+                        "cpu",
+                        "--mamba",
+                        "naive",
+                        "--output",
+                        tmp,
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertIn("stop_reason=loss_plateau", stdout.getvalue())
+            step_dir = Path(tmp) / "step_00000003"
+            self.assertTrue((step_dir / "model.pt").is_file())
+            metadata = torch.load(
+                step_dir / "meta.pt",
+                map_location="cpu",
+                weights_only=False,
+            )["metadata"]
+            self.assertTrue(metadata["final"])
+            self.assertEqual(metadata["stop_reason"], "loss_plateau")
+            self.assertEqual(
+                metadata["early_stopping"]["state"]["last_step"],
+                3,
+            )
 
 
 class TrainVlmAlignFreezeContractTest(unittest.TestCase):
