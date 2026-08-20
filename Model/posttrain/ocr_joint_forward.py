@@ -17,23 +17,33 @@ from Model.posttrain.ocr_anyres_collator import merge_packed_detail_views
 def move_native_batch(
     batch: PackedNativeOMVTBatch,
     device: torch.device,
+    *,
+    dtype: torch.dtype | None = None,
 ) -> PackedNativeOMVTBatch:
+    def move(value: torch.Tensor) -> torch.Tensor:
+        target_dtype = dtype if dtype is not None and value.is_floating_point() else None
+        return value.to(
+            device,
+            dtype=target_dtype,
+            non_blocking=True,
+        )
+
     streams = {
         kind: PackedPatchStream(
-            patches=stream.patches.to(device, non_blocking=True),
-            bbox_px_yxxy=stream.bbox_px_yxxy.to(device, non_blocking=True),
-            bbox_norm_yxxy=stream.bbox_norm_yxxy.to(device, non_blocking=True),
-            valid_fraction=stream.valid_fraction.to(device, non_blocking=True),
-            sample_ids=stream.sample_ids.to(device, non_blocking=True),
+            patches=move(stream.patches),
+            bbox_px_yxxy=move(stream.bbox_px_yxxy),
+            bbox_norm_yxxy=move(stream.bbox_norm_yxxy),
+            valid_fraction=move(stream.valid_fraction),
+            sample_ids=move(stream.sample_ids),
             cu_seqlens=stream.cu_seqlens.to("cpu"),
-            grid_yx=stream.grid_yx.to(device, non_blocking=True),
+            grid_yx=move(stream.grid_yx),
         )
         for kind, stream in batch.streams.items()
     }
     return replace(
         batch,
         streams=streams,
-        original_hw=batch.original_hw.to(device, non_blocking=True),
+        original_hw=move(batch.original_hw),
         raw_patch_tokens=batch.raw_patch_tokens.to("cpu"),
     )
 
@@ -87,7 +97,15 @@ def encode_anyres_visual_batch(
     if not isinstance(view_to_sample, torch.Tensor):
         raise TypeError("batch.view_to_sample must be a tensor")
 
-    native_packed = move_native_batch(native_packed, device)
+    target_parameter = next(native_tower.parameters(), None)
+    if target_parameter is None:
+        raise RuntimeError("native detail tower has no parameter dtype contract")
+    target_dtype = target_parameter.dtype
+    native_packed = move_native_batch(
+        native_packed,
+        device,
+        dtype=target_dtype,
+    )
     detail = native_tower(native_packed)
     logical_batch = int(batch["input_ids"].shape[0])
     detail_memory, detail_cu = merge_packed_detail_views(
@@ -96,10 +114,15 @@ def encode_anyres_visual_batch(
         view_to_sample.to("cpu"),
         logical_batch,
     )
-    global_pixels = {
-        key: value.to(device, non_blocking=True)
-        for key, value in dict(batch["global_pixel_values"]).items()
-    }
+    global_pixels = {}
+    for key, value in dict(batch["global_pixel_values"]).items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"global_pixel_values[{key!r}] must be a tensor")
+        global_pixels[key] = value.to(
+            device,
+            dtype=target_dtype if value.is_floating_point() else None,
+            non_blocking=True,
+        )
     return {
         "global_pixel_values": global_pixels,
         "detail_memory": detail_memory,

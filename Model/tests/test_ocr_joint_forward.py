@@ -12,7 +12,10 @@ from Model.config import OMVTConfig, RDTConfig
 from Model.model import RDTForCausalLM
 from Model.omvt import OMVTInjector
 from Model.posttrain.ocr_anyres_collator import AnyresOCRSFTCollator
-from Model.posttrain.ocr_joint_forward import forward_anyres_ocr_batch
+from Model.posttrain.ocr_joint_forward import (
+    forward_anyres_ocr_batch,
+    move_native_batch,
+)
 from Tokenizer.multimodal import NativeImageProcessorV2, PILImageProcessor
 
 
@@ -100,6 +103,33 @@ def _configs() -> tuple[RDTConfig, OMVTConfig]:
 
 
 class OCRJointForwardTest(unittest.TestCase):
+    def test_native_float_payloads_follow_tower_precision(self) -> None:
+        _rdt, omvt = _configs()
+        collator = AnyresOCRSFTCollator(
+            encode_reference=_NativeEncoder(),
+            omvt_cfg=omvt,
+            global_processor=PILImageProcessor(
+                image_size=16, in_channels=3, mean=None, std=None
+            ),
+            native_processor=NativeImageProcessorV2(
+                in_channels=3, mean=None, std=None, max_decode_pixels=1000
+            ),
+            max_raw_patch_tokens_per_view=100,
+            max_seq_len=512,
+        )
+        packed = collator([_item()])["native_packed"]
+        moved = move_native_batch(
+            packed,
+            torch.device("cpu"),
+            dtype=torch.bfloat16,
+        )
+        for stream in moved.streams.values():
+            self.assertEqual(stream.patches.dtype, torch.bfloat16)
+            self.assertEqual(stream.bbox_norm_yxxy.dtype, torch.bfloat16)
+            self.assertEqual(stream.valid_fraction.dtype, torch.bfloat16)
+            self.assertEqual(stream.sample_ids.dtype, torch.long)
+            self.assertEqual(stream.cu_seqlens.device.type, "cpu")
+
     def test_two_stage_zero_bridge_opens_gradient_into_native_tower(self) -> None:
         torch.manual_seed(37)
         rdt, omvt = _configs()
