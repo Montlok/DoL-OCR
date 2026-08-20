@@ -196,6 +196,7 @@ def train_one_step(
                     labels=batch["labels"],
                     word_pos=batch.get("word_pos"),
                     morph_depth=batch.get("morph_depth"),
+                    position_contract=batch.get("position_contract"),
                     pixel_values=batch.get("pixel_values"),
                     steps=rec_steps,
                     bptt_window=cfg.bptt_window,
@@ -300,6 +301,7 @@ def evaluate(
                 labels=batch["labels"],
                 word_pos=batch.get("word_pos"),
                 morph_depth=batch.get("morph_depth"),
+                position_contract=batch.get("position_contract"),
                 pixel_values=batch.get("pixel_values"),
                 return_logits=not cfg.use_loss_chunking,
             )

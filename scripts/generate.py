@@ -29,6 +29,7 @@ import torch  # noqa: E402
 
 from scripts.train_rdt import CONFIG_CHOICES, _resolve_mamba_backend  # noqa: E402
 from Model.model import RDTForCausalLM  # noqa: E402
+from Model.ocr.tokenization import tokenizer_morphology_track_table  # noqa: E402
 from Tokenizer.unified.bundle import TokenizerBundle  # noqa: E402
 
 
@@ -119,6 +120,11 @@ def main(argv: list[str] | None = None) -> None:
 
     prompt_ids = bundle.encode(args.prompt, add_bos=True)
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=args.device)
+    morphology_track_table = torch.tensor(
+        tokenizer_morphology_track_table(bundle.tokenizer),
+        dtype=torch.long,
+        device=args.device,
+    )
 
     out = model.generate(
         input_ids,
@@ -131,6 +137,7 @@ def main(argv: list[str] | None = None) -> None:
         repetition_penalty=args.repetition_penalty,
         use_cache=args.use_cache,
         recurrent_steps=args.recurrent_steps,
+        morphology_track_table=morphology_track_table,
     )
 
     full = out[0].tolist()

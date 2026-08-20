@@ -2,7 +2,11 @@
 
 """Tests for GRPO advantages, surrogate loss, and verifiable rewards."""
 
+import contextlib
+import io
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -10,8 +14,10 @@ from Model.config import RDTConfig, TrainingConfig
 from Model.model import RDTForCausalLM
 from Model.posttrain.grpo import (
     GRPOConfig,
+    grpo_compute_loss,
     grpo_loss,
     group_normalized_advantages,
+    group_relative_advantages,
 )
 from Model.posttrain.logprobs import token_logprobs_with_mask
 from Model.posttrain.rewards import (
@@ -53,6 +59,33 @@ class AdvantageTest(unittest.TestCase):
             group_normalized_advantages(torch.zeros(5), group_size=2)
         with self.assertRaises(ValueError):
             group_normalized_advantages(torch.zeros(1), group_size=1)
+
+    def test_centered_advantage_does_not_amplify_tiny_reward_spread(self):
+        rewards = torch.tensor([0.0, 1e-8])
+        adv = group_relative_advantages(
+            rewards,
+            group_size=2,
+            mode="centered",
+        )
+        self.assertLessEqual(float(adv.abs().max()), 1e-8)
+
+    def test_group_relative_advantage_rejects_nonfinite_reward(self):
+        with self.assertRaisesRegex(ValueError, "finite"):
+            group_relative_advantages(
+                torch.tensor([0.0, float("nan")]),
+                group_size=2,
+            )
+
+    def test_minimum_reward_spread_zeros_only_configured_groups(self):
+        rewards = torch.tensor([0.0, 1e-8, 0.0, 1.0])
+        adv = group_relative_advantages(
+            rewards,
+            group_size=2,
+            mode="centered",
+            min_reward_spread=1e-7,
+        )
+        self.assertTrue(torch.equal(adv[:2], torch.zeros(2)))
+        self.assertGreater(float(adv[3]), 0.0)
 
 
 class GRPOLossTest(unittest.TestCase):
@@ -99,6 +132,38 @@ class GRPOLossTest(unittest.TestCase):
                             cfg=GRPOConfig(clip_eps=0.2, kl_coef=0.0))
         # Clipped surrogate caps gain at (1+clip)*adv -> loss == -1.2
         self.assertAlmostEqual(float(loss), -1.2, places=5)
+
+    def test_behavior_policy_mismatch_fails_for_negative_advantage(self):
+        with self.assertRaisesRegex(RuntimeError, "rollout/scoring policy mismatch"):
+            grpo_loss(
+                torch.tensor([[0.0]]),
+                torch.tensor([[-0.1]]),
+                torch.tensor([-1.0]),
+                torch.ones(1, 1),
+                cfg=GRPOConfig(
+                    clip_eps=None,
+                    kl_coef=0.0,
+                    max_behavior_log_ratio=0.05,
+                ),
+            )
+
+    def test_behavior_gate_can_be_deferred_for_distributed_consensus(self):
+        _, metrics = grpo_loss(
+            torch.tensor([[0.0]]),
+            torch.tensor([[-0.1]]),
+            torch.tensor([-1.0]),
+            torch.ones(1, 1),
+            cfg=GRPOConfig(
+                clip_eps=None,
+                kl_coef=0.0,
+                max_behavior_log_ratio=0.05,
+            ),
+            enforce_behavior_gate=False,
+        )
+        self.assertAlmostEqual(
+            metrics["behavior_log_ratio_abs_max"],
+            0.1,
+        )
 
     def test_kl_numeric_bound_keeps_corrective_gradient(self):
         policy = torch.tensor([[-30.0]], requires_grad=True)
@@ -165,6 +230,90 @@ class RewardTest(unittest.TestCase):
 
 
 class GRPOIntegrationTest(unittest.TestCase):
+    def test_no_signal_streak_clean_stops_without_optimizer_path(self):
+        from scripts import train_grpo
+
+        calls = 0
+
+        def no_signal_loss(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return (
+                torch.tensor(0.0, requires_grad=True),
+                {
+                    "loss": 0.0,
+                    "kl": 0.0,
+                    "active_group": 0.0,
+                    "degenerate_group": 1.0,
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = io.StringIO()
+            with (
+                patch.dict(
+                    train_grpo.CONFIG_CHOICES,
+                    {"two_stage_tiny": _cfg},
+                    clear=True,
+                ),
+                patch.object(
+                    train_grpo,
+                    "grpo_compute_loss",
+                    side_effect=no_signal_loss,
+                ),
+                patch.object(
+                    train_grpo,
+                    "clip_or_check_grad_norm",
+                    side_effect=AssertionError(
+                        "zero-signal rollout entered optimizer path"
+                    ),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                rc = train_grpo.main(
+                    [
+                        "--smoke",
+                        "--precision",
+                        "fp32",
+                        "--max-steps",
+                        "5",
+                        "--max-degenerate-steps",
+                        "2",
+                        "--output",
+                        tmp,
+                    ]
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, 2)
+        self.assertIn("no prompt group carried reward spread", output.getvalue())
+
+    def test_native_rollout_behavior_matches_fresh_scoring(self):
+        torch.manual_seed(0)
+        policy = RDTForCausalLM(_cfg())
+        policy.reverse_loss_enabled = False
+        prompt = torch.randint(30, 200, (3,))
+
+        loss, metrics = grpo_compute_loss(
+            policy,
+            None,
+            [prompt],
+            lambda _responses, _idx: torch.tensor([0.0, 1.0]),
+            lambda ids: " ".join(str(int(token)) for token in ids),
+            cfg=GRPOConfig(
+                clip_eps=None,
+                advantage_mode="centered",
+                group_size=2,
+                max_new_tokens=2,
+                recurrent_steps=1,
+                kl_coef=0.0,
+                max_behavior_log_ratio=5e-3,
+            ),
+            eos_id=policy.cfg.eos_id,
+            pad_id=policy.cfg.pad_id,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertLess(metrics["behavior_log_ratio_abs_max"], 5e-3)
+
     def test_token_logprobs_with_mask_shapes_and_grad(self):
         torch.manual_seed(0)
         model = RDTForCausalLM(_cfg())

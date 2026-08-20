@@ -35,6 +35,7 @@ from .video_placeholders import (
 )
 from .bbox import decode_bbox_tokens, encode_bbox_tokens, normalize_bbox
 from .image_io import PILImageProcessor
+from .native_image_io import NativeImageProcessorV2, NativeImageTensor
 from .processor import MultimodalEncoding, MultimodalProcessor
 
 __all__ = [
@@ -52,6 +53,8 @@ __all__ = [
     "MULTIMODAL_SPECIAL_TOKENS",
     "MultimodalEncoding",
     "MultimodalProcessor",
+    "NativeImageProcessorV2",
+    "NativeImageTensor",
     "OCR_END",
     "OCR_START",
     "OCR_TOKEN",

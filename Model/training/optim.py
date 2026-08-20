@@ -110,6 +110,210 @@ def build_optimizer(
     raise ValueError(f"unsupported optimizer: {cfg.optimizer}")
 
 
+def build_ocr_joint_adamw(
+    model: nn.Module,
+    cfg: TrainingConfig,
+    lm_lr: float,
+    tower_lr: float,
+    projector_lr: float,
+    bridge_lr: float,
+) -> torch.optim.AdamW:
+    """Build fail-closed AdamW groups for joint OCR/text optimization.
+
+    The v1 OMVT tower, visual projectors, native detail tower, and ragged
+    bridge retain distinct base learning rates. Every group is then split by
+    the repository's existing decay policy. The legacy MLP vision encoder is
+    always frozen before coverage is checked.
+    """
+
+    if cfg.optimizer.lower() != "adamw" or cfg.adam_use_atan2:
+        raise ValueError(
+            "build_ocr_joint_adamw requires optimizer='adamw' and "
+            "adam_use_atan2=False"
+        )
+
+    role_lrs = {
+        "lm": _validate_joint_lr("lm_lr", lm_lr),
+        "tower": _validate_joint_lr("tower_lr", tower_lr),
+        "projector": _validate_joint_lr("projector_lr", projector_lr),
+        "bridge": _validate_joint_lr("bridge_lr", bridge_lr),
+    }
+
+    legacy = _module_at_path(model, "vision.encoder")
+    legacy_ids: set[int] = set()
+    if legacy is not None:
+        legacy_ids = {id(param) for param in legacy.parameters()}
+        legacy.requires_grad_(False)
+
+    roles: dict[int, str] = {}
+
+    def claim(module: nn.Module | None, role: str, source: str) -> None:
+        if module is None:
+            return
+        for param in module.parameters():
+            param_id = id(param)
+            if param_id in legacy_ids:
+                raise ValueError(
+                    f"legacy vision parameter is shared with {source}; refusing "
+                    "to unfreeze the legacy encoder"
+                )
+            if not param.requires_grad:
+                continue
+            previous = roles.get(param_id)
+            if previous is not None and previous != role:
+                raise ValueError(
+                    f"parameter is shared across OCR joint roles: "
+                    f"{previous!r} and {role!r} ({source})"
+                )
+            roles[param_id] = role
+
+    claim(_module_at_path(model, "vision.omvt.tower"), "tower", "vision.omvt.tower")
+    claim(
+        _module_at_path(model, "vision.omvt.projector"),
+        "projector",
+        "vision.omvt.projector",
+    )
+
+    tower_paths = (
+        "native_detail_tower",
+        "detail_tower",
+        "vision.native_detail_tower",
+        "vision.native_tower",
+    )
+    projector_paths = (
+        "native_projector",
+        "detail_projector",
+        "vision.native_projector",
+        "vision.detail_projector",
+        "vision.omvt_v2.projector",
+    )
+    bridge_paths = (
+        "vision_cross_attention",
+        "native_bridge",
+        "detail_bridge",
+        "vision.native_bridge",
+        "vision.detail_bridge",
+    )
+    for path in tower_paths:
+        claim(_module_at_path(model, path), "tower", path)
+    for path in projector_paths:
+        claim(_module_at_path(model, path), "projector", path)
+    for path in bridge_paths:
+        claim(_module_at_path(model, path), "bridge", path)
+
+    from Model.layers.vision_cross_attention import RaggedVisionCrossAttention
+    from Model.omvt.native_tower import NativeOMVTDetailTower
+
+    for module_name, module in model.named_modules():
+        if isinstance(module, NativeOMVTDetailTower):
+            claim(module, "tower", module_name or "<root native detail tower>")
+        elif isinstance(module, RaggedVisionCrossAttention):
+            claim(module, "bridge", module_name or "<root vision bridge>")
+
+    trainable = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    ]
+    if not trainable:
+        raise ValueError("model has no trainable parameters after freezing legacy vision")
+
+    for name, param in trainable:
+        param_id = id(param)
+        if param_id in roles:
+            continue
+        if _looks_visual_parameter(name):
+            raise ValueError(
+                f"unclassified trainable visual parameter {name!r}; add an "
+                "explicit joint-optimizer role instead of routing it to the LM"
+            )
+        roles[param_id] = "lm"
+
+    trainable_ids = {id(param) for _, param in trainable}
+    if set(roles) != trainable_ids:
+        missing = trainable_ids - set(roles)
+        extra = set(roles) - trainable_ids
+        raise RuntimeError(
+            "OCR joint parameter-role coverage failed: "
+            f"missing={len(missing)}, non_trainable_claims={len(extra)}"
+        )
+
+    decay, no_decay = _split_params_by_decay(model)
+    decay_ids = {id(param) for param in decay}
+    no_decay_ids = {id(param) for param in no_decay}
+    if decay_ids & no_decay_ids or (decay_ids | no_decay_ids) != trainable_ids:
+        raise RuntimeError("OCR joint decay policy does not cover trainable parameters")
+
+    ordered = [param for _, param in trainable]
+    groups: list[dict] = []
+    for role in ("lm", "tower", "projector", "bridge"):
+        for decay_name, eligible, weight_decay in (
+            ("decay", decay_ids, cfg.weight_decay),
+            ("no_decay", no_decay_ids, 0.0),
+        ):
+            params = [
+                param
+                for param in ordered
+                if roles[id(param)] == role and id(param) in eligible
+            ]
+            if params:
+                groups.append(
+                    {
+                        "params": params,
+                        "lr": role_lrs[role],
+                        "weight_decay": weight_decay,
+                        "ocr_joint_role": role,
+                        "ocr_joint_decay": decay_name,
+                        "ocr_joint_base_lr": role_lrs[role],
+                    }
+                )
+
+    grouped_ids = [id(param) for group in groups for param in group["params"]]
+    if len(grouped_ids) != len(set(grouped_ids)) or set(grouped_ids) != trainable_ids:
+        raise RuntimeError("OCR joint optimizer groups are not disjoint and complete")
+
+    return torch.optim.AdamW(
+        groups,
+        lr=role_lrs["lm"],
+        betas=(cfg.adam_beta1, cfg.adam_beta2),
+        eps=cfg.adam_eps,
+    )
+
+
+def _validate_joint_lr(name: str, value: float) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite positive number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite positive number") from exc
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return result
+
+
+def _module_at_path(model: nn.Module, path: str) -> nn.Module | None:
+    current: object = model
+    for component in path.split("."):
+        if not hasattr(current, component):
+            return None
+        current = getattr(current, component)
+        if current is None:
+            return None
+    if not isinstance(current, nn.Module):
+        raise TypeError(f"{path} must be an nn.Module when present")
+    return current
+
+
+def _looks_visual_parameter(name: str) -> bool:
+    root = name.split(".", 1)[0]
+    return root.startswith("vision") or root.startswith("native") or root in {
+        "detail_tower",
+        "detail_projector",
+        "detail_bridge",
+    }
+
+
 def _build_adamw(groups: list[dict], cfg: TrainingConfig) -> torch.optim.Optimizer:
     if cfg.adam_use_atan2:
         return AdamAtan2(
@@ -511,6 +715,7 @@ __all__ = [
     "AdamAtan2",
     "CombinedOptimizer",
     "Muon",
+    "build_ocr_joint_adamw",
     "build_optimizer",
     "build_scheduler",
     "param_groups_with_no_decay",

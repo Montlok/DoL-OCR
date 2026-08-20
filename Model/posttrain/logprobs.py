@@ -52,6 +52,13 @@ def sequence_logprobs(
     attention_mask: torch.Tensor | None = None,
     recurrent_steps: int | None = None,
     pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+    morphology_track_table: torch.Tensor | None = None,
+    completion_start: int | None = None,
+    pixel_repeats: int = 1,
+    position_contract: str | None = None,
+    visual_features: torch.Tensor | None = None,
+    detail_memory: torch.Tensor | None = None,
+    detail_cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-token log-probs of the realized next token.
 
@@ -59,15 +66,39 @@ def sequence_logprobs(
     ``logp[:, t] = log p(input_ids[:, t+1] | input_ids[:, : t+1])``,
     computed from a single full forward in float32.
     """
+    if completion_start is not None:
+        if type(completion_start) is not int:
+            raise TypeError("completion_start must be an integer or None")
+        max_start = input_ids.shape[1] - 1
+        if completion_start < 0 or completion_start > max_start:
+            raise ValueError(
+                "completion_start must satisfy "
+                f"0 <= completion_start <= {max_start}"
+            )
+
     out = model(
         input_ids,
         attention_mask=attention_mask,
         steps=recurrent_steps,
         return_logits=True,
         pixel_values=pixel_values,
+        morphology_track_table=morphology_track_table,
+        pixel_repeats=pixel_repeats,
+        position_contract=position_contract,
+        visual_features=visual_features,
+        detail_memory=detail_memory,
+        detail_cu_seqlens=detail_cu_seqlens,
     )
     logits = out["logits"]
-    return logits_to_token_logprobs(logits[:, :-1, :], input_ids[:, 1:])
+    if completion_start is None:
+        return logits_to_token_logprobs(logits[:, :-1, :], input_ids[:, 1:])
+
+    scored = logits_to_token_logprobs(
+        logits[:, completion_start:-1, :],
+        input_ids[:, completion_start + 1 :],
+    )
+    prefix = scored.new_zeros((scored.shape[0], completion_start))
+    return torch.cat((prefix, scored), dim=1)
 
 
 def completion_logprobs(
@@ -77,6 +108,11 @@ def completion_logprobs(
     attention_mask: torch.Tensor | None = None,
     recurrent_steps: int | None = None,
     pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+    morphology_track_table: torch.Tensor | None = None,
+    position_contract: str | None = None,
+    visual_features: torch.Tensor | None = None,
+    detail_memory: torch.Tensor | None = None,
+    detail_cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Summed and per-token log-probs over completion (response) tokens only.
 
@@ -98,6 +134,11 @@ def completion_logprobs(
         attention_mask=attention_mask,
         recurrent_steps=recurrent_steps,
         pixel_values=pixel_values,
+        morphology_track_table=morphology_track_table,
+        position_contract=position_contract,
+        visual_features=visual_features,
+        detail_memory=detail_memory,
+        detail_cu_seqlens=detail_cu_seqlens,
     )
     # A token at position t+1 is predicted from position t, so the mask for the
     # predicted token lives at index t+1 -> drop the first column to align.
@@ -113,6 +154,13 @@ def token_logprobs_with_mask(
     attention_mask: torch.Tensor | None = None,
     recurrent_steps: int | None = None,
     pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+    morphology_track_table: torch.Tensor | None = None,
+    completion_start: int | None = None,
+    pixel_repeats: int = 1,
+    position_contract: str | None = None,
+    visual_features: torch.Tensor | None = None,
+    detail_memory: torch.Tensor | None = None,
+    detail_cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unmasked per-token log-probs plus the aligned completion mask.
 
@@ -129,6 +177,13 @@ def token_logprobs_with_mask(
         attention_mask=attention_mask,
         recurrent_steps=recurrent_steps,
         pixel_values=pixel_values,
+        morphology_track_table=morphology_track_table,
+        completion_start=completion_start,
+        pixel_repeats=pixel_repeats,
+        position_contract=position_contract,
+        visual_features=visual_features,
+        detail_memory=detail_memory,
+        detail_cu_seqlens=detail_cu_seqlens,
     )
     shifted_mask = completion_mask[:, 1:].to(token_logp.dtype)
     return token_logp, shifted_mask

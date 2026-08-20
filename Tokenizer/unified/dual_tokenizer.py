@@ -187,6 +187,7 @@ class DualTrackTokenizer:
             local_id: token for token, local_id in morphbpe.vocab.items()
         }
 
+        mn_lo, _mn_hi = SEGMENT["mongolian"]
         gen_lo, gen_hi = SEGMENT["general"]
         self.general_local_to_global: dict[int, int] = {}
         self.general_global_to_local: dict[int, int] = {}
@@ -202,9 +203,27 @@ class DualTrackTokenizer:
             # such piece — including the byte-level fallback atoms — into
             # <unk>, destroying ~27% of English and ~29% of code tokens.
             self.general_local_to_global[local_id] = global_id
-            if gen_lo <= global_id < gen_hi:
-                # The reverse map stays segment-scoped: out-of-segment ids
-                # decode through the unified id->token table instead.
+            if (
+                gen_lo <= global_id < gen_hi
+                or (
+                    global_id >= mn_lo
+                    and token not in SPECIAL_TOKENS
+                    and not is_byte_token(token)
+                )
+            ):
+                # Shared general pieces live in the MorphBPE id segment, but
+                # still carry ByteLevel semantics at decode time. ASCII
+                # surfaces happen to decode correctly as raw unified strings;
+                # non-ASCII byte atoms do not. For example U+FE31 ``︱`` ends
+                # in the ByteLevel atom ``±``. If that atom shares a MorphBPE
+                # id, flushing it as the literal U+00B1 corrupts the sequence
+                # to ``�±``. Inverting every non-special/non-byte fallback
+                # forward mapping keeps adjacent byte atoms in one general
+                # decoder buffer and exactly reconstructs the source UTF-8.
+                #
+                # Explicit ``<0xNN>`` ids remain on the byte-fallback path
+                # below; reserved ids (notably ▁/◈) retain their documented
+                # unified semantics.
                 self.general_global_to_local[global_id] = local_id
 
     @property
@@ -216,8 +235,54 @@ class DualTrackTokenizer:
     ) -> list[int]:
         return self.encode_with_spans(text, add_bos=add_bos, add_eos=add_eos).input_ids
 
+    def encode_plain_text(self, text: str) -> list[int]:
+        """Encode literal user/label text without interpreting control strings.
+
+        OCR transcriptions are plain text. A visible ``▁``/``◈`` glyph or a
+        literal substring such as ``<bos>`` must not become a structural model
+        token (which decode intentionally folds or drops). Special-looking
+        spans therefore use the same pretrained general ByteLevel track as
+        other non-Mongolian text. The method never adds BOS/EOS; callers add
+        structural tokens explicitly through their row format.
+        """
+
+        return self.encode_plain_text_with_spans(text).input_ids
+
+    def encode_plain_text_with_spans(self, text: str) -> DualTrackResult:
+        """Plain-text encoding with route metadata retained for auditing."""
+
+        return self.encode_with_spans(
+            text,
+            add_bos=False,
+            add_eos=False,
+            interpret_special_tokens=False,
+        )
+
+    @staticmethod
+    def _mark_mongolian_fallback(
+        tokens: list[EncodedToken],
+    ) -> list[EncodedToken]:
+        """Make a MorphBPE miss observable to strict downstream contracts."""
+
+        return [
+            EncodedToken(
+                token.id,
+                token.token,
+                "mn_general_fallback",
+                token.start,
+                token.end,
+                surface=token.surface,
+                metadata=token.metadata,
+            )
+            for token in tokens
+        ]
+
     def encode_with_spans(
-        self, text: str, add_bos: bool = False, add_eos: bool = False
+        self,
+        text: str,
+        add_bos: bool = False,
+        add_eos: bool = False,
+        interpret_special_tokens: bool = True,
     ) -> DualTrackResult:
         spans = segment_by_language(text)
         tokens: list[EncodedToken] = []
@@ -227,7 +292,14 @@ class DualTrackTokenizer:
 
         for span in spans:
             if span.lang == "special":
-                tokens.extend(self._encode_special(span))
+                if interpret_special_tokens:
+                    tokens.extend(self._encode_special(span))
+                else:
+                    tokens.extend(
+                        self._encode_general(
+                            Span("general", span.text, span.start, span.end)
+                        )
+                    )
             elif span.lang == "mn":
                 tokens.extend(self._encode_mongolian(span))
             elif span.lang == "space":
@@ -261,9 +333,38 @@ class DualTrackTokenizer:
                     text = item.token
                     start = item.start
                     end = item.end
+                global_id = self.mn_local_to_global.get(local_id, self.unk_id)
+                if global_id == self.unk_id:
+                    # MorphBPE is morphology-aware but its finite seed
+                    # alphabet does not necessarily contain every scalar in
+                    # the Mongolian and Mongolian Supplement blocks. Keeping
+                    # <unk> would make an OCR label unrecoverable. Fall back
+                    # only for the uncovered source slice while surrounding
+                    # covered morphemes retain their pretrained ids.
+                    raw_start = max(0, int(start))
+                    raw_end = min(len(span.text), int(end))
+                    raw = span.text[raw_start:raw_end]
+                    if not raw:
+                        raise ValueError(
+                            "MorphBPE produced <unk> without a recoverable "
+                            f"source span for {span.text!r}"
+                        )
+                    tokens.extend(
+                        self._mark_mongolian_fallback(
+                            self._encode_general(
+                                Span(
+                                    "general",
+                                    raw,
+                                    span.start + raw_start,
+                                    span.start + raw_end,
+                                )
+                            )
+                        )
+                    )
+                    continue
                 tokens.append(
                     EncodedToken(
-                        self.mn_local_to_global.get(local_id, self.unk_id),
+                        global_id,
                         text,
                         "mn",
                         span.start + start,
@@ -273,6 +374,23 @@ class DualTrackTokenizer:
             return tokens
 
         local_ids = self.morphbpe.encode(span.text)
+        if any(
+            self.mn_local_to_global.get(local_id, self.unk_id) == self.unk_id
+            for local_id in local_ids
+        ):
+            # Legacy MorphBPE fixtures do not expose offsets, so a precise
+            # slice fallback is impossible. Preserve the text for permissive
+            # callers, but mark the route so strict OCR contracts reject it.
+            return self._mark_mongolian_fallback(
+                self._encode_general(
+                    Span(
+                        "general",
+                        span.text,
+                        span.start,
+                        span.end,
+                    )
+                )
+            )
         # No per-token offsets available: recover each piece's surface from the
         # reverse vocab and walk a cursor through the span so offsets stay
         # monotonic and non-overlapping.

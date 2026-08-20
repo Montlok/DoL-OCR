@@ -10,6 +10,8 @@ from collections.abc import Callable
 import torch
 
 from Model.config import EOS_ID, PAD_ID, OMVTConfig
+from Model.ocr.alignment_contract import read_verified_image_bytes
+from Model.ocr.image_preprocess import letterbox_grayscale_to_square
 from Model.ocr.metrics import ocr_report
 from Model.omvt import collate_omvt_batch
 from Model.posttrain.grpo import generate_sequences
@@ -29,7 +31,20 @@ def build_ocr_pixel_batch(
     omvt_cfg: OMVTConfig,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    images = processor([row["image"] for row in rows])
+    image_bytes = [
+        read_verified_image_bytes(
+            row["image"],
+            row["sha256"],
+            context=f"OCR sample {row.get('id', '<unknown>')}",
+        )
+        for row in rows
+    ]
+    images = processor(
+        [
+            letterbox_grayscale_to_square(raw, omvt_cfg.image_size)
+            for raw in image_bytes
+        ]
+    )
     return {
         key: value.to(device, non_blocking=True)
         for key, value in dict(collate_omvt_batch(images, omvt_cfg)).items()
@@ -50,8 +65,10 @@ def evaluate_ocr_manifest(
     precision: str,
     device: torch.device,
     cer_backend: str,
+    morphology_track_table: torch.Tensor | None = None,
+    position_contract: str | None = None,
     blank_visual: bool = False,
-) -> dict[str, float]:
+) -> dict[str, float | str | None]:
     """Greedy, full-manifest evaluation with no prompt padding.
 
     Rows are grouped by prompt length before batching. ``blank_visual`` zeros
@@ -95,6 +112,8 @@ def evaluate_ocr_manifest(
                     pad_id=PAD_ID,
                     recurrent_steps=recurrent_steps,
                     pixel_values=pixels,
+                    morphology_track_table=morphology_track_table,
+                    position_contract=position_contract,
                 )
             tails = sequences[:, prompt_len:]
             for tail, row in zip(tails, rows):
@@ -112,12 +131,32 @@ def evaluate_ocr_manifest(
         "raw_cer": float(report.raw_cer),
         "wer": float(report.wer),
         "line_exact": float(report.line_exact),
+        "raw_line_exact": float(report.raw_line_exact),
+        "normalized_line_exact": float(report.normalized_line_exact),
+        "normalization_backend": report.backend,
         "eos_rate": eos_rows / denom,
         "invalid_output_rate": invalid_rows / denom,
         "samples": float(len(predictions)),
     }
     for bucket, values in (report.script_cer or {}).items():
         metrics[f"script_{bucket}_cer"] = float(values["cer"])
+        metrics[f"script_{bucket}_n_ref"] = float(values["n_ref"])
+    for symbol, values in (report.symbol_metrics or {}).items():
+        for name, value in values.items():
+            if name == "variants":
+                for variant, variant_values in dict(value).items():
+                    for field, field_value in dict(variant_values).items():
+                        metrics[
+                            f"symbol_{variant}_{field}"
+                        ] = (
+                            None
+                            if field_value is None
+                            else float(field_value)
+                        )
+                continue
+            metrics[f"symbol_{symbol}_{name}"] = (
+                None if value is None else float(value)
+            )
     return metrics
 
 

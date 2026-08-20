@@ -12,6 +12,7 @@ from Model.ocr.metrics import (
     ocr_report,
     script_bucket_cer,
     script_of,
+    symbol_metrics,
     wer,
 )
 
@@ -43,13 +44,20 @@ class TestEditDistance(unittest.TestCase):
 
 
 class TestNominalNormalize(unittest.TestCase):
-    def test_python_fallback_strips_fvs_mvs(self):
+    def test_python_fallback_strips_fvs_but_preserves_mvs(self):
         folded = nominal_normalize([MONG + FVS1 + MONG + MVS], backend="python")
-        self.assertEqual(folded, [MONG + MONG])
+        self.assertEqual(folded, [MONG + MONG + MVS])
 
-    def test_python_fallback_maps_nnbsp_to_space(self):
+    def test_python_fallback_maps_nnbsp_to_mvs_like_rust(self):
         folded = nominal_normalize([MONG + NNBSP + MONG], backend="python")
-        self.assertEqual(folded, [MONG + " " + MONG])
+        self.assertEqual(folded, [MONG + MVS + MONG])
+
+    def test_python_fallback_removes_same_zero_width_noise_as_rust(self):
+        noise = "\u200b\u200c\u200d\u2060\ufeff"
+        self.assertEqual(
+            nominal_normalize(["a" + noise + "b"], backend="python"),
+            ["ab"],
+        )
 
     def test_auto_backend_returns_same_length(self):
         # auto must never change the number of items, regardless of backend.
@@ -190,6 +198,28 @@ class TestOCRReport(unittest.TestCase):
             cer(preds, refs, normalize=False, unit="grapheme"),
         )
 
+    def test_raw_and_normalized_line_exact_are_reported_separately(self):
+        pred = [MONG]
+        ref = [MONG + FVS1]
+        rep = ocr_report(pred, ref, backend="python")
+        self.assertEqual(rep.raw_line_exact, 0.0)
+        self.assertEqual(rep.normalized_line_exact, 1.0)
+        # Backward compatibility: line_exact remains the normalized rate.
+        self.assertEqual(rep.line_exact, rep.normalized_line_exact)
+
+    def test_rejected_rows_are_excluded_from_symbol_metrics(self):
+        rep = ocr_report(
+            ["7", "9"],
+            ["7", "8"],
+            backend="python",
+            rejected=[False, True],
+        )
+        digits = rep.symbol_metrics["digit"]
+        self.assertEqual(digits["n_ref"], 1)
+        self.assertEqual(digits["n_pred"], 1)
+        self.assertEqual(digits["correct"], 1)
+        self.assertEqual(digits["line_support"], 1)
+
 
 class TestScriptOf(unittest.TestCase):
     def test_mongolian_letter_is_mn(self):
@@ -275,6 +305,102 @@ class TestOCRReportScriptCER(unittest.TestCase):
         rep = ocr_report([MONG], [MONG], backend="python")
         self.assertIsNotNone(rep.script_cer)
         self.assertEqual(set(rep.script_cer), {"mn"})
+
+
+class TestSymbolMetrics(unittest.TestCase):
+    def test_full_alignment_attributes_all_required_symbol_classes(self):
+        preds = [
+            "2",  # in-class digit substitution
+            "",  # digit deletion
+            "9",  # prediction-only digit insertion
+            ",",  # punctuation match
+            ".",  # punctuation substitution
+            FVS4,  # FVS1 -> FVS4 substitution
+            "",  # MVS deletion
+            "",  # NNBSP deletion
+        ]
+        refs = [
+            "1",
+            "7",
+            "",
+            ",",
+            "!",
+            FVS1,
+            MVS,
+            NNBSP,
+        ]
+        metrics = symbol_metrics(preds, refs)
+
+        self.assertEqual(
+            metrics["digit"],
+            {
+                "n_ref": 2,
+                "n_pred": 2,
+                "correct": 0,
+                "substitutions": 1,
+                "deletions": 1,
+                "insertions": 1,
+                "line_support": 2,
+                "error_rate": 1.5,
+            },
+        )
+        self.assertEqual(
+            metrics["punctuation"],
+            {
+                "n_ref": 2,
+                "n_pred": 2,
+                "correct": 1,
+                "substitutions": 1,
+                "deletions": 0,
+                "insertions": 0,
+                "line_support": 2,
+                "error_rate": 0.5,
+            },
+        )
+        self.assertEqual(metrics["fvs"]["n_ref"], 1)
+        self.assertEqual(metrics["fvs"]["n_pred"], 1)
+        self.assertEqual(metrics["fvs"]["substitutions"], 1)
+        self.assertEqual(metrics["fvs"]["insertions"], 0)
+        self.assertEqual(metrics["fvs"]["error_rate"], 1.0)
+        self.assertEqual(metrics["mvs"]["deletions"], 1)
+        self.assertEqual(metrics["mvs"]["error_rate"], 1.0)
+        self.assertEqual(metrics["nnbsp"]["deletions"], 1)
+        self.assertEqual(metrics["nnbsp"]["error_rate"], 1.0)
+
+    def test_fvs_variants_have_independent_support_and_errors(self):
+        variants = symbol_metrics([FVS4], [FVS1])["fvs"]["variants"]
+        self.assertEqual(variants["fvs1"]["n_ref"], 1)
+        self.assertEqual(variants["fvs1"]["substitutions"], 1)
+        self.assertEqual(variants["fvs1"]["error_rate"], 1.0)
+        self.assertEqual(variants["fvs4"]["n_ref"], 0)
+        self.assertEqual(variants["fvs4"]["n_pred"], 1)
+        self.assertEqual(variants["fvs4"]["insertions"], 1)
+        self.assertIsNone(variants["fvs4"]["error_rate"])
+        self.assertEqual(variants["fvs2"]["n_ref"], 0)
+        self.assertIsNone(variants["fvs2"]["error_rate"])
+
+    def test_zero_reference_support_is_explicitly_unsupported(self):
+        metrics = symbol_metrics(["!"], [""])
+        self.assertEqual(metrics["punctuation"]["n_ref"], 0)
+        self.assertEqual(metrics["punctuation"]["n_pred"], 1)
+        self.assertEqual(metrics["punctuation"]["insertions"], 1)
+        self.assertEqual(metrics["punctuation"]["line_support"], 0)
+        self.assertIsNone(metrics["punctuation"]["error_rate"])
+        self.assertIsNone(metrics["digit"]["error_rate"])
+
+    def test_mongolian_and_ascii_decimal_digits_share_digit_class(self):
+        mongolian_digit_one = "\u1811"
+        metrics = symbol_metrics(
+            ["7" + mongolian_digit_one],
+            ["7" + mongolian_digit_one],
+        )
+        self.assertEqual(metrics["digit"]["n_ref"], 2)
+        self.assertEqual(metrics["digit"]["correct"], 2)
+        self.assertEqual(metrics["digit"]["error_rate"], 0.0)
+
+    def test_length_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "length mismatch"):
+            symbol_metrics(["1"], ["1", "2"])
 
 
 if __name__ == "__main__":

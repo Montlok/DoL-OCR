@@ -24,6 +24,7 @@ import argparse
 import os
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -49,6 +50,11 @@ from Model.config import (  # noqa: E402
     two_stage_tiny_config,
 )
 from Model.model import RDTForCausalLM  # noqa: E402
+from Model.ocr.position_contract import (  # noqa: E402
+    BOUNDARY_V1,
+    OCR_POSITION_CONTRACT_METADATA_VERSION,
+    resolve_checkpoint_ocr_position_contract,
+)
 from Model.posttrain.sft_data import SFTChatDataset, build_sft_example  # noqa: E402
 from Model.training import (  # noqa: E402
     PretrainingCollator,
@@ -60,6 +66,7 @@ from Model.training import (  # noqa: E402
     destroy_distributed,
     init_distributed,
     is_main_process,
+    load_checkpoint_metadata,
     resume_state,
     save_checkpoint,
     throughput_str,
@@ -146,6 +153,15 @@ def _smoke_encode(text: str) -> list[int]:
     return [(ord(c) % (RDTConfig().vocab_size - 1000)) + 1000 for c in text]
 
 
+def _sft_collator(train_cfg: TrainingConfig) -> PretrainingCollator:
+    """Use the same boundary-derived positions in SFT and generation."""
+
+    return PretrainingCollator(
+        max_seq_len=train_cfg.seq_len,
+        position_contract=BOUNDARY_V1,
+    )
+
+
 def _smoke_loader(train_cfg: TrainingConfig) -> DataLoader:
     chats = [
         [
@@ -166,7 +182,7 @@ def _smoke_loader(train_cfg: TrainingConfig) -> DataLoader:
         )
         for c in chats
     ]
-    collator = PretrainingCollator(max_seq_len=train_cfg.seq_len)
+    collator = _sft_collator(train_cfg)
     return DataLoader(rows, batch_size=train_cfg.micro_batch_size, collate_fn=collator)
 
 
@@ -199,7 +215,7 @@ def _real_loader(
         if world_size > 1
         else None
     )
-    collator = PretrainingCollator(max_seq_len=train_cfg.seq_len)
+    collator = _sft_collator(train_cfg)
     return DataLoader(
         dataset,
         batch_size=train_cfg.micro_batch_size,
@@ -232,6 +248,51 @@ def _validate_args(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sft_checkpoint_metadata(
+    args: argparse.Namespace,
+    model_cfg: RDTConfig,
+    *,
+    final: bool = False,
+) -> dict[str, object]:
+    """Return the model/position semantics needed for an exact SFT resume."""
+
+    metadata: dict[str, object] = {
+        "config": args.config,
+        "phase": "sft",
+        "rdt_config": asdict(model_cfg),
+        "ocr_position_contract": BOUNDARY_V1,
+        "ocr_position_contract_version": (
+            OCR_POSITION_CONTRACT_METADATA_VERSION
+        ),
+    }
+    if final:
+        metadata["final"] = True
+    return metadata
+
+
+def _validate_sft_resume_metadata(
+    resume_path: str,
+    model_cfg: RDTConfig,
+) -> dict[str, object]:
+    """Reject legacy or semantically different SFT checkpoints."""
+
+    metadata = load_checkpoint_metadata(resume_path)
+    resolve_checkpoint_ocr_position_contract(metadata, BOUNDARY_V1)
+
+    expected_rdt = asdict(model_cfg)
+    saved_rdt = metadata.get("rdt_config")
+    if not isinstance(saved_rdt, dict):
+        raise ValueError(
+            "checkpoint has no rdt_config metadata; it cannot be resumed as "
+            "a boundary_v1 SFT run"
+        )
+    if saved_rdt != expected_rdt:
+        raise ValueError(
+            "checkpoint rdt_config differs from the requested SFT model"
+        )
+    return metadata
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     rc = _validate_args(args)
@@ -240,6 +301,13 @@ def main(argv: list[str] | None = None) -> int:
 
     model_cfg = _build_model_cfg(args)
     train_cfg = _build_train_cfg(args)
+    if train_cfg.resume:
+        try:
+            _validate_sft_resume_metadata(train_cfg.resume, model_cfg)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            print(f"[error] unsafe SFT resume: {exc}", file=sys.stderr)
+            return 2
+
     rank, world_size, local_rank = init_distributed(backend=train_cfg.dist_backend)
     torch.manual_seed(args.seed + rank)
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
@@ -304,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
                     model,
                     optimizer,
                     scheduler,
-                    metadata={"config": args.config, "phase": "sft"},
+                    metadata=_sft_checkpoint_metadata(args, model_cfg),
                     keep_last_n=train_cfg.keep_last_n,
                     scaler=state.extra.get("grad_scaler"),
                 )
@@ -321,7 +389,11 @@ def main(argv: list[str] | None = None) -> int:
                     model,
                     optimizer,
                     scheduler,
-                    metadata={"config": args.config, "phase": "sft", "final": True},
+                    metadata=_sft_checkpoint_metadata(
+                        args,
+                        model_cfg,
+                        final=True,
+                    ),
                     keep_last_n=train_cfg.keep_last_n,
                     scaler=state.extra.get("grad_scaler"),
                 )

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
 import os
 import sys
@@ -58,19 +59,29 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from Model.config import EOS_ID, IMAGE_PATCH_ID  # noqa: E402
+from Model.ocr.alignment_contract import (  # noqa: E402
+    default_ocr_alignment_contract_path,
+    load_and_validate_ocr_alignment_data_contract,
+    read_verified_ocr_image_bytes,
+)
 from Model.ocr.data import split_ocr_row  # noqa: E402
 from Model.ocr.metrics import (  # noqa: E402
     edit_distance,
     grapheme_clusters,
     ocr_report,
 )
+from Model.ocr.position_contract import OCR_POSITION_CONTRACT_CHOICES  # noqa: E402
 from Model.ocr.segment import lines_from_column  # noqa: E402
+from Model.ocr.tokenization import (  # noqa: E402
+    native_tokenization_contract,
+)
 from Tokenizer.multimodal import PILImageProcessor  # noqa: E402
 from scripts.eval_vlm_ocr import (  # noqa: E402
     _decode_batches,
     _load_rows,
     _pixel_batch,
     _restore_omvt_geometry,
+    _validate_checkpoint_tokenizer,
     print_script_cer,
 )
 from scripts.ocr_infer import (  # noqa: E402
@@ -90,6 +101,11 @@ def parse_args(argv=None):
     )
     p.add_argument("--data", default="", help="val JSONL of build_ocr_row rows "
                    "with absolute image paths")
+    p.add_argument(
+        "--ocr-data-contract",
+        default="",
+        help="immutable OCR data receipt; defaults beside --data",
+    )
     p.add_argument("--tokenizer-bundle", default="",
                    help="unified tokenizer bundle dir (required: decodes the "
                    "ground truth from each row's target ids)")
@@ -118,6 +134,15 @@ def parse_args(argv=None):
         help="fixed decode depth; defaults to the checkpoint's trained depth",
     )
     p.add_argument("--repetition-penalty", type=float, default=1.0)
+    p.add_argument(
+        "--ocr-position-contract",
+        choices=OCR_POSITION_CONTRACT_CHOICES,
+        default=None,
+        help=(
+            "must match checkpoint metadata; historical checkpoints require "
+            "explicit legacy_sequential_v0"
+        ),
+    )
     # Column synthesis + segmentation.
     p.add_argument("--lines-per-column", type=int, default=3,
                    help="K consecutive val lines stacked per synthetic column")
@@ -212,6 +237,33 @@ def main(argv=None) -> int:
     from Tokenizer.unified.bundle import TokenizerBundle
 
     bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
+    issues = bundle.validate()
+    if issues:
+        raise ValueError(
+            "invalid tokenizer bundle:\n  - " + "\n  - ".join(issues)
+        )
+    if args.checkpoint:
+        token_contract = _validate_checkpoint_tokenizer(
+            args.checkpoint,
+            bundle,
+            args.tokenizer_bundle,
+            require_terminal=True,
+        )
+    else:
+        token_contract = native_tokenization_contract(
+            bundle.tokenizer,
+            args.tokenizer_bundle,
+        )
+    contract_path = (
+        Path(args.ocr_data_contract)
+        if args.ocr_data_contract
+        else default_ocr_alignment_contract_path(args.data)
+    )
+    load_and_validate_ocr_alignment_data_contract(
+        contract_path,
+        args.data,
+        token_contract,
+    )
     decode = bundle.tokenizer.decode
 
     rows = _load_rows(args.data, 0)
@@ -243,17 +295,21 @@ def main(argv=None) -> int:
     col_slices: list[tuple[int, int]] = []  # strip range per column
     n_lines_found: list[int] = []
     for group in groups:
-        targets, images = [], []
+        targets, image_rows = [], []
         for row in group:
             _, target, image_ref = split_ocr_row(row, eos_id=EOS_ID)
             if image_ref is None:
                 raise ValueError("val rows must carry an image reference")
             targets.append(target)
-            images.append(image_ref)
+            image_rows.append(row)
         refs.append(" ".join(decode(t) for t in targets))
         pils = []
-        for ref in images:
-            with Image.open(ref) as raw:
+        for row_index, image_row in enumerate(image_rows):
+            image_bytes = read_verified_ocr_image_bytes(
+                image_row,
+                context=f"{args.data}:group-image-{row_index + 1}",
+            )
+            with Image.open(io.BytesIO(image_bytes)) as raw:
                 raw.load()
                 pils.append(raw.convert("L"))
         column = stack_lines(pils, args.gap_px)

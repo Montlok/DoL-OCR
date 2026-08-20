@@ -3,7 +3,8 @@
 """Build a human-annotation package from a directory of scanned-book PDFs.
 
 The project needs hundreds-to-thousands of human-transcribed real lines for
-(a) a frozen L3 real-scan benchmark and (b) SFT domain adaptation. This tool
+(a) a frozen L3 real-scan benchmark and (b) leakage-controlled OCR
+reinforcement learning. This tool
 turns a directory of scanned-book PDFs into a ready-to-transcribe package: it
 samples pages, segments each into traditional-Mongolian text-line columns
 (:mod:`Model.ocr.segment`), samples lines, crops + letterboxes each one, and
@@ -44,6 +45,9 @@ Two input modes, mutually exclusive:
   manifest.
 - ``--image-dir``: a directory of pre-rendered page images, treated as if
   they were one document's already-rasterized pages (sorted by filename).
+  ``--capture-session`` is mandatory and assigns every crop in that directory
+  to one leakage-safe split group. Repeat both flags, in matching order, to
+  combine several genuinely independent capture sessions in one pack.
   This is both the escape hatch for a host with neither ``pdftoppm`` nor a
   real PDF corpus available, and the mode this module's own tests drive end
   to end.
@@ -85,7 +89,9 @@ Usage::
 
     # Smoke / no-PDF-access mode:
     python3 -m scripts.build_annotation_pack \\
-        --image-dir /tmp/rendered_pages --out /tmp/annopack_smoke --limit 20
+        --image-dir /tmp/rendered_pages --capture-session smoke-session \\
+        --image-dir /tmp/rendered_pages_2 --capture-session smoke-session-2 \\
+        --out /tmp/annopack_smoke --limit 20
 """
 
 from __future__ import annotations
@@ -480,6 +486,7 @@ def process_document(
     dpi: int,
     seed: int,
     limit_remaining: int | None,
+    group_id_override: str | None = None,
 ) -> DocResult:
     """Segment + sample lines from already-rendered, already-sampled pages.
 
@@ -627,6 +634,9 @@ def process_document(
                 {
                     "id": line_id,
                     "pdf": source_name,
+                    "group_id": (
+                        group_id_override or f"document:{source_name}"
+                    ),
                     "page": page_idx,
                     "col_box": list(col_box_orig),
                     "line_box": list(chunk_box),
@@ -651,9 +661,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--pdf-dir", default=None, help="directory of PDF files")
     ap.add_argument(
         "--image-dir",
+        action="append",
         default=None,
-        help="directory of pre-rendered page images, treated as one document's "
-        "pages (mutually exclusive with --pdf-dir)",
+        help="repeatable directory of pre-rendered page images; each occurrence "
+        "requires one matching --capture-session (mutually exclusive with "
+        "--pdf-dir)",
+    )
+    ap.add_argument(
+        "--capture-session",
+        action="append",
+        default=[],
+        help="repeatable stable camera/session provenance, paired by order with "
+        "--image-dir and used as one leakage-safe split group",
     )
     ap.add_argument("--out", required=True)
     ap.add_argument("--pages-per-doc", type=int, default=3)
@@ -668,6 +687,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if (args.pdf_dir is None) == (args.image_dir is None):
         ap.error("exactly one of --pdf-dir or --image-dir must be given")
+    if args.image_dir is not None and len(args.image_dir) != len(
+        args.capture_session
+    ):
+        ap.error(
+            "each --image-dir requires exactly one matching --capture-session"
+        )
+    if any(not value.strip() for value in args.capture_session):
+        ap.error("--capture-session must be non-empty")
+    if args.pdf_dir is not None and args.capture_session:
+        ap.error("--capture-session is only valid with --image-dir")
     if args.pages_per_doc < 1:
         ap.error("--pages-per-doc must be >= 1")
     if args.lines_per_page < 1:
@@ -696,33 +725,39 @@ def build_pack(args: argparse.Namespace) -> dict[str, Any]:
     results: list[DocResult] = []
 
     if args.image_dir is not None:
-        image_dir = Path(args.image_dir)
-        check_stem_collisions([image_dir])
-        doc_stem = sanitize_stem(image_dir.name)
-        pages = load_image_dir_pages(image_dir)
-        # n_pages_total for --image-dir mode IS the loaded-image count (there
-        # is no separate "true total" the way a PDF has a page count
-        # independent of what got rendered) -- sampled directly against it,
-        # exactly once, here.
-        n_pages_total = len(pages)
-        sampled_pages = sample_page_indices(
-            n_pages_total, args.pages_per_doc, seed=args.seed, doc_stem=doc_stem
-        )
-        result = process_document(
-            doc_stem,
-            image_dir.name,
-            n_pages_total,
-            sampled_pages,
-            pages,
-            out_dir=out_dir,
-            lines_per_page=args.lines_per_page,
-            dpi=args.dpi,
-            seed=args.seed,
-            limit_remaining=limit_remaining,
-        )
-        if limit_remaining is not None:
-            limit_remaining -= len(result.lines)
-        results.append(result)
+        image_dirs = [Path(value) for value in args.image_dir]
+        check_stem_collisions(image_dirs)
+        for image_dir, capture_session in zip(
+            image_dirs,
+            args.capture_session,
+        ):
+            doc_stem = sanitize_stem(image_dir.name)
+            pages = load_image_dir_pages(image_dir)
+            # n_pages_total for --image-dir mode IS the loaded-image count
+            # (unlike PDF mode, there is no independent true page count).
+            n_pages_total = len(pages)
+            sampled_pages = sample_page_indices(
+                n_pages_total,
+                args.pages_per_doc,
+                seed=args.seed,
+                doc_stem=doc_stem,
+            )
+            result = process_document(
+                doc_stem,
+                image_dir.name,
+                n_pages_total,
+                sampled_pages,
+                pages,
+                out_dir=out_dir,
+                lines_per_page=args.lines_per_page,
+                dpi=args.dpi,
+                seed=args.seed,
+                limit_remaining=limit_remaining,
+                group_id_override=f"capture:{capture_session.strip()}",
+            )
+            if limit_remaining is not None:
+                limit_remaining -= len(result.lines)
+            results.append(result)
     else:
         pdf_dir = Path(args.pdf_dir)
         pdf_paths = _iter_pdf_paths(pdf_dir)

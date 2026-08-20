@@ -91,6 +91,7 @@ python3 -m Tokenizer.tools.build_pretraining_data \
   --tokenizer-bundle artefacts/tokenizer_bundle \
   --input Tokenizer/data/sample_multimodal.jsonl \
   --output artefacts/pretrain.jsonl \
+  --receipt artefacts/pretrain.receipt.json \
   --max-length 2048 \
   --pack \
   --pad-to-max-length
@@ -100,12 +101,26 @@ python3 -m Tokenizer.evals.pretraining_gate \
   --input artefacts/pretrain.jsonl \
   --max-length 2048 \
   --json
+
+python3 -m scripts.train_rdt --config pretrain \
+  --tokenizer-bundle artefacts/tokenizer_bundle \
+  --data artefacts/pretrain.jsonl \
+  --data-receipt artefacts/pretrain.receipt.json \
+  --output runs/rdt
 ```
 
 The pretraining builder masks structural labels with `-100`, writes
 `word_pos` / `morph_depth` for the model's morphological RoPE, keeps
 image/video spans aligned, and can pack text-only rows while leaving
-multimodal rows standalone.
+multimodal rows standalone. It also writes a receipt binding the exact shard
+bytes to the tokenizer bundle, shared tokenizer algorithm, and the named row
+producer's current source fingerprint (by default `<output>.receipt.json`).
+Formal `train_rdt` runs fail closed for an unknown producer, producer drift, or
+a missing receipt; `--eval-data` likewise requires its own
+`--eval-data-receipt`.
+All production/non-smoke receipt-backed train, eval, and mix JSONL rows must
+persist `word_pos` and `morph_depth`; model-side fallback exists only for
+legacy/smoke inputs and must not be used in production.
 
 ## Evaluation
 

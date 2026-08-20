@@ -61,7 +61,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import io
 import json
 import os
 import shutil
@@ -86,15 +85,23 @@ from Model.config import (  # noqa: E402
     IMAGE_START_ID,
 )
 from Model.ocr.data import build_ocr_row, split_ocr_row  # noqa: E402
+from Model.ocr.image_preprocess import (  # noqa: E402
+    letterbox_grayscale_to_square,
+)
+from Model.ocr.position_contract import (  # noqa: E402
+    BOUNDARY_V1,
+    OCR_POSITION_CONTRACT_CHOICES,
+)
 from Model.ocr.segment import detect_columns, lines_from_column  # noqa: E402
 from Tokenizer.multimodal import PILImageProcessor  # noqa: E402
-from scripts.build_ocr_data_from_pairs import letterbox_to_square  # noqa: E402
 from scripts.eval_vlm_ocr import (  # noqa: E402
     _build_model,
     _decode_batches,
     _load_model_state,
     _pixel_batch,
+    _resolve_ocr_position_contract,
     _restore_omvt_geometry,
+    _validate_checkpoint_tokenizer,
 )
 from scripts.train_rdt import CONFIG_CHOICES  # noqa: E402
 
@@ -158,6 +165,15 @@ def parse_args(argv=None):
         help="fixed decode depth; defaults to the checkpoint's trained depth",
     )
     m.add_argument("--repetition-penalty", type=float, default=1.0)
+    m.add_argument(
+        "--ocr-position-contract",
+        choices=OCR_POSITION_CONTRACT_CHOICES,
+        default=None,
+        help=(
+            "must match checkpoint metadata; historical checkpoints require "
+            "explicit legacy_sequential_v0"
+        ),
+    )
     m.add_argument("--allow-random-init", action="store_true",
                    help="run WITHOUT loading a checkpoint (random weights); "
                    "pipeline smoke only, prints a loud warning")
@@ -248,15 +264,10 @@ def order_columns(boxes, column_order: str):
 
 
 def strip_to_letterboxed(strip: np.ndarray, image_size: int) -> Image.Image:
-    """numpy strip -> in-memory PNG bytes -> ``letterbox_to_square`` (REUSED).
+    """Convert one numpy strip with the shared legacy OCR letterbox."""
 
-    ``letterbox_to_square``'s public contract is bytes-in (fixed by the data
-    builder); PNG is lossless, so this shim costs one encode, not fidelity,
-    and the shared function stays untouched.
-    """
-    buf = io.BytesIO()
-    Image.fromarray(np.ascontiguousarray(strip)).save(buf, format="PNG")
-    return letterbox_to_square(buf.getvalue(), image_size)
+    image = Image.fromarray(np.ascontiguousarray(strip))
+    return letterbox_grayscale_to_square(image, image_size)
 
 
 def segment_page(
@@ -342,6 +353,10 @@ def load_deploy_model(args, device: torch.device):
     prints the loud random-weights banner to stderr (pipeline smoke only).
     Returns ``(model, omvt_cfg)``.
     """
+    if args.checkpoint:
+        _resolve_ocr_position_contract(args)
+    elif getattr(args, "ocr_position_contract", None) is None:
+        args.ocr_position_contract = BOUNDARY_V1
     model = _build_model(args, device)
     omvt_cfg = model.vision._omvt_cfg
     if args.checkpoint:
@@ -365,18 +380,35 @@ def autocast_ctx_for(device: torch.device, precision: str):
     return torch.no_grad
 
 
-def make_decode_fn(tokenizer_bundle: str):
-    """Bundle decode when available; ids-as-text fallback for bundle-less smoke."""
+def make_decode_runtime(
+    tokenizer_bundle: str,
+    device: torch.device,
+    *,
+    checkpoint: str = "",
+):
+    """Return decode while validating the checkpoint tokenizer identity."""
     if tokenizer_bundle:
         from Tokenizer.unified.bundle import TokenizerBundle
 
         bundle = TokenizerBundle.from_dir(tokenizer_bundle)
-        return bundle.tokenizer.decode
+        issues = bundle.validate()
+        if issues:
+            raise ValueError(
+                "invalid tokenizer bundle:\n  - " + "\n  - ".join(issues)
+            )
+        if checkpoint:
+            _validate_checkpoint_tokenizer(
+                checkpoint,
+                bundle,
+                tokenizer_bundle,
+                require_terminal=True,
+            )
+        return bundle.tokenizer.decode, None
     print(
         "[infer] no --tokenizer-bundle: printing raw token ids (smoke only)",
         file=sys.stderr,
     )
-    return lambda ids: " ".join(map(str, ids))
+    return (lambda ids: " ".join(map(str, ids))), None
 
 
 def resolve_device(spec: str) -> torch.device:
@@ -455,6 +487,11 @@ def main(argv=None) -> int:
     prompts = [prompt] * len(records)
     args.seq_len = len(prompt) + args.max_new_tokens + 1
 
+    decode, _morphology_track_table = make_decode_runtime(
+        args.tokenizer_bundle,
+        device,
+        checkpoint=args.checkpoint,
+    )
     model, omvt_cfg = load_deploy_model(args, device)
     if omvt_cfg.compress_to != args.n_image_tokens:
         raise ValueError(
@@ -471,10 +508,15 @@ def main(argv=None) -> int:
     # _decode_batches logs progress to stdout; stdout here is reserved for
     # the transcription itself, so route the progress lines to stderr.
     with contextlib.redirect_stdout(sys.stderr):
-        preds_ids = _decode_batches(model, prompts, pixels, args, device,
-                                    autocast_ctx)
+        preds_ids = _decode_batches(
+            model,
+            prompts,
+            pixels,
+            args,
+            device,
+            autocast_ctx,
+        )
 
-    decode = make_decode_fn(args.tokenizer_bundle)
     texts = [decode(ids) for ids in preds_ids]
     for text in texts:
         print(text)

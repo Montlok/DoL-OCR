@@ -25,7 +25,14 @@ Model/
     compressor.py      # PerceiverCompressor → fixed-N visual tokens
     tower.py           # OMVTVisionTower (full pipeline)
     injector.py        # OMVTInjector: tower + projector + <image_patch> replacement
+    native_patcher.py  # packed per-sample arbitrary-resolution patch geometry
+    native_planner.py  # budgeted overlap windows + exact ownership proof
+    native_tower.py    # ragged native-detail tower (v1 path remains unchanged)
     heads.py / losses.py  # OCR / masked-patch / orientation / layout-order SSL
+  posttrain/
+    ocr_anyres_builder.py # review-pack and immutable READY dataset producer
+    ocr_joint_trainer.py  # visual/joint SFT optimizer cycles
+    ocr_anyres_grpo.py    # admitted cache-free anyres GRPO objective
   training/
     data.py            # JSONL + StreamingJsonlDataset + pixel-aware collator + dataloader
     optim.py           # AdamW / Adam-atan2 / Muon (+CombinedOptimizer) + warmup/cosine/WSD
@@ -148,16 +155,31 @@ fp tolerance; it requires the NaiveSSM backend (`--mamba=naive`). Tests:
 ## 3. Training entry points
 
 All three scripts are CLI-driven and accept `--smoke` for a synthetic
-in-memory smoke run.
+in-memory smoke run. Every non-smoke `train_rdt` run must identify both the
+tokenizer bundle and the immutable producer receipt for the exact JSONL shards.
+That receipt also names one registered row producer and fingerprints its
+current source; unknown or drifted producers are rejected before model
+allocation.
+If `--eval-data` is set, its separately built `--eval-data-receipt` is required
+as well.
+Every production/non-smoke receipt-backed train, eval, or mix JSONL row must
+persist both `word_pos` and `morph_depth`; model-side reconstruction/fallback is
+legacy/smoke-only and is not a production data path.
 
 ```bash
 # Text RDT pretraining (single process)
 python -m scripts.train_rdt --config pretrain \
-    --data path/to/shards/*.jsonl --output runs/rdt
+    --tokenizer-bundle path/to/tokenizer/bundle \
+    --data "path/to/shards/*.jsonl" \
+    --data-receipt path/to/train.receipt.json \
+    --output runs/rdt
 
 # DDP / FSDP
 torchrun --nproc_per_node=8 scripts/train_rdt.py --config pretrain \
-    --dist fsdp --precision bf16 --data path/to/shards/*.jsonl \
+    --dist fsdp --precision bf16 \
+    --tokenizer-bundle path/to/tokenizer/bundle \
+    --data "path/to/shards/*.jsonl" \
+    --data-receipt path/to/train.receipt.json \
     --output runs/rdt
 
 # OMVT vision-tower SSL (Phase 1 — OCR / masked-patch / orientation / layout-order)
@@ -171,7 +193,10 @@ python -m scripts.train_vlm_align --output runs/vlm_align [--freeze-rdt]
 # Joint multimodal RDT pretraining
 python -m scripts.train_rdt --config pretrain --multimodal \
     --image-size 64 --n-image-tokens 9 \
-    --data path/to/mm_shards/*.jsonl --output runs/rdt_mm
+    --tokenizer-bundle path/to/tokenizer/bundle \
+    --data "path/to/mm_shards/*.jsonl" \
+    --data-receipt path/to/mm_train.receipt.json \
+    --output runs/rdt_mm
 ```
 
 Resume: `--resume runs/rdt/latest` (auto-detects FSDP / DDP / single).
@@ -251,7 +276,8 @@ python -m Tokenizer.tools.build_ocr_data \
 python -m Tokenizer.tools.build_pretraining_data \
     --tokenizer-bundle artifacts/bundle/ \
     --input  data/raw_mm.jsonl \
-    --output data/mm_shards/shard_00.jsonl
+    --output data/mm_shards/shard_00.jsonl \
+    --receipt data/mm_shards/train.receipt.json
 ```
 
 Row schema is documented in
@@ -261,14 +287,16 @@ Row schema is documented in
 `scripts/build_ocr_data.py` renders synthetic transcription lines to images
 *and* tokenizes them in one step (`Tokenizer.tools.build_ocr_data` above only
 pairs pre-existing `{image, label}` files, it does not render or tokenize).
-Its OCR target is encoded through a lossless byte-fallback path — never the
-lossy MorphBPE track — so the label round-trips the rendered text exactly,
-byte-for-byte, including FVS/MVS/NNBSP; see the module docstring for the
-contract. `--max-seq-len` skips rows whose tokenized length would exceed the
-budget before the (expensive) render step, since byte-fallback can inflate a
-target to ~3x its MorphBPE-routed length. Evaluation (`scripts/eval_ocr.py`,
-`scripts/eval_vlm_ocr.py`) reports grapheme CER as the headline metric
-alongside normalized/raw CER (see `Model/ocr/metrics.py`).
+For a frozen language model its production target uses the exact native
+pretraining route and persists the same `word_pos` / `morph_depth` features.
+Every admitted label must be `<unk>`-free and round-trip exactly, including
+FVS/MVS/contextual-NNBSP, digits, and punctuation; Mongolian text that would
+silently fall back to the general track is rejected. Byte fallback remains an
+explicit conversion-only mode for experiments that also retrain the language
+side. `--max-seq-len` rejects oversized rows before the expensive render step.
+Evaluation (`scripts/eval_ocr.py`, `scripts/eval_vlm_ocr.py`) reports grapheme
+CER as the headline metric alongside normalized/raw CER (see
+`Model/ocr/metrics.py`).
 
 ### 4.4 Pick `--n-image-tokens` carefully (multimodal only)
 
@@ -299,7 +327,9 @@ CLI: set `--image-size <S>` and `--n-image-tokens <count>` so that
 torchrun --nproc_per_node=8 scripts/train_rdt.py \
     --config pretrain --dist fsdp --precision bf16 \
     --grad-ckpt-recurrent on --bptt-window 4 \
+    --tokenizer-bundle artifacts/bundle/ \
     --data "data/text_shards/*.jsonl" \
+    --data-receipt data/text_shards/train.receipt.json \
     --output runs/rdt_pretrain
 
 # Multimodal formal run (pre-aligned OMVT injector + pixel collator)
@@ -307,7 +337,9 @@ torchrun --nproc_per_node=8 scripts/train_rdt.py \
     --config pretrain --dist fsdp --precision bf16 \
     --multimodal --image-size 224 --n-image-tokens 64 \
     --grad-ckpt-recurrent on --bptt-window 4 \
+    --tokenizer-bundle artifacts/bundle/ \
     --data "data/mm_shards/*.jsonl" \
+    --data-receipt data/mm_shards/train.receipt.json \
     --output runs/rdt_pretrain_mm
 ```
 
@@ -395,8 +427,11 @@ configs and tests use the `NaiveSSM` fallback explicitly.
 These checks must run on the CUDA cluster before the ~1.1B `pretrain_config`
 run; a macOS/CPU development host cannot validate them.
 
-Set `DATA_GLOB` to the real pretraining shard glob before running the commands
-below, e.g. `export DATA_GLOB="data/pretrain/*.jsonl"`.
+Set `DATA_GLOB`, `TOKENIZER_BUNDLE`, and `DATA_RECEIPT` to the real shard glob,
+the producing tokenizer bundle, and the builder-emitted receipt before running
+the commands below, e.g. `export DATA_GLOB="data/pretrain/*.jsonl"`,
+`export TOKENIZER_BUNDLE="artifacts/bundle"`, and
+`export DATA_RECEIPT="data/pretrain/train.receipt.json"`.
 
 - [ ] **官方 Mamba** — install CUDA Mamba and prove production configs build
   the upstream backend, not `NaiveSSM`:
@@ -487,7 +522,9 @@ below, e.g. `export DATA_GLOB="data/pretrain/*.jsonl"`.
         --config pretrain --dist fsdp --precision bf16 --dist-backend nccl \
         --grad-ckpt-recurrent $rec --grad-ckpt-prelude-coda $pc \
         --bptt-window $bptt --max-steps 20 --save-every 0 \
-        --data "$DATA_GLOB" --output "runs/bench_${tier}_${bptt}"
+        --tokenizer-bundle "$TOKENIZER_BUNDLE" \
+        --data "$DATA_GLOB" --data-receipt "$DATA_RECEIPT" \
+        --output "runs/bench_${tier}_${bptt}"
     done
   done
   ```
@@ -500,13 +537,20 @@ below, e.g. `export DATA_GLOB="data/pretrain/*.jsonl"`.
   after the M1 RNG fix (`rng.pt` saves Python, NumPy, torch CPU, and CUDA RNG;
   shuffle seeding uses seed + rank + worker, not `os.getpid()`):
   ```bash
+  RDT_RESUME_ARGS=(
+      --config tiny --dist fsdp --precision bf16 --dist-backend nccl
+      --tokenizer-bundle "$TOKENIZER_BUNDLE"
+      --data "$DATA_GLOB" --data-receipt "$DATA_RECEIPT"
+      --max-steps 8 --save-every 3
+  )
   torchrun --standalone --nproc_per_node=2 scripts/train_rdt.py \
-      --config tiny --dist fsdp --precision bf16 --dist-backend nccl \
-      --data "$DATA_GLOB" --max-steps 6 --save-every 3 \
+      "${RDT_RESUME_ARGS[@]}" \
       --output runs/phase_f_resume
+  # From another terminal after step 3 is durable:
+  python -m scripts.rdt_monitor control stop --run runs/phase_f_resume
+  # After the first process exits, resume with the identical configuration:
   torchrun --standalone --nproc_per_node=2 scripts/train_rdt.py \
-      --config tiny --dist fsdp --precision bf16 --dist-backend nccl \
-      --data "$DATA_GLOB" --max-steps 8 --save-every 3 \
+      "${RDT_RESUME_ARGS[@]}" \
       --resume runs/phase_f_resume/latest --output runs/phase_f_resume
   python - <<'PY'
   import torch
@@ -515,5 +559,7 @@ below, e.g. `export DATA_GLOB="data/pretrain/*.jsonl"`.
   print(sorted(rng))
   PY
   ```
-  Be aware: `StreamingJsonlDataset` shard/file position is not checkpointed;
-  resume restores RNG state but restarts the streaming data iterator.
+  `StreamingJsonlDataset` does not serialize a file cursor. Resume verifies the
+  exact ordered shard-byte receipt, restores RNG, rebuilds the deterministic
+  iterator, and fast-forwards `step × grad_accum_steps` batches before the next
+  update. Never use `--no-resume-skip-data` for a production continuation.

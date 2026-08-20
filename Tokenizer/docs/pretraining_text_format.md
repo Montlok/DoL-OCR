@@ -11,7 +11,9 @@
   `Tokenizer/tools/build_pretraining_data.py`。
 - **阶段二（编码后分片）**：builder 产出的、`scripts/train_rdt.py --data`
   直接消费的行格式。**正式训练读取的是阶段二的分片**，阶段一的字段不会
-  直接进模型。
+  直接进模型。builder 同时生成不可变 receipt，将这些分片的字节绑定到
+  tokenizer bundle、共享 tokenizer 算法，以及明确命名的行生产器源码指纹；
+  正式训练只接受已注册且指纹完全一致的生产器，并必须一并传入 receipt。
 
 多模态字段的语义见
 [`multimodal_data_format.md`](./multimodal_data_format.md)；本文聚焦**各种文本格式**。
@@ -91,9 +93,9 @@
 | `input_ids` | `list[int]` | **必填** | token id 序列 |
 | `attention_mask` | `list[int]` | **必填** | 与 `input_ids` 等长，1=有效 0=padding |
 | `labels` | `list[int]` | **必填** | 与 `input_ids` 等长；`-100` 表示该位不计 loss |
-| `word_pos` | `list[int]` | 可选 | 词位置索引；缺失时由 `token_offsets` 推导，再缺失则 `range(n)` |
-| `morph_depth` | `list[int]` | 可选 | 形态深度；缺失时同上推导，再缺失则全 `0` |
-| `token_offsets` | `list[[start, end]]` | 可选 | 字符跨度；用于在缺 `word_pos/morph_depth` 时推导 |
+| `word_pos` | `list[int]` | **正式 receipt-backed 必填**；legacy/smoke 可选 | 词位置索引；legacy/smoke 缺失时可由 `token_offsets` 推导，再缺失则 `range(n)` |
+| `morph_depth` | `list[int]` | **正式 receipt-backed 必填**；legacy/smoke 可选 | 形态深度；legacy/smoke 缺失时同上推导，再缺失则全 `0` |
+| `token_offsets` | `list[[start, end]]` | 可选 | 字符跨度；仅供 legacy/smoke 在缺 `word_pos/morph_depth` 时推导 |
 | `modality_spans` | `dict` | 可选 | `{"image_token_spans": [...], "video_token_spans": [...]}` |
 | `metadata` | `dict` | 可选 | 透传元数据 |
 | `images` / `image_sizes` | `list` | 可选（多模态） | 原样透传给 collator |
@@ -103,8 +105,10 @@
 **`train_rdt` 侧的校验契约（`Model/training/data.py::_normalize_row`）：**
 
 - `input_ids` / `attention_mask` / `labels` **必须存在且三者等长**，否则报错。
-- `word_pos` / `morph_depth` 缺失：优先用 `token_offsets` 推导；仍缺失则填
-  `range(n)` 与全 `0`。
+- 所有 production/non-smoke receipt-backed `--data` / `--eval-data` /
+  `--mix-data` JSONL 必须持久化等长的 `word_pos` 与 `morph_depth`。
+- 仅 legacy/smoke 行允许缺失这两个字段：优先用 `token_offsets` 推导；仍
+  缺失则填 `range(n)` 与全 `0`。该 model-side fallback 不得用于正式训练。
 - 行长 > `--seq-len` 时：
   - 纯文本行 → 截断；
   - **多模态行（含 `images` 或 `videos`）→ 直接报错**（截断会让
@@ -132,12 +136,19 @@ PYTHONPATH=. python3 -m Tokenizer.tools.build_pretraining_data \
     --tokenizer-bundle artifacts/bundle/ \
     --input  data/corpus.jsonl \
     --output data/text_shards/shard_00.jsonl \
+    --receipt data/text_shards/train.receipt.json \
     --max-length 2048
 
 # 2) 直接用编码后分片开训
 PYTHONPATH=. python3 scripts/train_rdt.py --config small \
-    --data "data/text_shards/*.jsonl" --output runs/exp1
+    --tokenizer-bundle artifacts/bundle/ \
+    --data "data/text_shards/*.jsonl" \
+    --data-receipt data/text_shards/train.receipt.json \
+    --output runs/exp1
 ```
+
+若配置 `--eval-data`，必须用同一 builder 为验证分片单独生成 receipt，并
+同时传 `--eval-data-receipt`；不能复用训练 receipt。
 
 编码后分片单行（纯文本，已可直接喂给 `train_rdt`）：
 

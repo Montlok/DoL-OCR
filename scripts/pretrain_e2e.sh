@@ -28,7 +28,8 @@
 #   CONFIG          train_rdt config (default two_stage_pretrain)
 #   MAX_STEPS       training steps (default 100000)
 #   MAMBA           Mamba backend for train_rdt (default official; smoke naive)
-#   TRAIN_ARGS      extra args forwarded verbatim to scripts/train_rdt
+#   TRAIN_ARGS      extra args forwarded verbatim to scripts/train_rdt; an
+#                   added --eval-data must include its --eval-data-receipt
 #   MIX_MANIFEST    optional token-weighted mix manifest (JSON). When set, the
 #                   packed shards are built from a weighted mixture of the
 #                   sources it lists (hitting target language/domain token
@@ -86,6 +87,8 @@ ALL_JSONL="$CORPUS_DIR/all.jsonl"
 MORPHBPE_JSON="$TOK_DIR/morphbpe.json"
 GENERAL_JSON="$TOK_DIR/general.json"
 SHARD_JSONL="$DATA_DIR/shard-00.jsonl"
+SHARD_RECEIPT_JSON="$DATA_DIR/shard-00.receipt.json"
+SHARD_BUILD_SUMMARY="$DATA_DIR/shard-00.build-summary.json"
 MIX_REPORT="$DATA_DIR/mix-report.json"
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -222,7 +225,7 @@ if [ -n "$MIX_MANIFEST" ]; then
     # drop the shard to force Stage 3 to repack from the new mixture. When the
     # mix was fresh (untouched), the shard stays newer and is preserved.
     if [ -f "$ALL_JSONL" ] && [ "$ALL_JSONL" -nt "$SHARD_JSONL" ]; then
-        rm -f "$SHARD_JSONL"
+        rm -f "$SHARD_JSONL" "$SHARD_RECEIPT_JSON" "$SHARD_BUILD_SUMMARY"
     fi
 fi
 
@@ -230,14 +233,45 @@ fi
 # Stage 3: build packed pretraining shards
 # ---------------------------------------------------------------------------
 log "[3/5] building packed shards"
-if [ -s "$SHARD_JSONL" ]; then
+if [ -s "$SHARD_JSONL" ] \
+    && [ -s "$SHARD_RECEIPT_JSON" ] \
+    && [ -s "$SHARD_BUILD_SUMMARY" ]; then
     echo "shards already built, skipping"
 else
-    python3 -m Tokenizer.tools.build_pretraining_data \
-        --tokenizer-bundle "$BUNDLE_DIR" \
-        --input "$ALL_JSONL" --output "$SHARD_JSONL" \
-        --max-length "$MAX_LENGTH" --pack
+    BUILD_SUMMARY="$(
+        python3 -m Tokenizer.tools.build_pretraining_data \
+            --tokenizer-bundle "$BUNDLE_DIR" \
+            --input "$ALL_JSONL" --output "$SHARD_JSONL" \
+            --receipt "$SHARD_RECEIPT_JSON" \
+            --max-length "$MAX_LENGTH" --pack
+    )"
+    printf '%s\n' "$BUILD_SUMMARY"
+    SHARD_BUILD_SUMMARY_TMP="${SHARD_BUILD_SUMMARY}.tmp.$$"
+    printf '%s\n' "$BUILD_SUMMARY" > "$SHARD_BUILD_SUMMARY_TMP"
+    mv -f "$SHARD_BUILD_SUMMARY_TMP" "$SHARD_BUILD_SUMMARY"
 fi
+DATA_RECEIPT="$(
+    python3 - "$SHARD_BUILD_SUMMARY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+try:
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid pretraining build summary {summary_path}: {exc}")
+receipt = summary.get("receipt")
+if not isinstance(receipt, str) or not receipt:
+    raise SystemExit(f"pretraining build summary has no receipt: {summary_path}")
+print(receipt)
+PY
+)"
+if [ ! -s "$DATA_RECEIPT" ]; then
+    echo "pretraining data receipt is missing or empty: $DATA_RECEIPT" >&2
+    exit 1
+fi
+echo "data receipt: $DATA_RECEIPT"
 
 # ---------------------------------------------------------------------------
 # Stage 4: data gate
@@ -251,10 +285,17 @@ python3 -m Tokenizer.evals.pretraining_gate \
 # Stage 5: pretraining (two-stage mHC core)
 # ---------------------------------------------------------------------------
 log "[5/5] launching pretraining (config=$CONFIG)"
+# The e2e "SMOKE=1" mode is a two-step run over the shards built above, not
+# train_rdt's in-memory --smoke mode, so it is receipt-backed as well.
+RDT_LINEAGE_ARGS=(
+    --tokenizer-bundle "$BUNDLE_DIR"
+    --data-receipt "$DATA_RECEIPT"
+)
 # shellcheck disable=SC2086
 python3 -m scripts.train_rdt \
     --config "$CONFIG" \
-    --data "$DATA_DIR" \
+    --data "$SHARD_JSONL" \
+    "${RDT_LINEAGE_ARGS[@]}" \
     --seq-len "$MAX_LENGTH" \
     --max-steps "$MAX_STEPS" \
     --precision "$PRECISION" \

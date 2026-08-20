@@ -12,7 +12,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -62,12 +61,21 @@ from Model.training import (  # noqa: E402
     evaluate,
     init_distributed,
     is_main_process,
+    load_checkpoint_metadata,
     resume_state,
     save_checkpoint,
     throughput_str,
     train_one_step,
+    validate_resumable_checkpoint,
 )
 from Model.training.status import StatusReporter  # noqa: E402
+from Tokenizer.pretraining.data_contract import (  # noqa: E402
+    load_and_validate_pretraining_data_contract,
+)
+from Tokenizer.unified.contract import (  # noqa: E402
+    tokenizer_algorithm_contract,
+    tokenizer_bundle_contract,
+)
 
 
 CONFIG_CHOICES = {
@@ -89,9 +97,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--data", default="")
     p.add_argument("--eval-data", default="")
     p.add_argument(
+        "--data-receipt",
+        default="",
+        help="producer receipt for the exact pre-tokenized --data shards",
+    )
+    p.add_argument(
+        "--eval-data-receipt",
+        default="",
+        help="producer receipt for the exact pre-tokenized --eval-data shards",
+    )
+    p.add_argument(
         "--tokenizer-bundle",
         default="",
-        help="optional tokenizer bundle dir; recorded in checkpoint metadata",
+        help=(
+            "tokenizer bundle used to produce every pre-tokenized input; "
+            "required for non-smoke training"
+        ),
     )
     p.add_argument("--output", default="outputs/rdt")
     p.add_argument("--resume", default="")
@@ -214,6 +235,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="second JSONL stream (e.g. multimodal OCR rows) interleaved with "
         "--data at optimizer-step granularity; batches stay stream-pure so "
         "the collator's one-image-per-row invariant holds",
+    )
+    p.add_argument(
+        "--mix-data-receipt",
+        default="",
+        help=(
+            "producer receipt for the exact --mix-data shards; accepts either "
+            "an RDT pretraining receipt or the native OCR alignment receipt"
+        ),
     )
     p.add_argument(
         "--mix-every",
@@ -542,14 +571,17 @@ def _sample_supervision_metrics(shards: list[Path], max_rows: int) -> dict[str, 
     }
 
 
-def _validate_args(args: argparse.Namespace) -> int:
+def _validate_args(
+    args: argparse.Namespace,
+    *,
+    validate_data: bool = True,
+) -> int:
     """Argument-level validation.
 
-    Runs **before** any expensive setup (distributed init, model alloc,
-    output-dir creation) so misconfigured invocations fail fast with a
-    clear stderr message and a non-zero exit code, instead of OOMing
-    halfway through model construction or leaving stale ``outputs/`` dirs.
-    Returns 0 on success, a non-zero code on failure.
+    Cheap structural checks run before distributed initialization.  In
+    ``main``, corpus resolution and the sampled supervision gate are then run
+    only on rank zero and broadcast before model allocation.  Direct callers
+    retain the full validation by default.  Returns 0 on success, otherwise 2.
     """
 
     if not args.smoke and not args.data:
@@ -562,6 +594,13 @@ def _validate_args(args: argparse.Namespace) -> int:
     if args.resume and not Path(args.resume).exists():
         print(
             f"scripts/train_rdt: --resume path does not exist: {args.resume}",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.smoke and args.no_resume_skip_data:
+        print(
+            "scripts/train_rdt: --no-resume-skip-data is smoke-only; "
+            "production resume must fast-forward the deterministic stream",
             file=sys.stderr,
         )
         return 2
@@ -602,9 +641,11 @@ def _validate_args(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    # Resolve the data spec **here** rather than waiting for build_dataloader
-    # so an empty glob (typo'd shard pattern) fails *before* we allocate a
-    # multi-billion-parameter model and initialize the process group.
+    if not validate_data:
+        return 0
+    # Resolve the data spec here rather than waiting for build_dataloader so an
+    # empty glob fails before model allocation. Under torchrun, main invokes
+    # this full branch only on rank zero after process-group initialization.
     if not args.smoke and args.data:
         from Model.training.data import _resolve_shards
 
@@ -684,6 +725,46 @@ def _validate_args(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rank_zero_broadcast_result(
+    callback,
+    *,
+    rank: int,
+    world_size: int,
+):
+    """Run an expensive preflight once and give every rank one outcome.
+
+    Rank zero converts every ordinary exception into a serializable envelope
+    before the single broadcast.  Other ranks never enter a barrier ahead of
+    that broadcast, so a validation failure cannot strand them waiting for a
+    rank that already returned.
+    """
+
+    box: list[object] = [None]
+    if rank == 0:
+        try:
+            box[0] = {"ok": True, "value": callback()}
+        except Exception as exc:
+            box[0] = {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+    if world_size > 1:
+        torch.distributed.broadcast_object_list(box, src=0)
+    envelope = box[0]
+    if not isinstance(envelope, dict) or envelope.get("ok") is not True:
+        if isinstance(envelope, dict):
+            error_type = envelope.get("error_type", "Exception")
+            error = envelope.get("error", "unknown rank-zero preflight failure")
+        else:
+            error_type = "RuntimeError"
+            error = "rank-zero preflight broadcast returned an invalid payload"
+        raise ValueError(
+            f"rank-zero preflight failed [{error_type}]: {error}"
+        )
+    return envelope.get("value")
+
+
 def _evaluate_distributed(
     model,
     eval_loader,
@@ -711,38 +792,116 @@ def _evaluate_distributed(
     }
 
 
-def _file_sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _tokenizer_bundle_metadata(path: str) -> dict:
     if not path:
         return {}
-    root = Path(path)
-    files: dict[str, str] = {}
-    for name in (
-        "config.json",
-        "morphbpe.json",
-        "general.json",
-        "vocab.json",
-        "manifest.json",
-    ):
-        candidate = root / name
-        if candidate.exists():
-            files[name] = _file_sha256(candidate)
-    manifest = {}
-    manifest_path = root / "manifest.json"
-    if manifest_path.exists():
-        with manifest_path.open("r", encoding="utf-8") as f:
-            manifest = json.load(f)
+    return tokenizer_bundle_contract(path)
+
+
+def _validated_data_lineage(args: argparse.Namespace) -> dict | None:
+    """Validate producer receipts against current bundle, algorithm, and bytes."""
+
+    if args.smoke:
+        return None
+    if not args.tokenizer_bundle:
+        raise ValueError(
+            "--tokenizer-bundle is required for non-smoke pre-tokenized training"
+        )
+    if not args.data_receipt:
+        raise ValueError(
+            "--data-receipt is required for non-smoke pre-tokenized training"
+        )
+    if bool(args.eval_data) != bool(args.eval_data_receipt):
+        raise ValueError(
+            "--eval-data and --eval-data-receipt must be set together"
+        )
+    if bool(args.mix_data) != bool(args.mix_data_receipt):
+        raise ValueError(
+            "--mix-data and --mix-data-receipt must be set together"
+        )
+    bundle_identity = _tokenizer_bundle_metadata(args.tokenizer_bundle)
+    algorithm_identity = tokenizer_algorithm_contract()
+    streams = {
+        "train": load_and_validate_pretraining_data_contract(
+            args.data_receipt,
+            args.data,
+            tokenizer_bundle=bundle_identity,
+            tokenizer_algorithm=algorithm_identity,
+        )
+    }
+    if args.eval_data:
+        streams["eval"] = load_and_validate_pretraining_data_contract(
+            args.eval_data_receipt,
+            args.eval_data,
+            tokenizer_bundle=bundle_identity,
+            tokenizer_algorithm=algorithm_identity,
+        )
+    if args.mix_data:
+        try:
+            mix_header = json.loads(
+                Path(args.mix_data_receipt).read_text(encoding="utf-8")
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"invalid mix data receipt JSON: {args.mix_data_receipt}: {exc}"
+            ) from exc
+        kind = mix_header.get("kind") if isinstance(mix_header, dict) else None
+        if kind == "pretokenized_rdt_jsonl":
+            streams["mix"] = load_and_validate_pretraining_data_contract(
+                args.mix_data_receipt,
+                args.mix_data,
+                tokenizer_bundle=bundle_identity,
+                tokenizer_algorithm=algorithm_identity,
+            )
+        elif kind == "pretokenized_ocr_alignment":
+            if not getattr(args, "multimodal", False):
+                raise ValueError(
+                    "native OCR --mix-data requires --multimodal so verified "
+                    "image bytes reach the vision tower"
+                )
+            from Model.ocr.alignment_contract import (
+                load_and_validate_ocr_alignment_data_contract,
+            )
+            from Model.ocr.tokenization import native_tokenization_contract
+            from Tokenizer.unified.bundle import TokenizerBundle
+
+            bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
+            native_contract = native_tokenization_contract(
+                bundle.tokenizer,
+                args.tokenizer_bundle,
+            )
+            streams["mix"] = load_and_validate_ocr_alignment_data_contract(
+                args.mix_data_receipt,
+                args.mix_data,
+                native_contract,
+            )
+        else:
+            raise ValueError(
+                "--mix-data-receipt kind must be 'pretokenized_rdt_jsonl' "
+                "or 'pretokenized_ocr_alignment'"
+            )
+    return streams
+
+
+def _dataloader_contract_flags(
+    data_lineage: dict | None,
+    stream: str,
+) -> dict[str, bool]:
+    """Return fail-closed row checks for one receipt-backed stream."""
+
+    if data_lineage is None:
+        return {
+            "require_precomputed_morphology": False,
+            "require_verified_images": False,
+        }
+    lineage = data_lineage.get(stream)
+    if not isinstance(lineage, dict):
+        raise ValueError(f"validated data lineage is missing stream {stream!r}")
     return {
-        "path": str(root),
-        "files": files,
-        "manifest": manifest,
+        "require_precomputed_morphology": True,
+        "require_verified_images": (
+            lineage.get("kind") == "pretokenized_ocr_alignment"
+        ),
     }
 
 
@@ -770,25 +929,104 @@ def _run_metadata(
     model_cfg: RDTConfig,
     train_cfg: TrainingConfig,
     omvt_cfg,
+    data_lineage: dict | None = None,
 ) -> dict:
+    if data_lineage is not None:
+        train_lineage = data_lineage.get("train")
+        if not isinstance(train_lineage, dict):
+            raise ValueError("validated data lineage is missing the train stream")
+        bundle_metadata = train_lineage["tokenizer_bundle"]
+        algorithm_metadata = train_lineage["tokenizer_algorithm"]
+    else:
+        bundle_metadata = _tokenizer_bundle_metadata(args.tokenizer_bundle)
+        algorithm_metadata = (
+            tokenizer_algorithm_contract() if args.tokenizer_bundle else {}
+        )
     return {
         "config_name": args.config,
         "rdt_config": asdict(model_cfg),
         "training_config": asdict(train_cfg),
         "omvt_config": asdict(omvt_cfg) if omvt_cfg is not None else None,
         "mix": (
-            {"mix_data": args.mix_data, "mix_every": args.mix_every}
+            {"mix_every": args.mix_every}
             if args.mix_data
             else None
         ),
-        "tokenizer_bundle": _tokenizer_bundle_metadata(args.tokenizer_bundle),
+        "tokenizer_bundle": bundle_metadata,
+        "tokenizer_algorithm": algorithm_metadata,
+        "data_lineage": data_lineage,
         "git": _git_metadata(),
     }
 
 
+_RELOCATABLE_TRAINING_PATH_FIELDS = frozenset(
+    {"train_data", "eval_data", "output_dir", "resume"}
+)
+
+
+def _resume_training_config(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: item
+        for key, item in value.items()
+        if key not in _RELOCATABLE_TRAINING_PATH_FIELDS
+    }
+
+
+def _validate_resume_tokenizer_lineage(
+    resume_path: str,
+    current_metadata: dict,
+) -> None:
+    """Reject any resume-time semantic or byte drift.
+
+    Filesystem roots may move, so path-only training fields are excluded.  The
+    exact resolved bytes remain bound through ``data_lineage``.
+    """
+
+    saved = load_checkpoint_metadata(resume_path)
+    conflicts: list[str] = []
+    if saved.get("config_name") != current_metadata.get("config_name"):
+        conflicts.append("config_name differs")
+    if saved.get("rdt_config") != current_metadata.get("rdt_config"):
+        conflicts.append("rdt_config differs")
+    if saved.get("omvt_config") != current_metadata.get("omvt_config"):
+        conflicts.append("omvt_config differs")
+    if saved.get("tokenizer_bundle") != current_metadata.get(
+        "tokenizer_bundle"
+    ):
+        conflicts.append("tokenizer_bundle differs (resolved file bytes)")
+    if saved.get("tokenizer_algorithm") != current_metadata.get(
+        "tokenizer_algorithm"
+    ):
+        conflicts.append(
+            "tokenizer_algorithm differs (source/runtime/Unicode identity)"
+        )
+    saved_training = _resume_training_config(saved.get("training_config"))
+    current_training = _resume_training_config(
+        current_metadata.get("training_config")
+    )
+    if saved_training is None or current_training is None:
+        conflicts.append("training_config lineage is missing")
+    elif saved_training != current_training:
+        conflicts.append(
+            "training_config differs outside relocatable path fields"
+        )
+    if saved.get("mix") != current_metadata.get("mix"):
+        conflicts.append("mix data schedule differs")
+    if saved.get("data_lineage") != current_metadata.get("data_lineage"):
+        conflicts.append("data_lineage differs (resolved shard bytes or order)")
+    if conflicts:
+        raise ValueError(
+            "unsafe RDT resume lineage:\n  - " + "\n  - ".join(conflicts)
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    rc = _validate_args(args)
+    # Keep cheap, path-local validation before process-group setup.  Corpus
+    # sampling and full receipt hashing happen once on rank zero below.
+    rc = _validate_args(args, validate_data=False)
     if rc != 0:
         return rc
     try:
@@ -798,7 +1036,62 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     train_cfg_preview = _build_train_cfg(args, model_cfg_preview)
     omvt_cfg = build_omvt_cfg(args)
-    rank, world_size, local_rank = init_distributed(backend=train_cfg_preview.dist_backend)
+    model_cfg = _apply_train_overrides(model_cfg_preview, train_cfg_preview)
+    train_cfg = train_cfg_preview
+    rank, world_size, local_rank = init_distributed(
+        backend=train_cfg_preview.dist_backend
+    )
+
+    def _rank_zero_data_preflight():
+        if _validate_args(args) != 0:
+            raise ValueError("argument/data gate validation failed")
+        return _validated_data_lineage(args)
+
+    try:
+        data_lineage = _rank_zero_broadcast_result(
+            _rank_zero_data_preflight,
+            rank=rank,
+            world_size=world_size,
+        )
+    except ValueError as exc:
+        if rank == 0:
+            print(
+                f"scripts/train_rdt: data lineage validation failed: {exc}",
+                file=sys.stderr,
+            )
+        destroy_distributed()
+        return 2
+
+    run_metadata = _run_metadata(
+        args,
+        model_cfg,
+        train_cfg,
+        omvt_cfg,
+        data_lineage=data_lineage,
+    )
+    if args.resume:
+        def _rank_zero_resume_preflight():
+            validate_resumable_checkpoint(
+                args.resume,
+                require_scaler=(
+                    train_cfg.precision == "fp16"
+                    and torch.cuda.is_available()
+                ),
+                context="RDT --resume",
+            )
+            _validate_resume_tokenizer_lineage(args.resume, run_metadata)
+
+        try:
+            _rank_zero_broadcast_result(
+                _rank_zero_resume_preflight,
+                rank=rank,
+                world_size=world_size,
+            )
+        except ValueError as exc:
+            if rank == 0:
+                print(f"scripts/train_rdt: {exc}", file=sys.stderr)
+            destroy_distributed()
+            return 2
     if args.dist != "single" and world_size == 1 and not args.smoke:
         print(
             "[warn] --dist != single but world_size=1; running single-process",
@@ -810,11 +1103,6 @@ def main(argv: list[str] | None = None) -> int:
     device = torch.device(
         f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
     )
-
-    model_cfg = model_cfg_preview
-    train_cfg = train_cfg_preview
-    model_cfg = _apply_train_overrides(model_cfg, train_cfg)
-    run_metadata = _run_metadata(args, model_cfg, train_cfg, omvt_cfg)
 
     if is_main_process():
         Path(train_cfg.output_dir).mkdir(parents=True, exist_ok=True)
@@ -861,6 +1149,7 @@ def main(argv: list[str] | None = None) -> int:
             pad_id=PAD_ID,
             image_processor=image_processor,
             omvt_cfg=omvt_cfg,
+            **_dataloader_contract_flags(data_lineage, "train"),
         )
         batch_iter = iter(dataloader)
         if args.mix_data:
@@ -872,6 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
                 pad_id=PAD_ID,
                 image_processor=image_processor,
                 omvt_cfg=omvt_cfg,
+                **_dataloader_contract_flags(data_lineage, "mix"),
             )
             batch_iter = _interleaved_batches(
                 batch_iter,
@@ -893,6 +1183,7 @@ def main(argv: list[str] | None = None) -> int:
                 drop_last=False,
                 image_processor=build_image_processor(args),
                 omvt_cfg=omvt_cfg,
+                **_dataloader_contract_flags(data_lineage, "eval"),
             )
 
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=train_cfg.tensorboard)

@@ -30,9 +30,19 @@ class OMVTInjector(nn.Module):
                 nn.Linear(omvt_cfg.d_vision, rdt_cfg.d_model),
             )
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        pixel_repeats: int = 1,
+    ) -> torch.Tensor:
+        if type(pixel_repeats) is not int or pixel_repeats <= 0:
+            raise ValueError("pixel_repeats must be a positive integer")
         tower_out = self.tower(batch)
-        return self.projector(tower_out["compressed"])
+        projected = self.projector(tower_out["compressed"])
+        if pixel_repeats != 1:
+            projected = projected.repeat_interleave(pixel_repeats, dim=0)
+        return projected
 
 
 __all__ = ["OMVTInjector"]

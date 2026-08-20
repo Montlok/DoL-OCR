@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import inspect
 import math
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from Model.config import MIN_OFFICIAL_MAMBA3_D_STATE
+from Model.inference.cache import MambaCache
 from Model.layers.rmsnorm import GroupedRMSNorm
 
 
@@ -16,6 +19,19 @@ try:
     from mamba_ssm.modules.mamba3 import Mamba3 as OfficialMamba3
 except ImportError:
     OfficialMamba3 = None
+
+try:
+    from mamba_ssm.utils.generation import InferenceParams as OfficialInferenceParams
+except ImportError:
+    OfficialInferenceParams = None
+
+try:
+    _OFFICIAL_MAMBA_VERSION = distribution_version("mamba-ssm")
+except PackageNotFoundError:
+    _OFFICIAL_MAMBA_VERSION = None
+
+
+_SUPPORTED_OFFICIAL_CACHE_VERSION = "2.3.2.post1"
 
 
 def official_available() -> bool:
@@ -27,6 +43,66 @@ def _validate_official_cfg(cfg) -> None:
         raise ValueError(
             "official Mamba3 requires mamba_d_state >= "
             f"{MIN_OFFICIAL_MAMBA3_D_STATE}; got {cfg.mamba_d_state}"
+        )
+
+
+def _validate_official_cache_api(mamba: nn.Module, layer_idx: int | None) -> None:
+    """Fail closed unless the installed upstream cache API is the audited one."""
+
+    if _OFFICIAL_MAMBA_VERSION != _SUPPORTED_OFFICIAL_CACHE_VERSION:
+        raise RuntimeError(
+            "official Mamba3 incremental cache requires the audited "
+            f"mamba-ssm=={_SUPPORTED_OFFICIAL_CACHE_VERSION}; found "
+            f"{_OFFICIAL_MAMBA_VERSION!r}"
+        )
+    if OfficialInferenceParams is None:
+        raise RuntimeError(
+            "official Mamba3 incremental cache requires "
+            "mamba_ssm.utils.generation.InferenceParams"
+        )
+    if type(layer_idx) is not int or layer_idx < 0:
+        raise RuntimeError(
+            "official Mamba3 incremental cache requires a non-negative "
+            "integer layer_idx"
+        )
+    if getattr(mamba, "layer_idx", None) != layer_idx:
+        raise RuntimeError("official Mamba3 layer_idx does not match its wrapper")
+
+    required = {
+        "forward": {"inference_params"},
+        "allocate_inference_cache": {"batch_size", "max_seqlen"},
+        "step": {"u", "angle_state", "ssm_state", "k_state", "v_state"},
+    }
+    for method_name, parameter_names in required.items():
+        method = getattr(mamba, method_name, None)
+        if not callable(method):
+            raise RuntimeError(
+                f"official Mamba3 cache API is missing callable {method_name}()"
+            )
+        try:
+            actual = set(inspect.signature(method).parameters)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot inspect official Mamba3 {method_name}() cache API"
+            ) from exc
+        missing = sorted(parameter_names - actual)
+        if missing:
+            raise RuntimeError(
+                f"official Mamba3 {method_name}() cache API is incompatible; "
+                f"missing parameters: {', '.join(missing)}"
+            )
+
+    try:
+        inference_params = set(
+            inspect.signature(OfficialInferenceParams).parameters
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("cannot inspect official InferenceParams API") from exc
+    missing = {"max_seqlen", "max_batch_size"} - inference_params
+    if missing:
+        raise RuntimeError(
+            "official InferenceParams API is incompatible; missing parameters: "
+            + ", ".join(sorted(missing))
         )
 
 
@@ -216,6 +292,16 @@ class NaiveSSM(nn.Module):
         Both fields are updated in place.
         """
 
+        if not isinstance(cache, MambaCache):
+            raise TypeError("NaiveSSM cache must be a MambaCache")
+        if cache.backend not in {None, "naive"}:
+            raise RuntimeError(
+                f"MambaCache is bound to backend={cache.backend!r}, not 'naive'"
+            )
+        if cache.official_inference_params is not None:
+            raise RuntimeError("NaiveSSM cache contains official Mamba state")
+        cache.backend = "naive"
+
         bsz, m, _ = x.shape
         dtype = x.dtype
         k = self.d_conv
@@ -369,15 +455,19 @@ class Mamba3Layer(nn.Module):
             raise ValueError("x must have shape [B, L, d_model]")
 
         if cache is not None:
-            if not isinstance(self.mamba, NaiveSSM):
-                raise NotImplementedError(
-                    "incremental decode cache is only supported with the "
-                    "NaiveSSM fallback backend; the official Mamba kernels are "
-                    "not steppable here"
+            if not isinstance(cache, MambaCache):
+                raise TypeError("Mamba3Layer cache must be a MambaCache")
+            if attn_mask is not None and not bool(attn_mask.all()):
+                raise ValueError(
+                    "cached Mamba decode requires an all-ones attn_mask "
+                    "(no padding); pad-free generation only"
                 )
             residual = x
             mamba_input = self.norm(residual)
-            y = self.mamba(mamba_input, attn_mask=attn_mask, cache=cache)
+            if isinstance(self.mamba, NaiveSSM):
+                y = self.mamba(mamba_input, attn_mask=attn_mask, cache=cache)
+            else:
+                y = self._forward_official_cached(mamba_input, cache)
             return residual + y
 
         mask = None
@@ -409,6 +499,200 @@ class Mamba3Layer(nn.Module):
         if mask is not None:
             out = out * mask
         return out
+
+    def _forward_official_cached(
+        self,
+        x: torch.Tensor,
+        cache: MambaCache,
+    ) -> torch.Tensor:
+        """Run one isolated upstream prefill followed by single-token steps."""
+
+        if cache.official_poisoned:
+            raise RuntimeError(
+                "official MambaCache is poisoned by a failed step; start a new "
+                "DecodeCache"
+            )
+        if cache.backend not in {None, "official"}:
+            raise RuntimeError(
+                f"MambaCache is bound to backend={cache.backend!r}, not 'official'"
+            )
+        if cache.conv_window is not None or cache.ssm_state is not None:
+            raise RuntimeError("official MambaCache contains NaiveSSM state")
+
+        bsz, chunk_len, _ = x.shape
+        max_seqlen = int(self.cfg.max_seq_len)
+        if max_seqlen <= 0:
+            raise RuntimeError("official Mamba cache max_seq_len must be positive")
+        if chunk_len <= 0:
+            raise ValueError("official Mamba cache cannot process an empty chunk")
+
+        if cache.official_inference_params is None:
+            _validate_official_cache_api(self.mamba, self.layer_idx)
+            if cache.backend is not None or cache.official_owner is not None:
+                raise RuntimeError("official MambaCache is only partially initialized")
+            if chunk_len > max_seqlen:
+                raise ValueError(
+                    "official Mamba prefill exceeds max_seq_len: "
+                    f"{chunk_len} > {max_seqlen}"
+                )
+            return self._official_prefill(
+                x,
+                cache,
+                batch_size=bsz,
+                max_seqlen=max_seqlen,
+            )
+
+        self._validate_bound_official_cache(
+            x,
+            cache,
+            batch_size=bsz,
+            max_seqlen=max_seqlen,
+        )
+        if chunk_len != 1:
+            raise ValueError(
+                "official Mamba cache accepts exactly one token after prefill; "
+                f"got chunk length {chunk_len}"
+            )
+
+        inference_params = cache.official_inference_params
+        offset = int(inference_params.seqlen_offset)
+        if offset + 1 > max_seqlen:
+            raise ValueError(
+                "official Mamba cache would exceed max_seq_len: "
+                f"{offset} + 1 > {max_seqlen}"
+            )
+        states = self._official_states(inference_params)
+
+        try:
+            result = self.mamba.step(x[:, 0, :], *states)
+            if not isinstance(result, tuple) or len(result) != 5:
+                raise RuntimeError(
+                    "official Mamba3 step() must return "
+                    "(out, angle_state, ssm_state, k_state, v_state)"
+                )
+            out = result[0]
+            next_states = tuple(result[1:])
+            self._validate_official_step_result(out, states, next_states, x)
+        except Exception:
+            cache.official_poisoned = True
+            raise
+
+        inference_params.key_value_memory_dict[self.layer_idx] = next_states
+        inference_params.seqlen_offset = offset + 1
+        return out.unsqueeze(1)
+
+    def _official_prefill(
+        self,
+        x: torch.Tensor,
+        cache: MambaCache,
+        *,
+        batch_size: int,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        states = self.mamba.allocate_inference_cache(
+            batch_size=batch_size,
+            max_seqlen=max_seqlen,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        if not isinstance(states, tuple) or len(states) != 4:
+            raise RuntimeError(
+                "official Mamba3 allocate_inference_cache() must return four states"
+            )
+        if not all(isinstance(state, torch.Tensor) for state in states):
+            raise RuntimeError("official Mamba3 cache states must be tensors")
+
+        inference_params = OfficialInferenceParams(
+            max_seqlen=max_seqlen,
+            max_batch_size=batch_size,
+            key_value_memory_dict={self.layer_idx: states},
+        )
+        out = self.mamba(x, inference_params=inference_params)
+        if not isinstance(out, torch.Tensor) or out.shape != x.shape:
+            raise RuntimeError(
+                "official Mamba3 prefill returned an incompatible output shape"
+            )
+        if int(inference_params.seqlen_offset) != 0:
+            raise RuntimeError(
+                "official Mamba3 mutated seqlen_offset during prefill"
+            )
+        self._official_states(inference_params)
+
+        inference_params.seqlen_offset = x.shape[1]
+        cache.backend = "official"
+        cache.official_inference_params = inference_params
+        cache.official_owner = self.mamba
+        cache.official_batch_size = batch_size
+        cache.official_max_seqlen = max_seqlen
+        cache.official_device = x.device
+        cache.official_dtype = x.dtype
+        return out
+
+    def _validate_bound_official_cache(
+        self,
+        x: torch.Tensor,
+        cache: MambaCache,
+        *,
+        batch_size: int,
+        max_seqlen: int,
+    ) -> None:
+        inference_params = cache.official_inference_params
+        if cache.backend != "official":
+            raise RuntimeError("official MambaCache backend binding is invalid")
+        if cache.official_owner is not self.mamba:
+            raise RuntimeError(
+                "official MambaCache belongs to a different Mamba call site"
+            )
+        if cache.official_batch_size != batch_size:
+            raise ValueError(
+                "official Mamba cache batch size is fixed after prefill: "
+                f"expected {cache.official_batch_size}, got {batch_size}"
+            )
+        if cache.official_max_seqlen != max_seqlen:
+            raise RuntimeError("official Mamba cache max_seq_len changed within a run")
+        if cache.official_device != x.device or cache.official_dtype != x.dtype:
+            raise ValueError(
+                "official Mamba cache device and dtype are fixed after prefill"
+            )
+        if not isinstance(inference_params, OfficialInferenceParams):
+            raise RuntimeError("official MambaCache has incompatible InferenceParams")
+        if int(inference_params.max_batch_size) != batch_size:
+            raise RuntimeError("official InferenceParams max_batch_size changed")
+        if int(inference_params.max_seqlen) != max_seqlen:
+            raise RuntimeError("official InferenceParams max_seqlen changed")
+        offset = int(inference_params.seqlen_offset)
+        if offset <= 0 or offset > max_seqlen:
+            raise RuntimeError("official InferenceParams seqlen_offset is invalid")
+
+    def _official_states(self, inference_params) -> tuple[torch.Tensor, ...]:
+        state_dict = getattr(inference_params, "key_value_memory_dict", None)
+        if not isinstance(state_dict, dict) or set(state_dict) != {self.layer_idx}:
+            raise RuntimeError(
+                "official InferenceParams must contain exactly one call-site state"
+            )
+        states = state_dict[self.layer_idx]
+        if not isinstance(states, tuple) or len(states) != 4:
+            raise RuntimeError("official Mamba3 call-site state must contain four tensors")
+        if not all(isinstance(state, torch.Tensor) for state in states):
+            raise RuntimeError("official Mamba3 call-site states must be tensors")
+        return states
+
+    @staticmethod
+    def _validate_official_step_result(
+        out: object,
+        previous_states: tuple[torch.Tensor, ...],
+        next_states: tuple[object, ...],
+        x: torch.Tensor,
+    ) -> None:
+        if not isinstance(out, torch.Tensor) or out.shape != (x.shape[0], x.shape[2]):
+            raise RuntimeError("official Mamba3 step() returned an incompatible output")
+        if len(next_states) != len(previous_states) or not all(
+            isinstance(state, torch.Tensor) for state in next_states
+        ):
+            raise RuntimeError("official Mamba3 step() returned incompatible states")
+        for previous, current in zip(previous_states, next_states):
+            if current.shape != previous.shape:
+                raise RuntimeError("official Mamba3 step() changed a state shape")
 
 
 def _is_right_padding_mask(attn_mask: torch.Tensor) -> bool:

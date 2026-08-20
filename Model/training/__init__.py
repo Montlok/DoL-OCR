@@ -13,11 +13,16 @@ The legacy import paths are preserved:
 """
 
 from Model.training.checkpoint import (
+    clear_no_update_progress,
     load_checkpoint,
     load_checkpoint_metadata,
+    load_no_update_progress,
     resolve_checkpoint_dir,
+    restore_rng_state,
     resume_state,
+    save_no_update_progress,
     save_checkpoint,
+    validate_resumable_checkpoint,
 )
 from Model.training.data import (
     JsonlPretrainingDataset,
@@ -71,18 +76,23 @@ __all__ = [
     "build_optimizer",
     "build_scheduler",
     "clip_or_check_grad_norm",
+    "clear_no_update_progress",
     "destroy_distributed",
     "evaluate",
     "init_distributed",
     "is_main_process",
     "load_checkpoint",
     "load_checkpoint_metadata",
+    "load_no_update_progress",
     "param_groups_with_no_decay",
     "resolve_checkpoint_dir",
+    "restore_rng_state",
     "resume_state",
+    "save_no_update_progress",
     "save_checkpoint",
     "throughput_str",
     "train_one_step",
+    "validate_resumable_checkpoint",
     "wrap_ddp",
     "wrap_fsdp",
 ]

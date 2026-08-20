@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +17,17 @@ from Tokenizer.pretraining import (
     encoded_sample_to_dict,
     iter_pack_samples,
 )
+from Tokenizer.pretraining.data_contract import (
+    PRETRAINING_PRODUCER_GENERIC_BUILDER,
+    build_pretraining_data_contract,
+    default_pretraining_data_contract_path,
+    write_pretraining_data_contract,
+)
 from Tokenizer.unified.bundle import TokenizerBundle
+from Tokenizer.unified.contract import (
+    tokenizer_algorithm_contract,
+    tokenizer_bundle_contract,
+)
 
 
 def _iter_samples(
@@ -111,7 +122,14 @@ class _JsonlShardWriter:
         if exc_type is None and self._fh is None and not self.paths:
             path = self._path_for_idx(0)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch()
+            with path.open("wb") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
             self.paths.append(str(path))
 
     def _path_for_idx(self, idx: int) -> Path:
@@ -153,8 +171,19 @@ class _JsonlShardWriter:
 
     def close(self) -> None:
         if self._fh is not None:
-            self._fh.close()
+            handle = self._fh
             self._fh = None
+            path = Path(handle.name)
+            try:
+                handle.flush()
+                os.fsync(handle.fileno())
+            finally:
+                handle.close()
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
 
 
 def _nonempty_samples(
@@ -173,6 +202,15 @@ def main() -> None:
     parser.add_argument("--tokenizer-bundle", required=True)
     parser.add_argument("--input", required=True, help=".txt or .jsonl")
     parser.add_argument("--output", required=True, help="output JSONL")
+    parser.add_argument(
+        "--receipt",
+        default="",
+        help=(
+            "immutable output-shard receipt; defaults to "
+            "<output>.receipt.json, or <output>/pretraining_data_receipt.json "
+            "when --output is a sharded directory"
+        ),
+    )
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--pack", action="store_true", help="pack text-only samples")
     parser.add_argument(
@@ -236,10 +274,35 @@ def main() -> None:
             writer.write(row)
             summary.add_row(row)
     summary.shards = list(writer.paths)
+    bundle_identity = tokenizer_bundle_contract(args.tokenizer_bundle)
+    algorithm_identity = tokenizer_algorithm_contract()
+    receipt = build_pretraining_data_contract(
+        [Path(path) for path in writer.paths],
+        producer_kind=PRETRAINING_PRODUCER_GENERIC_BUILDER,
+        tokenizer_bundle=bundle_identity,
+        tokenizer_algorithm=algorithm_identity,
+    )
+    sharded_directory = bool(
+        (args.shard_token_budget or args.shard_sample_budget)
+        and not Path(args.output).suffix
+    )
+    receipt_path = Path(args.receipt) if args.receipt else (
+        default_pretraining_data_contract_path(
+            args.output,
+            sharded_directory=sharded_directory,
+        )
+    )
+    write_pretraining_data_contract(receipt_path, receipt)
 
+    rendered_summary = summary.to_dict()
+    rendered_summary["receipt"] = str(receipt_path)
+    rendered_summary["data_sha256"] = receipt["data_sha256"]
+    rendered_summary["data_total_size_bytes"] = receipt[
+        "data_total_size_bytes"
+    ]
     print(
         json.dumps(
-            summary.to_dict(), ensure_ascii=False
+            rendered_summary, ensure_ascii=False
         )
     )
 

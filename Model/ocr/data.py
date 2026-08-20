@@ -29,6 +29,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from Model.ocr.alignment_contract import validate_ocr_image_binding_fields
+from Tokenizer.pretraining.morphology import (
+    MORPH_TRACK_RESET,
+    derive_morph_info_from_track_ids,
+)
+
 
 def build_ocr_row(
     target_ids: Sequence[int],
@@ -41,9 +47,13 @@ def build_ocr_row(
     image_end_id: int,
     eos_id: int,
     instruction_ids: Sequence[int] = (),
+    target_track_ids: Sequence[int] | None = None,
+    instruction_track_ids: Sequence[int] | None = None,
+    image_sha256: str | None = None,
+    image_size_bytes: int | None = None,
     add_eos: bool = True,
     ignore_index: int = -100,
-) -> dict[str, list]:
+) -> dict[str, Any]:
     """Build one pre-tokenized OCR training row.
 
     Args:
@@ -55,6 +65,14 @@ def build_ocr_row(
         bos_id/image_start_id/image_patch_id/image_end_id/eos_id: special ids.
         instruction_ids: optional prompt tokens placed after ``<image_end>`` and
             before the target (masked from the loss).
+        target_track_ids/instruction_track_ids: canonical morphology-route ids
+            aligned with their token sequences. When supplied, the row also
+            carries the exact ``word_pos``/``morph_depth`` representation used
+            by language pretraining. Strict frozen-LM OCR builders require
+            both; legacy/smoke callers may omit both.
+        image_sha256/image_size_bytes: expected bytes of ``image_ref``. They
+            must be supplied together for native frozen-LM OCR data; the
+            strict collator verifies them while reading the image.
         add_eos: append ``eos_id`` to the target and supervise it.
         ignore_index: label value for masked (unsupervised) positions.
 
@@ -68,6 +86,27 @@ def build_ocr_row(
     if not target_ids:
         raise ValueError("target_ids must be non-empty")
     instruction_ids = [int(t) for t in instruction_ids]
+    if (target_track_ids is None) != (instruction_track_ids is None):
+        raise ValueError(
+            "target_track_ids and instruction_track_ids must be supplied together"
+        )
+    target_tracks = (
+        [int(value) for value in target_track_ids]
+        if target_track_ids is not None
+        else None
+    )
+    instruction_tracks = (
+        [int(value) for value in instruction_track_ids]
+        if instruction_track_ids is not None
+        else None
+    )
+    if target_tracks is not None and len(target_tracks) != len(target_ids):
+        raise ValueError("target_track_ids must align with target_ids")
+    if (
+        instruction_tracks is not None
+        and len(instruction_tracks) != len(instruction_ids)
+    ):
+        raise ValueError("instruction_track_ids must align with instruction_ids")
 
     prompt = (
         [bos_id, image_start_id]
@@ -89,12 +128,36 @@ def build_ocr_row(
             "instruction_ids and target_ids must not contain image_patch_id"
         )
 
-    return {
+    row = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
         "images": [image_ref],
     }
+    if (image_sha256 is None) != (image_size_bytes is None):
+        raise ValueError(
+            "image_sha256 and image_size_bytes must be supplied together"
+        )
+    if image_sha256 is not None and image_size_bytes is not None:
+        row["image_sha256"] = image_sha256
+        row["image_size_bytes"] = image_size_bytes
+        validate_ocr_image_binding_fields(row)
+    if target_tracks is not None and instruction_tracks is not None:
+        prompt_tracks = (
+            [MORPH_TRACK_RESET] * (2 + n_image_tokens + 1)
+            + instruction_tracks
+        )
+        all_tracks = (
+            prompt_tracks
+            + target_tracks
+            + ([MORPH_TRACK_RESET] if add_eos else [])
+        )
+        word_pos, morph_depth = derive_morph_info_from_track_ids(all_tracks)
+        if len(word_pos) != len(input_ids):
+            raise RuntimeError("OCR morphology fields must align with input_ids")
+        row["word_pos"] = word_pos
+        row["morph_depth"] = morph_depth
+    return row
 
 
 def split_ocr_row(

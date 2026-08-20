@@ -145,6 +145,8 @@ class VisionInjector(nn.Module):
 
         self._omvt_cfg = omvt_cfg
         self.omvt = None  # type: ignore[assignment]
+        self.native_detail_tower = None  # type: ignore[assignment]
+        self.native_detail_migration_receipt = None
 
     def _ensure_omvt(self) -> None:
         if self.omvt is not None:
@@ -170,15 +172,90 @@ class VisionInjector(nn.Module):
 
         self.omvt = injector
 
+    def install_native_detail_tower(
+        self,
+        omvt_cfg,
+        max_detail_tokens: int,
+        ratio: int,
+        initialize_from_legacy: bool = True,
+    ):
+        """Explicitly install the opt-in native-detail tower.
+
+        The default v1 module tree remains unchanged until this method is
+        called.  Weight migration is exact and receipt-backed; no partial or
+        non-strict state-dict loading is used.
+        """
+
+        if self.native_detail_tower is not None:
+            raise RuntimeError("native detail tower is already installed")
+        if type(max_detail_tokens) is not int or max_detail_tokens <= 0:
+            raise ValueError("max_detail_tokens must be a positive integer")
+        if type(ratio) is not int or ratio <= 0:
+            raise ValueError("ratio must be a positive integer")
+        if type(initialize_from_legacy) is not bool:
+            raise ValueError("initialize_from_legacy must be bool")
+        if omvt_cfg is None:
+            raise ValueError("omvt_cfg is required for native detail installation")
+        if initialize_from_legacy and self.omvt is None:
+            raise RuntimeError(
+                "legacy OMVT must already be installed before native migration"
+            )
+
+        from Model.omvt.native_migration import (
+            initialize_fresh_native_detail,
+            migrate_legacy_omvt_to_native_detail,
+        )
+        from Model.omvt.native_tower import NativeOMVTDetailTower
+
+        native_tower = NativeOMVTDetailTower(
+            omvt_cfg,
+            max_detail_tokens_per_sample=max_detail_tokens,
+            source_tokens_per_detail_token=ratio,
+        )
+        if initialize_from_legacy:
+            legacy_tower = getattr(self.omvt, "tower", None)
+            if legacy_tower is None:
+                raise TypeError("installed legacy OMVT does not expose its tower")
+            target_parameter = next(legacy_tower.parameters(), None)
+        else:
+            target_parameter = next(self.parameters(), None)
+        if target_parameter is not None:
+            native_tower = native_tower.to(
+                device=target_parameter.device,
+                dtype=target_parameter.dtype,
+            )
+
+        if initialize_from_legacy:
+            receipt = migrate_legacy_omvt_to_native_detail(
+                legacy_tower,
+                native_tower,
+            )
+        else:
+            receipt = initialize_fresh_native_detail(native_tower)
+
+        # Register only after every shape/layer/tensor check has succeeded, so
+        # a failed migration never leaves a partially initialized live module.
+        self.native_detail_tower = native_tower
+        self.native_detail_migration_receipt = receipt
+        return receipt
+
     def encode_visual(
         self,
         pixel_values: torch.Tensor | Mapping[str, torch.Tensor],
+        *,
+        pixel_repeats: int = 1,
     ) -> torch.Tensor:
         """Encode/project pixels once, before injecting them into token slots."""
 
+        if type(pixel_repeats) is not int or pixel_repeats <= 0:
+            raise ValueError("pixel_repeats must be a positive integer")
         if isinstance(pixel_values, Mapping):
             self._ensure_omvt()
-            return self.omvt(pixel_values)
+            return self.omvt(pixel_values, pixel_repeats=pixel_repeats)
+        if pixel_repeats != 1:
+            raise ValueError(
+                "pixel_repeats is only supported for OMVT mapping inputs"
+            )
         return self.encoder(pixel_values)
 
     def forward(
@@ -187,14 +264,26 @@ class VisionInjector(nn.Module):
         input_ids: torch.Tensor,
         pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
         visual_features: torch.Tensor | None = None,
+        pixel_repeats: int = 1,
     ) -> torch.Tensor:
+        if type(pixel_repeats) is not int or pixel_repeats <= 0:
+            raise ValueError("pixel_repeats must be a positive integer")
         if pixel_values is not None and visual_features is not None:
             raise ValueError("pass pixel_values or visual_features, not both")
+        if visual_features is not None and pixel_repeats != 1:
+            raise ValueError(
+                "pixel_repeats must be 1 for precomputed visual_features"
+            )
         if pixel_values is None and visual_features is None:
+            if pixel_repeats != 1:
+                raise ValueError("pixel_repeats requires pixel_values")
             return inputs_embeds
         if visual_features is None:
             assert pixel_values is not None
-            visual_features = self.encode_visual(pixel_values)
+            visual_features = self.encode_visual(
+                pixel_values,
+                pixel_repeats=pixel_repeats,
+            )
         return inject_visual_features(
             inputs_embeds=inputs_embeds,
             input_ids=input_ids,

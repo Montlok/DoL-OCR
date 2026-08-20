@@ -30,6 +30,7 @@ state) and is documented in the delivery report rather than as a unittest.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import unittest
@@ -46,6 +47,7 @@ from Tokenizer.unified.dual_tokenizer import DualTrackTokenizer, build_unified_v
 from scripts.build_ocr_data import make_ocr_target_encoder
 from scripts.build_ocr_data_from_pairs import (
     ShardCounters,
+    _validated_shard_completion_manifest,
     build_one_hanshi_virtual_shard,
     build_one_shard,
     hanshi_image_path,
@@ -76,6 +78,7 @@ TEST_MIN = 435200
 N_IMAGE_TOKENS = 256
 IMAGE_SIZE = 224
 MAX_SEQ_LEN = 512
+TOKENIZATION_CONTRACT_SHA256 = "a" * 64
 
 
 class _FakeMorphBPE:
@@ -88,7 +91,11 @@ class _FakeMorphBPE:
     del _i, _ch
 
     def encode(self, text: str) -> list[int]:
-        return [self.vocab[text]]
+        # The real MorphBPE encoder can emit several native pieces for one
+        # Mongolian span.  Keep the fixture deliberately simple, but preserve
+        # that contract instead of assuming every input span is a single
+        # vocabulary entry.
+        return [self.vocab[ch] for ch in text]
 
 
 def make_fixture_tokenizer() -> DualTrackTokenizer:
@@ -319,6 +326,7 @@ class ProcessShardTest(unittest.TestCase):
             test_src_doc_min=TEST_MIN,
             val_cap_per_shard=1000,
             ssl_quota_per_shard=1000,
+            tokenization_contract_sha256=TOKENIZATION_CONTRACT_SHA256,
             instruction_ids=[],
         )
         kwargs.update(overrides)
@@ -386,6 +394,12 @@ class ProcessShardTest(unittest.TestCase):
         self.assertEqual(len(row["images"]), 1)
         self.assertTrue(os.path.isabs(row["images"][0]))
         self.assertTrue(Path(row["images"][0]).is_file())
+        image_bytes = Path(row["images"][0]).read_bytes()
+        self.assertEqual(row["image_size_bytes"], len(image_bytes))
+        self.assertEqual(
+            row["image_sha256"],
+            hashlib.sha256(image_bytes).hexdigest(),
+        )
 
     def test_align_image_is_letterboxed_square(self):
         self._run()
@@ -433,8 +447,25 @@ class ProcessShardTest(unittest.TestCase):
         self.assertTrue(sentinel_path.is_file())
         with sentinel_path.open() as fh:
             payload = json.load(fh)
-        self.assertEqual(payload["n_align_written"], counters.n_align_written)
-        self.assertEqual(payload["n_samples_seen"], 5)
+        self.assertEqual(
+            payload["counters"]["n_align_written"],
+            counters.n_align_written,
+        )
+        self.assertEqual(payload["counters"]["n_samples_seen"], 5)
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(len(payload["producer_algorithm"]["aggregate_sha256"]), 64)
+        self.assertEqual(
+            {
+                entry["path"]
+                for entry in payload["producer_algorithm"]["source_files"]
+            },
+            {
+                "Model/ocr/data.py",
+                "Model/ocr/image_preprocess.py",
+                "Model/ocr/pair_shards.py",
+                "scripts/build_ocr_data_from_pairs.py",
+            },
+        )
 
     def test_rerun_with_sentinel_skips_and_counters_unchanged(self):
         first = self._run_via_build_one_shard()
@@ -446,12 +477,8 @@ class ProcessShardTest(unittest.TestCase):
         self.assertEqual(first.as_dict(), second.as_dict())
         self.assertEqual(align_path.stat().st_mtime_ns, mtime_before)
 
-    def _run_via_build_one_shard(self):
-        return build_one_shard(
-            0,
-            self.tmp_dir,
-            self.out_dir,
-            self.encode_target,
+    def _run_via_build_one_shard(self, **overrides):
+        kwargs = dict(
             n_image_tokens=N_IMAGE_TOKENS,
             image_size=IMAGE_SIZE,
             max_seq_len=MAX_SEQ_LEN,
@@ -459,8 +486,92 @@ class ProcessShardTest(unittest.TestCase):
             test_src_doc_min=TEST_MIN,
             val_cap_per_shard=1000,
             ssl_quota_per_shard=1000,
+            tokenization_contract_sha256=TOKENIZATION_CONTRACT_SHA256,
             instruction_ids=[],
         )
+        kwargs.update(overrides)
+        return build_one_shard(
+            0,
+            self.tmp_dir,
+            self.out_dir,
+            self.encode_target,
+            **kwargs,
+        )
+
+    def test_legacy_or_corrupt_sentinel_is_rebuilt(self):
+        self._run_via_build_one_shard()
+        sentinel = self.out_dir / "done" / "shard-00000.json"
+        align = self.out_dir / "jsonl" / "align" / "shard-00000.jsonl"
+        sentinel.write_text('{"n_align_written":1}\n', encoding="utf-8")
+        align.write_text('{"stale":true}\n', encoding="utf-8")
+
+        counters = self._run_via_build_one_shard()
+
+        self.assertEqual(counters.n_align_written, 1)
+        self.assertNotIn("stale", self._read_jsonl(align)[0])
+        self.assertEqual(json.loads(sentinel.read_text())["schema_version"], 2)
+
+    def test_changed_tokenizer_contract_or_build_parameters_rebuilds(self):
+        self._run_via_build_one_shard()
+
+        counters = self._run_via_build_one_shard(
+            tokenization_contract_sha256="b" * 64,
+            ssl_quota_per_shard=0,
+        )
+
+        self.assertEqual(counters.n_ssl_written, 0)
+        sentinel = json.loads(
+            (self.out_dir / "done" / "shard-00000.json").read_text()
+        )
+        self.assertEqual(
+            sentinel["tokenization_contract_sha256"],
+            "b" * 64,
+        )
+        self.assertEqual(
+            sentinel["build_parameters"]["ssl_quota_per_shard"],
+            0,
+        )
+
+    def test_mutated_output_invalidates_sentinel_and_rebuilds(self):
+        self._run_via_build_one_shard()
+        align = self.out_dir / "jsonl" / "align" / "shard-00000.jsonl"
+        align.write_text('{"stale":true}\n', encoding="utf-8")
+
+        self._run_via_build_one_shard()
+
+        self.assertNotIn("stale", self._read_jsonl(align)[0])
+
+    def test_aggregate_receipt_rejects_stale_unrequested_shard(self):
+        self._run_via_build_one_shard()
+        completion, semantics = _validated_shard_completion_manifest(
+            self.out_dir / "jsonl" / "align",
+            self.out_dir,
+            tokenization_contract_sha256=TOKENIZATION_CONTRACT_SHA256,
+            expected_semantics=None,
+        )
+        self.assertEqual(completion["sentinel_count"], 1)
+        self.assertEqual(len(completion["sentinel_manifest_sha256"]), 64)
+        self.assertEqual(semantics["n_image_tokens"], N_IMAGE_TOKENS)
+
+        stale_data = (
+            self.out_dir / "jsonl" / "align" / "shard-00001.jsonl"
+        )
+        stale_data.write_text('{"legacy":true}\n', encoding="utf-8")
+        stale_sentinel = self.out_dir / "done" / "shard-00001.json"
+        stale_sentinel.write_text(
+            json.dumps({"n_align_written": 1}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "schema|different tokenizer|producer",
+        ):
+            _validated_shard_completion_manifest(
+                self.out_dir / "jsonl" / "align",
+                self.out_dir,
+                tokenization_contract_sha256=TOKENIZATION_CONTRACT_SHA256,
+                expected_semantics=None,
+            )
 
     def test_crashed_shard_partial_outputs_are_rebuilt_not_left_stale(self):
         # Simulate a crash: write a stale align jsonl with no sentinel, then
@@ -523,6 +634,7 @@ class WorkerLoopContinuationTest(unittest.TestCase):
                 test_src_doc_min=TEST_MIN,
                 val_cap_per_shard=1000,
                 ssl_quota_per_shard=1000,
+                tokenization_contract_sha256=TOKENIZATION_CONTRACT_SHA256,
                 instruction_ids=[],
             )
 
@@ -575,6 +687,7 @@ class ValCapTest(unittest.TestCase):
                 test_src_doc_min=TEST_MIN,
                 val_cap_per_shard=0,
                 ssl_quota_per_shard=1000,
+                tokenization_contract_sha256=TOKENIZATION_CONTRACT_SHA256,
                 instruction_ids=[],
             )
             self.assertEqual(counters.n_val, 1)
@@ -605,6 +718,7 @@ class SSLQuotaTest(unittest.TestCase):
                 test_src_doc_min=TEST_MIN,
                 val_cap_per_shard=1000,
                 ssl_quota_per_shard=0,
+                tokenization_contract_sha256=TOKENIZATION_CONTRACT_SHA256,
                 instruction_ids=[],
             )
             self.assertEqual(counters.n_align_written, 1)
@@ -807,6 +921,7 @@ class HanshiProcessVirtualShardTest(unittest.TestCase):
             test_src_doc_min=TEST_MIN,
             val_cap_per_shard=1000,
             ssl_quota_per_shard=1000,
+            tokenization_contract_sha256=TOKENIZATION_CONTRACT_SHA256,
             instruction_ids=[],
         )
         kwargs.update(overrides)
@@ -927,8 +1042,11 @@ class HanshiProcessVirtualShardTest(unittest.TestCase):
         sentinel_path = self.out_dir / "done" / f"shard-{output_shard_number:05d}.json"
         with sentinel_path.open() as fh:
             payload = json.load(fh)
-        self.assertEqual(payload["n_align_written"], counters.n_align_written)
-        self.assertEqual(payload["n_samples_seen"], 6)
+        self.assertEqual(
+            payload["counters"]["n_align_written"],
+            counters.n_align_written,
+        )
+        self.assertEqual(payload["counters"]["n_samples_seen"], 6)
 
     def test_rerun_via_build_one_hanshi_virtual_shard_skips_and_counters_unchanged(self):
         rows = self._kept_rows_for_virtual_shard(0)
@@ -941,6 +1059,7 @@ class HanshiProcessVirtualShardTest(unittest.TestCase):
             test_src_doc_min=TEST_MIN,
             val_cap_per_shard=1000,
             ssl_quota_per_shard=1000,
+            tokenization_contract_sha256=TOKENIZATION_CONTRACT_SHA256,
             instruction_ids=[],
         )
         first = build_one_hanshi_virtual_shard(
@@ -950,11 +1069,10 @@ class HanshiProcessVirtualShardTest(unittest.TestCase):
         align_path = self.out_dir / "jsonl" / "align" / f"shard-{output_shard_number:05d}.jsonl"
         mtime_before = align_path.stat().st_mtime_ns
 
-        # Second call passes an EMPTY rows list to prove the sentinel short-
-        # circuits actual (re)processing rather than happening to reprocess
-        # identical rows and land on the same counters by coincidence.
+        # The worker must see current rows so it can bind their digest before
+        # trusting the sentinel; unchanged rows still skip image processing.
         second = build_one_hanshi_virtual_shard(
-            output_shard_number, [], self.pages_root, self.out_dir,
+            output_shard_number, rows, self.pages_root, self.out_dir,
             self.encode_target, **kwargs,
         )
 
@@ -977,6 +1095,7 @@ class HanshiProcessVirtualShardTest(unittest.TestCase):
             test_src_doc_min=TEST_MIN,
             val_cap_per_shard=1000,
             ssl_quota_per_shard=1000,
+            tokenization_contract_sha256=TOKENIZATION_CONTRACT_SHA256,
             instruction_ids=[],
         )
         counters = build_one_hanshi_virtual_shard(

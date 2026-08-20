@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import shutil
@@ -16,6 +17,9 @@ import torch
 import torch.nn as nn
 
 from Model.training.dist import is_distributed, is_main_process
+
+NO_UPDATE_PROGRESS_SCHEMA_VERSION = 1
+NO_UPDATE_PROGRESS_FILENAME = "NO_UPDATE_PROGRESS.pt"
 
 
 @dataclass
@@ -120,7 +124,14 @@ def _rng_state() -> dict[str, Any]:
     try:
         import numpy as np
 
-        state["numpy"] = np.random.get_state()
+        numpy_state = np.random.get_state()
+        state["numpy_safe_v1"] = {
+            "bit_generator": str(numpy_state[0]),
+            "keys": torch.from_numpy(numpy_state[1].copy()),
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        }
     except ImportError:  # pragma: no cover - numpy is an optional dep
         pass
     if torch.cuda.is_available():
@@ -150,7 +161,31 @@ def _restore_rng(state: dict[str, Any]) -> None:
         torch.set_rng_state(state["cpu"])
     if "python" in state:
         random.setstate(state["python"])
-    if "numpy" in state:
+    if "numpy_safe_v1" in state:
+        numpy_state = state["numpy_safe_v1"]
+        if not isinstance(numpy_state, dict) or set(numpy_state) != {
+            "bit_generator",
+            "keys",
+            "position",
+            "has_gauss",
+            "cached_gaussian",
+        } or not isinstance(numpy_state["keys"], torch.Tensor):
+            raise ValueError("checkpoint NumPy RNG state is malformed")
+        try:
+            import numpy as np
+
+            np.random.set_state(
+                (
+                    str(numpy_state["bit_generator"]),
+                    numpy_state["keys"].cpu().numpy(),
+                    int(numpy_state["position"]),
+                    int(numpy_state["has_gauss"]),
+                    float(numpy_state["cached_gaussian"]),
+                )
+            )
+        except ImportError:  # pragma: no cover
+            pass
+    elif "numpy" in state:
         try:
             import numpy as np
 
@@ -352,6 +387,218 @@ def resolve_checkpoint_dir(path: str | Path) -> Path:
     return p
 
 
+def validate_resumable_checkpoint(
+    path: str | Path,
+    *,
+    require_scaler: bool = False,
+    context: str = "--resume",
+) -> Path:
+    """Validate the complete state required to continue an optimizer run.
+
+    Initialization checkpoints may intentionally contain model weights only,
+    but a formal resume must restore the optimizer, scheduler, RNG, metadata,
+    and (for CUDA fp16) loss scaler together. ``save_checkpoint`` publishes
+    ``COMPLETE`` last, so accepting fewer members would let an interrupted
+    directory advance the data cursor while silently resetting training state.
+    """
+
+    checkpoint_dir = resolve_checkpoint_dir(path)
+    required = [
+        "COMPLETE",
+        "model.pt",
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng.pt",
+        "meta.pt",
+    ]
+    if require_scaler:
+        required.append("scaler.pt")
+    missing_or_empty = sorted(
+        name
+        for name in required
+        if (checkpoint_dir / name).is_symlink()
+        or not (checkpoint_dir / name).is_file()
+        or (checkpoint_dir / name).stat().st_size == 0
+    )
+    if missing_or_empty:
+        raise ValueError(
+            f"{context} requires a complete resumable checkpoint; "
+            "missing or empty: " + ", ".join(missing_or_empty)
+        )
+
+    try:
+        marker = (checkpoint_dir / "COMPLETE").read_text(
+            encoding="ascii"
+        ).strip()
+        meta = torch.load(
+            checkpoint_dir / "meta.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+    except (EOFError, OSError, UnicodeError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"{context} checkpoint completion metadata is unreadable: {exc}"
+        ) from exc
+    if not isinstance(meta, dict):
+        raise ValueError(f"{context} checkpoint meta.pt is not a dictionary")
+    metadata = meta.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError(
+            f"{context} checkpoint metadata payload is not a dictionary"
+        )
+    step = meta.get("step")
+    if type(step) is not int or step < 0:
+        raise ValueError(f"{context} checkpoint meta.pt has no valid step")
+    if marker != f"step={step}":
+        raise ValueError(
+            f"{context} checkpoint COMPLETE/meta.pt step mismatch: "
+            f"{marker!r} != 'step={step}'"
+        )
+    return checkpoint_dir
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _no_update_progress_path(checkpoint_dir: Path) -> Path:
+    return checkpoint_dir.parent / NO_UPDATE_PROGRESS_FILENAME
+
+
+def save_no_update_progress(
+    checkpoint: str | Path,
+    *,
+    contract_sha256: str,
+    state: dict[str, Any],
+) -> Path:
+    """Durably journal progress made while optimizer state is unchanged.
+
+    The journal is intentionally small: it anchors to an already complete
+    checkpoint's ``meta.pt`` and stores only control state plus every rank's
+    RNG. Callers must use it solely for rollouts where no parameter, optimizer,
+    scheduler, or scaler update occurred.
+    """
+
+    checkpoint_dir = validate_resumable_checkpoint(
+        checkpoint,
+        context="no-update progress anchor",
+    )
+    if (
+        not isinstance(contract_sha256, str)
+        or len(contract_sha256) != 64
+        or any(ch not in "0123456789abcdef" for ch in contract_sha256)
+    ):
+        raise ValueError("no-update progress contract SHA-256 is invalid")
+    if not isinstance(state, dict):
+        raise TypeError("no-update progress state must be a dictionary")
+    meta = torch.load(
+        checkpoint_dir / "meta.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    step = int(meta["step"])
+    rng_state = _checkpoint_rng_state()
+    destination = _no_update_progress_path(checkpoint_dir)
+    if not is_main_process():
+        return destination
+    if destination.is_symlink():
+        raise ValueError(
+            f"no-update progress journal must not be a symlink: {destination}"
+        )
+    payload = {
+        "schema_version": NO_UPDATE_PROGRESS_SCHEMA_VERSION,
+        "kind": "training_no_update_progress",
+        "anchor_step": step,
+        "anchor_meta_sha256": _file_sha256(checkpoint_dir / "meta.pt"),
+        "contract_sha256": contract_sha256,
+        "state": state,
+        "rng_state": rng_state,
+    }
+    temporary = destination.with_name(
+        f".{destination.name}.tmp-{os.getpid()}"
+    )
+    try:
+        _durable_torch_save(payload, temporary)
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return destination
+
+
+def load_no_update_progress(
+    checkpoint: str | Path,
+    *,
+    contract_sha256: str,
+) -> dict[str, Any] | None:
+    """Load a journal only when it anchors the exact resumed checkpoint."""
+
+    checkpoint_dir = resolve_checkpoint_dir(checkpoint)
+    source = _no_update_progress_path(checkpoint_dir)
+    if not source.exists():
+        return None
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(
+            f"no-update progress journal must be a regular file: {source}"
+        )
+    try:
+        payload = torch.load(source, map_location="cpu", weights_only=True)
+    except (EOFError, OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"no-update progress journal is unreadable: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("no-update progress journal must be a dictionary")
+    if payload.get("schema_version") != NO_UPDATE_PROGRESS_SCHEMA_VERSION:
+        raise ValueError("no-update progress journal schema differs from runtime")
+    if payload.get("kind") != "training_no_update_progress":
+        raise ValueError("no-update progress journal kind is invalid")
+
+    meta = torch.load(
+        checkpoint_dir / "meta.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    checkpoint_step = int(meta["step"])
+    if payload.get("anchor_step") != checkpoint_step:
+        # A newer complete checkpoint supersedes the old no-update journal.
+        return None
+    if payload.get("anchor_meta_sha256") != _file_sha256(
+        checkpoint_dir / "meta.pt"
+    ):
+        raise ValueError(
+            "no-update progress journal anchors different checkpoint metadata"
+        )
+    if payload.get("contract_sha256") != contract_sha256:
+        raise ValueError("no-update progress journal data contract differs")
+    if not isinstance(payload.get("state"), dict):
+        raise ValueError("no-update progress journal state is malformed")
+    if not isinstance(payload.get("rng_state"), dict):
+        raise ValueError("no-update progress journal RNG state is malformed")
+    return payload
+
+
+def restore_rng_state(state: dict[str, Any]) -> None:
+    """Restore the current rank from a checkpoint/journal RNG payload."""
+
+    _restore_rng(state)
+
+
+def clear_no_update_progress(checkpoint: str | Path) -> None:
+    """Remove the generated journal after a newer full checkpoint is durable."""
+
+    if not is_main_process():
+        return
+    checkpoint_dir = resolve_checkpoint_dir(checkpoint)
+    destination = _no_update_progress_path(checkpoint_dir)
+    if destination.exists() or destination.is_symlink():
+        destination.unlink()
+        _fsync_directory(destination.parent)
+
+
 def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
     """Load only a checkpoint's user metadata, without loading model weights."""
 
@@ -359,7 +606,7 @@ def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
     meta_path = p / "meta.pt"
     if not meta_path.exists():
         return {}
-    meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+    meta = torch.load(meta_path, map_location="cpu", weights_only=True)
     if not isinstance(meta, dict):
         raise TypeError(f"checkpoint metadata must be a dict: {meta_path}")
     payload = meta.get("metadata", meta)
@@ -371,7 +618,7 @@ def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
 def load_checkpoint(path: str | Path) -> CheckpointPayload:
     p = resolve_checkpoint_dir(path)
 
-    model_state = torch.load(p / "model.pt", map_location="cpu", weights_only=False)
+    model_state = torch.load(p / "model.pt", map_location="cpu", weights_only=True)
     opt_path = p / "optimizer.pt"
     sched_path = p / "scheduler.pt"
     rng_path = p / "rng.pt"
@@ -379,27 +626,27 @@ def load_checkpoint(path: str | Path) -> CheckpointPayload:
     scaler_path = p / "scaler.pt"
 
     opt_state = (
-        torch.load(opt_path, map_location="cpu", weights_only=False)
+        torch.load(opt_path, map_location="cpu", weights_only=True)
         if opt_path.exists()
         else None
     )
     sched_state = (
-        torch.load(sched_path, map_location="cpu", weights_only=False)
+        torch.load(sched_path, map_location="cpu", weights_only=True)
         if sched_path.exists()
         else None
     )
     rng_state = (
-        torch.load(rng_path, map_location="cpu", weights_only=False)
+        torch.load(rng_path, map_location="cpu", weights_only=True)
         if rng_path.exists()
         else {}
     )
     meta = (
-        torch.load(meta_path, map_location="cpu", weights_only=False)
+        torch.load(meta_path, map_location="cpu", weights_only=True)
         if meta_path.exists()
         else {"step": 0, "metadata": {}}
     )
     scaler_state = (
-        torch.load(scaler_path, map_location="cpu", weights_only=False)
+        torch.load(scaler_path, map_location="cpu", weights_only=True)
         if scaler_path.exists()
         else None
     )
@@ -447,9 +694,16 @@ def resume_state(
 
 __all__ = [
     "CheckpointPayload",
+    "NO_UPDATE_PROGRESS_FILENAME",
+    "NO_UPDATE_PROGRESS_SCHEMA_VERSION",
+    "clear_no_update_progress",
     "load_checkpoint",
     "load_checkpoint_metadata",
+    "load_no_update_progress",
     "resolve_checkpoint_dir",
+    "restore_rng_state",
     "resume_state",
+    "save_no_update_progress",
     "save_checkpoint",
+    "validate_resumable_checkpoint",
 ]

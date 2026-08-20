@@ -10,22 +10,39 @@ import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
 from Model.config import OMVTConfig, RDTConfig, TrainingConfig
 from Model.model import RDTForCausalLM
+from Model.ocr.alignment_contract import (
+    OCR_ALIGNMENT_DATA_SCHEMA_VERSION,
+    OCR_IMAGE_BINDING_MODE,
+)
+from Model.ocr.position_contract import BOUNDARY_V1
+from Model.ocr.tokenization import (
+    OCR_NATIVE_TARGET_ENCODING,
+    OCR_TOKENIZATION_CONTRACT_VERSION,
+    canonical_json_sha256,
+)
 from Model.omvt import OMVTInjector, collate_omvt_batch
-from Model.posttrain.checkpointing import reconstruct_policy_from_checkpoint
-from Model.posttrain.checkpointing import OCR_GRPO_CONTRACT_VERSION
+from Model.posttrain.checkpointing import (
+    OCR_GRPO_CONTRACT_VERSION,
+    load_verified_policy_metadata,
+    reconstruct_policy_from_checkpoint,
+    validate_visual_ocr_source_contract,
+)
 from Model.posttrain.grpo import (
     GRPOConfig,
+    combine_pixel_values,
     grpo_compute_loss,
     grpo_loss,
     repeat_pixel_values,
     sample_group,
 )
 from Model.posttrain.ocr_decode import INVALID_OCR_TOKEN, decode_ocr_completion
+from Model.posttrain.ocr_eval import build_ocr_pixel_batch
 from Model.posttrain.preference_data import OCRPromptDataset
 from Model.posttrain.rewards import (
     RewardConfig,
@@ -88,6 +105,9 @@ class OCRRewardTest(unittest.TestCase):
         self.assertEqual(args.train_scope, "vision")
         self.assertEqual(args.temperature, 1.0)
         self.assertIsNone(args.top_p)
+        self.assertIsNone(args.clip_eps)
+        self.assertEqual(args.advantage_mode, "centered")
+        self.assertEqual(args.max_behavior_log_ratio, 5e-3)
 
     def test_vision_scope_freezes_every_language_parameter(self):
         from scripts.train_grpo import _configure_trainable_scope
@@ -430,6 +450,48 @@ class OCRPromptDatasetTest(unittest.TestCase):
                     require_sha256=False,
                 )
 
+    def test_hot_path_rejects_image_mutated_after_lightweight_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = root / "photo.png"
+            self._image(image)
+            digest = hashlib.sha256(image.read_bytes()).hexdigest()
+            manifest = root / "rl.jsonl"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "id": "p1",
+                        "split": "rl_train",
+                        "image": image.name,
+                        "sha256": digest,
+                        "reference": "abc",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            dataset = OCRPromptDataset(
+                manifest,
+                encode=lambda _text: [],
+                n_image_tokens=1,
+                bos_id=2,
+                image_start_id=6,
+                image_patch_id=7,
+                image_end_id=8,
+                verify_image_decode=False,
+                verify_sha256=False,
+            )
+
+            image.write_bytes(b"mutated-after-dataset-construction")
+
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                build_ocr_pixel_batch(
+                    [dataset[0]],
+                    lambda _images: torch.zeros(1, 3, 16, 16),
+                    _tiny_omvt(),
+                    torch.device("cpu"),
+                )
+
 
 class MultimodalGRPOTest(unittest.TestCase):
     def test_generation_attention_distinguishes_sampled_and_fill_pad(self):
@@ -495,12 +557,19 @@ class MultimodalGRPOTest(unittest.TestCase):
             parameter.requires_grad_(False)
         prompt = torch.tensor([cfg.bos_id, 300])
 
-        def fake_generate(input_ids, **_kwargs):
+        def fake_generate(input_ids, *, on_sample=None, **_kwargs):
             tails = torch.tensor(
                 [[cfg.pad_id, 301, cfg.eos_id, cfg.pad_id],
                  [302, cfg.eos_id, cfg.pad_id, cfg.pad_id]],
                 device=input_ids.device,
             )
+            if on_sample is not None:
+                for step in range(tails.shape[1]):
+                    on_sample(
+                        step,
+                        tails[:, step],
+                        torch.zeros(input_ids.shape[0], device=input_ids.device),
+                    )
             return torch.cat([input_ids, tails], dim=1)
 
         policy.generate = fake_generate  # type: ignore[method-assign]
@@ -570,14 +639,30 @@ class MultimodalGRPOTest(unittest.TestCase):
         )
         pixels = torch.randn(1, 1, 4)
         seen = {"rollout": 0, "policy": 0, "reference": 0}
+        seen_contracts: list[tuple[str, str | None]] = []
 
-        def fake_generate(input_ids, *, pixel_values=None, **_kwargs):
+        def fake_generate(
+            input_ids,
+            *,
+            pixel_values=None,
+            on_sample=None,
+            **_kwargs,
+        ):
             self.assertIsNotNone(pixel_values)
             self.assertEqual(pixel_values.shape[0], 4)
+            seen_contracts.append(
+                ("rollout", _kwargs.get("position_contract"))
+            )
             seen["rollout"] += 1
             tails = torch.tensor(
                 [[300], [301], [300], [301]], device=input_ids.device
             )
+            if on_sample is not None:
+                on_sample(
+                    0,
+                    tails[:, 0],
+                    torch.zeros(input_ids.shape[0], device=input_ids.device),
+                )
             return torch.cat([input_ids, tails], dim=1)
 
         policy.generate = fake_generate  # type: ignore[method-assign]
@@ -586,11 +671,17 @@ class MultimodalGRPOTest(unittest.TestCase):
 
         def policy_spy(*args, pixel_values=None, **kwargs):
             self.assertIsNotNone(pixel_values)
+            seen_contracts.append(
+                ("policy", kwargs.get("position_contract"))
+            )
             seen["policy"] += 1
             return policy_forward(*args, pixel_values=pixel_values, **kwargs)
 
         def reference_spy(*args, pixel_values=None, **kwargs):
             self.assertIsNotNone(pixel_values)
+            seen_contracts.append(
+                ("reference", kwargs.get("position_contract"))
+            )
             seen["reference"] += 1
             return reference_forward(*args, pixel_values=pixel_values, **kwargs)
 
@@ -610,9 +701,18 @@ class MultimodalGRPOTest(unittest.TestCase):
             pad_id=cfg.pad_id,
             eos_id=cfg.eos_id,
             pixel_values=[pixels, pixels.clone()],
+            position_contract=BOUNDARY_V1,
         )
         loss.backward()
         self.assertEqual(seen, {"rollout": 1, "policy": 1, "reference": 1})
+        self.assertEqual(
+            seen_contracts,
+            [
+                ("rollout", BOUNDARY_V1),
+                ("policy", BOUNDARY_V1),
+                ("reference", BOUNDARY_V1),
+            ],
+        )
         self.assertGreater(metrics["reward_std"], 0.0)
         vision_grad = policy.vision.encoder.patch_embed.weight.grad
         self.assertIsNotNone(vision_grad)
@@ -650,6 +750,110 @@ class MultimodalGRPOTest(unittest.TestCase):
             handle.remove()
         self.assertEqual(len(calls), 1)
 
+    def test_two_image_omvt_repeat_preserves_group_order_and_logits(self):
+        torch.manual_seed(0)
+        rdt_cfg, omvt_cfg = _tiny_rdt(), _tiny_omvt()
+        model = RDTForCausalLM(rdt_cfg).eval()
+        model.vision._omvt_cfg = omvt_cfg
+        model.vision.omvt = OMVTInjector(rdt_cfg, omvt_cfg)
+        prompt = torch.tensor(
+            [[
+                rdt_cfg.bos_id,
+                rdt_cfg.image_start_id,
+                rdt_cfg.image_patch_id,
+                rdt_cfg.image_patch_id,
+                rdt_cfg.image_end_id,
+            ]]
+        )
+        repeats = 4
+        unique_prompts = prompt.expand(2, -1).contiguous()
+        input_ids = unique_prompts.repeat_interleave(repeats, dim=0)
+        images = torch.randn(2, 3, 16, 16)
+        pixels = dict(collate_omvt_batch(images, omvt_cfg))
+        grouped = combine_pixel_values(
+            [
+                repeat_pixel_values(
+                    dict(collate_omvt_batch(images[index:index + 1], omvt_cfg)),
+                    repeats,
+                )
+                for index in range(images.shape[0])
+            ]
+        )
+        with torch.no_grad():
+            legacy = model(input_ids, pixel_values=grouped)["logits"]
+            unique = model(
+                input_ids,
+                pixel_values=pixels,
+                pixel_repeats=repeats,
+            )["logits"]
+        torch.testing.assert_close(unique, legacy, rtol=1e-6, atol=1e-6)
+        self.assertTrue(
+            torch.equal(unique.argmax(dim=-1), legacy.argmax(dim=-1))
+        )
+
+    def test_grpo_omvt_tower_processes_only_unique_images_per_stage(self):
+        torch.manual_seed(0)
+        rdt_cfg, omvt_cfg = _tiny_rdt(), _tiny_omvt()
+        policy = RDTForCausalLM(rdt_cfg).eval()
+        policy.vision._omvt_cfg = omvt_cfg
+        policy.vision.omvt = OMVTInjector(rdt_cfg, omvt_cfg)
+        reference = RDTForCausalLM(rdt_cfg).eval()
+        reference.vision._omvt_cfg = omvt_cfg
+        reference.vision.omvt = OMVTInjector(rdt_cfg, omvt_cfg)
+        reference.load_state_dict(policy.state_dict())
+        for parameter in reference.parameters():
+            parameter.requires_grad_(False)
+
+        prompt = torch.tensor(
+            [
+                rdt_cfg.bos_id,
+                rdt_cfg.image_start_id,
+                rdt_cfg.image_patch_id,
+                rdt_cfg.image_patch_id,
+                rdt_cfg.image_end_id,
+            ]
+        )
+        pixels = [
+            dict(
+                collate_omvt_batch(
+                    torch.randn(1, 3, 16, 16),
+                    omvt_cfg,
+                )
+            )
+            for _ in range(2)
+        ]
+        image_batch_sizes: list[int] = []
+
+        def record_batch(_module, args):
+            image_batch_sizes.append(int(args[0]["images"].shape[0]))
+
+        handles = [
+            policy.vision.omvt.tower.register_forward_pre_hook(record_batch),
+            reference.vision.omvt.tower.register_forward_pre_hook(record_batch),
+        ]
+        try:
+            loss, _ = grpo_compute_loss(
+                policy,
+                reference,
+                [prompt, prompt.clone()],
+                lambda _responses, _idx: torch.arange(4, dtype=torch.float32),
+                lambda ids: str(int(ids[0])),
+                GRPOConfig(
+                    group_size=4,
+                    max_new_tokens=1,
+                    recurrent_steps=1,
+                ),
+                eos_id=rdt_cfg.eos_id,
+                pad_id=rdt_cfg.pad_id,
+                pixel_values=pixels,
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(image_batch_sizes, [2, 2, 2])
+        self.assertEqual(sum(image_batch_sizes), 6)
+
     def test_ocr_grpo_backpropagates_into_omvt_tower_and_projector(self):
         from scripts.train_grpo import _configure_trainable_scope
 
@@ -677,8 +881,14 @@ class MultimodalGRPOTest(unittest.TestCase):
         )
         pixels = dict(collate_omvt_batch(torch.randn(1, 3, 16, 16), omvt_cfg))
 
-        def fake_generate(input_ids, **_kwargs):
+        def fake_generate(input_ids, *, on_sample=None, **_kwargs):
             tails = torch.tensor([[300], [301]], device=input_ids.device)
+            if on_sample is not None:
+                on_sample(
+                    0,
+                    tails[:, 0],
+                    torch.zeros(input_ids.shape[0], device=input_ids.device),
+                )
             return torch.cat([input_ids, tails], dim=1)
 
         policy.generate = fake_generate  # type: ignore[method-assign]
@@ -711,10 +921,23 @@ class MultimodalGRPOTest(unittest.TestCase):
         from scripts.train_grpo import _evaluate_ocr_validation
 
         class FakeDataset:
-            rows = [
-                {"prompt_ids": [2, 6, 7, 7, 8], "image": "a", "reference": "a"},
-                {"prompt_ids": [2, 6, 7, 7, 8], "image": "b", "reference": "a"},
-            ]
+            def __init__(self, image: Path, digest: str):
+                self.rows = [
+                    {
+                        "id": "a",
+                        "prompt_ids": [2, 6, 7, 7, 8],
+                        "image": str(image),
+                        "sha256": digest,
+                        "reference": "a",
+                    },
+                    {
+                        "id": "b",
+                        "prompt_ids": [2, 6, 7, 7, 8],
+                        "image": str(image),
+                        "sha256": digest,
+                        "reference": "a",
+                    },
+                ]
 
             def __len__(self):
                 return len(self.rows)
@@ -730,28 +953,36 @@ class MultimodalGRPOTest(unittest.TestCase):
                 )
                 return torch.cat([input_ids, tail], dim=1)
 
-        model = FakeModel()
-        metrics = _evaluate_ocr_validation(
-            model,
-            FakeDataset(),
-            lambda images: torch.zeros(len(images), 3, 16, 16),
-            _tiny_omvt(),
-            lambda ids: decode_ocr_completion(
-                ids,
-                lambda content: "a" if content == [300] else "",
-                valid_token_ids={3, 300},
-            ),
-            batch_size=2,
-            max_new_tokens=2,
-            recurrent_steps=1,
-            precision="fp32",
-            device=torch.device("cpu"),
-            cer_backend="python",
-        )
-        self.assertTrue(model.greedy)
-        self.assertEqual(metrics["grapheme_cer"], 0.0)
-        self.assertEqual(metrics["line_exact"], 1.0)
-        self.assertEqual(metrics["eos_rate"], 1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "photo.png"
+            OCRPromptDatasetTest()._image(image)
+            digest = hashlib.sha256(image.read_bytes()).hexdigest()
+            model = FakeModel()
+            metrics = _evaluate_ocr_validation(
+                model,
+                FakeDataset(image, digest),
+                lambda images: torch.zeros(len(images), 3, 16, 16),
+                _tiny_omvt(),
+                lambda ids: decode_ocr_completion(
+                    ids,
+                    lambda content: "a" if content == [300] else "",
+                    valid_token_ids={3, 300},
+                ),
+                batch_size=2,
+                max_new_tokens=2,
+                recurrent_steps=1,
+                precision="fp32",
+                device=torch.device("cpu"),
+                cer_backend="python",
+                morphology_track_table=torch.zeros(
+                    _tiny_rdt().vocab_size,
+                    dtype=torch.long,
+                ),
+            )
+            self.assertTrue(model.greedy)
+            self.assertEqual(metrics["grapheme_cer"], 0.0)
+            self.assertEqual(metrics["line_exact"], 1.0)
+            self.assertEqual(metrics["eos_rate"], 1.0)
 
 
 class StrictCheckpointTest(unittest.TestCase):
@@ -775,14 +1006,293 @@ class StrictCheckpointTest(unittest.TestCase):
         torch.save({"step": 1, "metadata": metadata}, step / "meta.pt")
         return step
 
+    def _write_visual_contract(
+        self,
+        step: Path,
+        *,
+        mutate=None,
+    ) -> dict:
+        contract = {
+            "target_encoding": OCR_NATIVE_TARGET_ENCODING,
+            "tokenization_contract_version": (
+                OCR_TOKENIZATION_CONTRACT_VERSION
+            ),
+            "tokenizer_manifest_canonical_sha256": "manifest-sha",
+            "tokenizer_vocab_sha256": "vocab-sha",
+            "tokenizer_bundle": {
+                "schema_version": 1,
+                "files": [
+                    {
+                        "role": "config",
+                        "name": "config.json",
+                        "size_bytes": 1,
+                        "sha256": "a" * 64,
+                    },
+                    {
+                        "role": "morphbpe",
+                        "name": "morphbpe.json",
+                        "size_bytes": 2,
+                        "sha256": "b" * 64,
+                    },
+                    {
+                        "role": "general",
+                        "name": "general.json",
+                        "size_bytes": 3,
+                        "sha256": "c" * 64,
+                    },
+                    {
+                        "role": "vocab",
+                        "name": "vocab.json",
+                        "size_bytes": 4,
+                        "sha256": "d" * 64,
+                    },
+                    {
+                        "role": "manifest",
+                        "name": "manifest.json",
+                        "size_bytes": 5,
+                        "sha256": "e" * 64,
+                    },
+                ],
+                "files_canonical_sha256": "f" * 64,
+            },
+            "pretraining_tokenizer_algorithm": {
+                "contract_version": 1,
+                "files": {"Tokenizer/unified/dual_tokenizer.py": "9" * 64},
+            },
+            "native_route": "dual-track-pretraining-special-aware",
+            "mongolian_general_fallback": "forbidden",
+            "reference_canonicalization": "native-pretraining-v3",
+        }
+        meta_path = step / "meta.pt"
+        payload = torch.load(meta_path, map_location="cpu", weights_only=False)
+        entries = [
+            {
+                "name": "align.jsonl",
+                "sha256": "f" * 64,
+                "size_bytes": 1,
+            }
+        ]
+        data_contract = {
+            "schema_version": OCR_ALIGNMENT_DATA_SCHEMA_VERSION,
+            "kind": "pretokenized_ocr_alignment",
+            "data_layout": "single_jsonl",
+            "data_file_count": 1,
+            "data_files": entries,
+            "data_sha256": canonical_json_sha256(entries),
+            "image_binding": OCR_IMAGE_BINDING_MODE,
+            "image_manifest_sha256": "8" * 64,
+            "image_reference_count": 1,
+            "image_total_size_bytes": 1,
+            "shard_completion": {
+                "mode": "direct_builder_v1",
+                "sentinel_count": 0,
+                "sentinels": [],
+                "sentinel_manifest_sha256": canonical_json_sha256([]),
+            },
+            "ocr_tokenization_contract": json.loads(json.dumps(contract)),
+        }
+        payload["metadata"].update(
+            {
+                "phase": "vlm_align",
+                "freeze_rdt": True,
+                "frozen_vision": False,
+                "ocr_target_encoding": OCR_NATIVE_TARGET_ENCODING,
+                "ocr_tokenization_contract_version": (
+                    OCR_TOKENIZATION_CONTRACT_VERSION
+                ),
+                "final": True,
+                "stop_reason": "loss_plateau",
+                "source_rdt_tokenizer_bundle": json.loads(
+                    json.dumps(contract["tokenizer_bundle"])
+                ),
+                "source_rdt_tokenizer_algorithm": dict(
+                    contract["pretraining_tokenizer_algorithm"]
+                ),
+                "ocr_data_contract": data_contract,
+            }
+        )
+        if mutate is not None:
+            mutate(payload["metadata"])
+        torch.save(payload, meta_path)
+        (step / "COMPLETE").write_text("step=1\n", encoding="ascii")
+        return contract
+
+    def test_visual_source_contract_binds_native_tokenizer_and_weights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            step = self._write_checkpoint(Path(tmp))
+            contract = self._write_visual_contract(step)
+            lineage = validate_visual_ocr_source_contract(
+                torch.load(
+                    step / "meta.pt",
+                    map_location="cpu",
+                    weights_only=False,
+                )["metadata"],
+                step,
+                contract,
+                tokenizer_vocab_extent=_tiny_rdt().vocab_size,
+            )
+            self.assertEqual(
+                lineage["visual_corpus_manifest_sha256"],
+                canonical_json_sha256(
+                    [
+                        {
+                            "name": "align.jsonl",
+                            "sha256": "f" * 64,
+                            "size_bytes": 1,
+                        }
+                    ]
+                ),
+            )
+            self.assertEqual(
+                len(lineage["source_checkpoint_model_sha256"]),
+                64,
+            )
+            self.assertEqual(
+                len(lineage["source_checkpoint_metadata_sha256"]),
+                64,
+            )
+
+    def test_visual_source_contract_rejects_every_tokenization_mismatch(self):
+        mutations = {
+            "phase": lambda meta: meta.update(phase="sft"),
+            "language-not-frozen": lambda meta: meta.update(freeze_rdt=False),
+            "missing-vision-state": lambda meta: meta.pop("frozen_vision"),
+            "target-mode": lambda meta: meta.update(
+                ocr_target_encoding="byte_fallback"
+            ),
+            "top-version": lambda meta: meta.update(
+                ocr_tokenization_contract_version=1
+            ),
+            "data-token-version": lambda meta: meta[
+                "ocr_data_contract"
+            ]["ocr_tokenization_contract"].update(
+                tokenization_contract_version=1
+            ),
+            "data-manifest-sha": lambda meta: meta[
+                "ocr_data_contract"
+            ]["ocr_tokenization_contract"].update(
+                tokenizer_manifest_canonical_sha256="different"
+            ),
+            "periodic": lambda meta: meta.update(final=False),
+            "non-terminal": lambda meta: meta.update(stop_reason=""),
+            "source-tokenizer": lambda meta: meta[
+                "source_rdt_tokenizer_bundle"
+            ]["files"][0].update(sha256="0" * 64),
+            "source-algorithm": lambda meta: meta[
+                "source_rdt_tokenizer_algorithm"
+            ].update({"contract_version": 999}),
+            "vocab-extent": lambda meta: meta["rdt_config"].update(
+                vocab_size=_tiny_rdt().vocab_size - 1
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                step = self._write_checkpoint(Path(tmp))
+                contract = self._write_visual_contract(step, mutate=mutate)
+                metadata = torch.load(
+                    step / "meta.pt",
+                    map_location="cpu",
+                    weights_only=False,
+                )["metadata"]
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "unsafe visual OCR source checkpoint",
+                ):
+                    validate_visual_ocr_source_contract(
+                        metadata,
+                        step,
+                        contract,
+                        tokenizer_vocab_extent=_tiny_rdt().vocab_size,
+                    )
+
     def test_reconstructs_and_strictly_loads_omvt(self):
         with tempfile.TemporaryDirectory() as tmp:
+            step = self._write_checkpoint(Path(tmp))
+            model_sha256 = hashlib.sha256((step / "model.pt").read_bytes()).hexdigest()
+            metadata_sha256 = hashlib.sha256((step / "meta.pt").read_bytes()).hexdigest()
             loaded = reconstruct_policy_from_checkpoint(
-                self._write_checkpoint(Path(tmp)),
+                step,
                 require_vision=True,
+                expected_model_sha256=model_sha256,
+                expected_metadata_sha256=metadata_sha256,
             )
             self.assertIsNotNone(loaded.model.vision.omvt)
             self.assertEqual(loaded.omvt_config.compress_to, 2)
+            self.assertEqual(loaded.model_sha256, model_sha256)
+            self.assertEqual(loaded.metadata_sha256, metadata_sha256)
+
+    def test_verified_metadata_accepts_meta_path_and_override_is_not_reloaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            step = self._write_checkpoint(Path(tmp))
+            metadata, metadata_sha256 = load_verified_policy_metadata(
+                step / "meta.pt"
+            )
+            model_sha256 = hashlib.sha256((step / "model.pt").read_bytes()).hexdigest()
+            real_torch_load = torch.load
+            with patch(
+                "Model.posttrain.checkpointing.torch.load",
+                wraps=real_torch_load,
+            ) as mocked_load:
+                loaded = reconstruct_policy_from_checkpoint(
+                    step,
+                    require_vision=True,
+                    metadata_override=metadata,
+                    expected_metadata_sha256=metadata_sha256,
+                    expected_model_sha256=model_sha256,
+                )
+            self.assertEqual(mocked_load.call_count, 1)
+            self.assertTrue(mocked_load.call_args.kwargs["weights_only"])
+            self.assertEqual(loaded.metadata_sha256, metadata_sha256)
+
+    def test_expected_model_hash_mismatch_fails_before_deserialization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            step = self._write_checkpoint(Path(tmp))
+            metadata, metadata_sha256 = load_verified_policy_metadata(step)
+            with patch("Model.posttrain.checkpointing.torch.load") as mocked_load:
+                with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                    reconstruct_policy_from_checkpoint(
+                        step,
+                        require_vision=True,
+                        metadata_override=metadata,
+                        expected_metadata_sha256=metadata_sha256,
+                        expected_model_sha256="0" * 64,
+                    )
+            mocked_load.assert_not_called()
+
+    def test_rejects_model_changed_during_same_fd_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            step = self._write_checkpoint(Path(tmp))
+            metadata, metadata_sha256 = load_verified_policy_metadata(step)
+            model_path = step / "model.pt"
+            real_torch_load = torch.load
+
+            def mutate_after_load(handle, **kwargs):
+                payload = real_torch_load(handle, **kwargs)
+                with model_path.open("ab") as output:
+                    output.write(b"mutation")
+                return payload
+
+            with patch(
+                "Model.posttrain.checkpointing.torch.load",
+                side_effect=mutate_after_load,
+            ):
+                with self.assertRaisesRegex(ValueError, "changed while being loaded"):
+                    reconstruct_policy_from_checkpoint(
+                        step,
+                        require_vision=True,
+                        metadata_override=metadata,
+                        expected_metadata_sha256=metadata_sha256,
+                    )
+
+    def test_rejects_symlinked_model_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            step = self._write_checkpoint(Path(tmp))
+            model_path = step / "model.pt"
+            target = step / "real-model.pt"
+            model_path.rename(target)
+            model_path.symlink_to(target.name)
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                reconstruct_policy_from_checkpoint(step, require_vision=True)
 
     def test_refuses_to_guess_omvt_geometry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -822,6 +1332,8 @@ class StrictCheckpointTest(unittest.TestCase):
                     "phase": "grpo_reference",
                     "contract_version": OCR_GRPO_CONTRACT_VERSION,
                     "source_checkpoint": "visual-source",
+                    "source_checkpoint_model_sha256": "",
+                    "ocr_tokenization_contract": {},
                     "immutable": True,
                 }
             )
@@ -830,6 +1342,9 @@ class StrictCheckpointTest(unittest.TestCase):
             saved_state = torch.load(
                 step / "model.pt", map_location="cpu", weights_only=False
             )
+            reference_model_sha256 = hashlib.sha256(
+                (step / "model.pt").read_bytes()
+            ).hexdigest()
             first_key = next(iter(saved_state))
 
             reference, resolved = _load_immutable_reference(
@@ -841,6 +1356,7 @@ class StrictCheckpointTest(unittest.TestCase):
                 0,
                 torch.device("cpu"),
                 require_vision=True,
+                expected_reference_model_sha256=reference_model_sha256,
             )
             self.assertEqual(resolved, step)
             self.assertTrue(
@@ -857,35 +1373,55 @@ class StrictCheckpointTest(unittest.TestCase):
                     0,
                     torch.device("cpu"),
                     require_vision=True,
+                    expected_reference_model_sha256=reference_model_sha256,
+                )
+
+            original_model = (step / "model.pt").read_bytes()
+            (step / "model.pt").write_bytes(original_model + b"tampered")
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                _load_immutable_reference(
+                    str(step),
+                    "visual-source",
+                    _tiny_rdt(),
+                    _tiny_omvt(),
+                    TrainingConfig(parallel="single", max_steps=1, warmup_steps=0),
+                    0,
+                    torch.device("cpu"),
+                    require_vision=True,
+                    expected_reference_model_sha256=reference_model_sha256,
                 )
 
     def test_resume_rejects_model_only_checkpoint(self):
-        from scripts.train_grpo import _validate_resumable_checkpoint_files
+        from Model.training.checkpoint import validate_resumable_checkpoint
 
         with tempfile.TemporaryDirectory() as tmp:
             step = Path(tmp) / "step_00000001"
             step.mkdir()
-            for name in ("COMPLETE", "model.pt", "meta.pt"):
-                (step / name).touch()
+            (step / "COMPLETE").write_text("step=1\n", encoding="ascii")
+            torch.save({}, step / "model.pt")
+            torch.save({"step": 1, "metadata": {}}, step / "meta.pt")
             with self.assertRaisesRegex(ValueError, "optimizer.pt"):
-                _validate_resumable_checkpoint_files(
+                validate_resumable_checkpoint(
                     step,
                     require_scaler=False,
+                    context="GRPO --resume",
                 )
 
             for name in ("optimizer.pt", "scheduler.pt", "rng.pt"):
-                (step / name).touch()
+                (step / name).write_bytes(name.encode("ascii"))
             self.assertEqual(
-                _validate_resumable_checkpoint_files(
+                validate_resumable_checkpoint(
                     step,
                     require_scaler=False,
+                    context="GRPO --resume",
                 ),
                 step,
             )
             with self.assertRaisesRegex(ValueError, "scaler.pt"):
-                _validate_resumable_checkpoint_files(
+                validate_resumable_checkpoint(
                     step,
                     require_scaler=True,
+                    context="GRPO --resume",
                 )
 
 

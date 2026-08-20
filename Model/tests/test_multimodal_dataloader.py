@@ -9,6 +9,7 @@ model, and produces a finite loss after one optimizer step.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 import unittest
@@ -195,6 +196,53 @@ class MultimodalDataloaderTest(unittest.TestCase):
             }
             with self.assertRaisesRegex(ValueError, "one image per row"):
                 coll([with_img, without])
+
+    def test_strict_ocr_collator_verifies_image_bytes_lazily(self) -> None:
+        omvt_cfg = OMVTConfig(
+            image_size=16,
+            d_vision=32,
+            vertical_patch=(8, 4),
+            horizontal_patch=(4, 8),
+            square_patch=(4, 4),
+            layout_patch=(16, 16),
+            compress_to=4,
+        )
+        coll = PretrainingCollator(
+            image_processor=PILImageProcessor(image_size=16),
+            omvt_cfg=omvt_cfg,
+            require_verified_images=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = os.path.join(tmp, "bound.png")
+            Image.new("RGB", (16, 16), color="white").save(image_path)
+            image_bytes = open(image_path, "rb").read()
+            row = {
+                "input_ids": [BOS_ID, IMAGE_PATCH_ID, EOS_ID],
+                "attention_mask": [1, 1, 1],
+                "labels": [BOS_ID, IMAGE_PATCH_ID, EOS_ID],
+                "images": [image_path],
+                "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
+                "image_size_bytes": len(image_bytes),
+            }
+            self.assertIn("pixel_values", coll([row]))
+
+            mutated = bytearray(image_bytes)
+            mutated[-1] ^= 1
+            with open(image_path, "wb") as handle:
+                handle.write(mutated)
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                coll([row])
+
+    def test_strict_ocr_collator_rejects_missing_image_binding(self) -> None:
+        coll = PretrainingCollator(require_verified_images=True)
+        row = {
+            "input_ids": [BOS_ID, IMAGE_PATCH_ID, EOS_ID],
+            "attention_mask": [1, 1, 1],
+            "labels": [BOS_ID, IMAGE_PATCH_ID, EOS_ID],
+            "images": ["/tmp/unbound.png"],
+        }
+        with self.assertRaisesRegex(ValueError, "image_sha256"):
+            coll([row])
 
 
 if __name__ == "__main__":  # pragma: no cover

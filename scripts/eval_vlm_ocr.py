@@ -45,9 +45,21 @@ import torch
 
 from Model.config import EOS_ID, IMAGE_PATCH_ID, OMVTConfig, PAD_ID, RDTConfig
 from Model.model import RDTForCausalLM
+from Model.ocr.alignment_contract import (
+    default_ocr_alignment_contract_path,
+    load_and_validate_ocr_alignment_data_contract,
+    read_verified_ocr_image_bytes,
+)
 from Model.ocr.data import build_ocr_row, split_ocr_row
 from Model.ocr.metrics import ocr_report
+from Model.ocr.tokenization import native_tokenization_contract
+from Model.ocr.position_contract import (
+    BOUNDARY_V1,
+    OCR_POSITION_CONTRACT_CHOICES,
+    resolve_checkpoint_ocr_position_contract,
+)
 from Model.omvt import OMVTInjector
+from Model.posttrain.checkpointing import validate_visual_ocr_source_contract
 from Model.omvt.patcher import collate_omvt_batch
 from Model.training import load_checkpoint_metadata, resolve_checkpoint_dir
 from Model.training.multimodal_cli import make_omvt_cfg
@@ -58,7 +70,19 @@ from scripts.train_rdt import CONFIG_CHOICES, _resolve_mamba_backend
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Generative OCR eval (CER) for VLM checkpoints")
     p.add_argument("--checkpoint", default="", help="train_vlm_align output root, step dir, or model.pt")
-    p.add_argument("--data", default="", help="alignment-row JSONL (build_vlm_ocr_data output)")
+    p.add_argument(
+        "--data",
+        default="",
+        help=(
+            "alignment-row JSONL from scripts.build_ocr_data_from_pairs or "
+            "scripts.build_ocr_data"
+        ),
+    )
+    p.add_argument(
+        "--ocr-data-contract",
+        default="",
+        help="immutable OCR data receipt; defaults beside --data",
+    )
     p.add_argument("--tokenizer-bundle", default="", help="unified tokenizer bundle dir (id -> text)")
     p.add_argument("--config", choices=list(CONFIG_CHOICES), default="tiny")
     p.add_argument("--mamba", choices=["auto", "official", "naive"], default="auto")
@@ -86,6 +110,15 @@ def parse_args(argv=None):
     p.add_argument("--blank-baseline", action="store_true",
                    help="also decode with an all-white page (language-prior-only CER)")
     p.add_argument("--repetition-penalty", type=float, default=1.0)
+    p.add_argument(
+        "--ocr-position-contract",
+        choices=OCR_POSITION_CONTRACT_CHOICES,
+        default=None,
+        help=(
+            "must match checkpoint metadata; historical checkpoints without "
+            "the field require explicit legacy_sequential_v0"
+        ),
+    )
     p.add_argument("--out", default="", help="write {image, ref, pred[, pred_blank]} JSONL here")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--smoke", action="store_true", help="synthetic CPU self-check")
@@ -112,6 +145,46 @@ def _checkpoint_metadata(path: str) -> dict:
     if p.is_file() and p.name != "model.pt":
         return {}
     return load_checkpoint_metadata(path)
+
+
+def _validate_checkpoint_tokenizer(
+    checkpoint: str,
+    bundle,
+    bundle_dir: str,
+    *,
+    require_terminal: bool,
+) -> dict:
+    """Bind an OCR checkpoint to its exact pretrained tokenizer runtime."""
+
+    token_contract = native_tokenization_contract(
+        bundle.tokenizer,
+        bundle_dir,
+    )
+    validate_visual_ocr_source_contract(
+        _checkpoint_metadata(checkpoint),
+        resolve_checkpoint_dir(checkpoint),
+        token_contract,
+        tokenizer_vocab_extent=(
+            max(int(value) for value in bundle.tokenizer.vocab.values()) + 1
+        ),
+        require_terminal=require_terminal,
+    )
+    return token_contract
+
+
+def _resolve_ocr_position_contract(args, metadata: dict | None = None) -> str:
+    """Resolve and store the checkpoint's fail-closed OCR position contract."""
+
+    metadata = (
+        _checkpoint_metadata(getattr(args, "checkpoint", ""))
+        if metadata is None
+        else metadata
+    )
+    resolved = resolve_checkpoint_ocr_position_contract(
+        metadata, getattr(args, "ocr_position_contract", None)
+    )
+    args.ocr_position_contract = resolved
+    return resolved
 
 
 def _restore_omvt_geometry(args, metadata: dict | None = None) -> OMVTConfig | None:
@@ -226,12 +299,26 @@ def visual_contribution(real_report, blank_report) -> float:
 
 
 @torch.no_grad()
-def _decode_batches(model, prompts, pixel_fn, args, device, autocast_ctx):
+def _decode_batches(
+    model,
+    prompts,
+    pixel_fn,
+    args,
+    device,
+    autocast_ctx,
+    *,
+    morphology_track_table=None,
+):
     """Generate continuations for uniform-length prompt rows.
 
     ``pixel_fn(start, end)`` supplies the pixel batch for rows [start, end) —
     real pages for the main pass, white pages for the baseline pass.
     """
+    if morphology_track_table is not None:
+        raise ValueError(
+            "OCR evaluation must use the checkpoint position contract, not a "
+            "morphology_track_table"
+        )
     preds_ids: list[list[int]] = []
     n = len(prompts)
     prompt_len = len(prompts[0])
@@ -254,6 +341,9 @@ def _decode_batches(model, prompts, pixel_fn, args, device, autocast_ctx):
                 repetition_penalty=args.repetition_penalty,
                 recurrent_steps=recurrent_steps,
                 pixel_values=pixel_fn(start, end),
+                position_contract=getattr(
+                    args, "ocr_position_contract", BOUNDARY_V1
+                ),
             )
         for row in out[:, prompt_len:].tolist():
             preds_ids.append(_cut_continuation(row))
@@ -271,6 +361,7 @@ def _smoke(args) -> int:
     args.image_size, args.d_vision, args.patch_preset = 56, 64, "derived"
     args.n_image_tokens = None
     args.max_new_tokens, args.batch_size = 4, 2
+    args.ocr_position_contract = BOUNDARY_V1
     n_img = make_omvt_cfg(56, 64, None, preset="derived").compress_to
     rows = [
         build_ocr_row(
@@ -323,11 +414,43 @@ def main(argv=None) -> int:
                   "(or use --smoke)", file=sys.stderr)
             return 2
 
+    try:
+        _resolve_ocr_position_contract(args)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"scripts.eval_vlm_ocr: {exc}", file=sys.stderr)
+        return 2
+
     torch.manual_seed(args.seed)
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
+
+    from Tokenizer.unified.bundle import TokenizerBundle
+
+    bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
+    issues = bundle.validate()
+    if issues:
+        raise ValueError(
+            "invalid tokenizer bundle:\n  - " + "\n  - ".join(issues)
+        )
+    token_contract = _validate_checkpoint_tokenizer(
+        args.checkpoint,
+        bundle,
+        args.tokenizer_bundle,
+        require_terminal=False,
+    )
+    contract_path = (
+        Path(args.ocr_data_contract)
+        if args.ocr_data_contract
+        else default_ocr_alignment_contract_path(args.data)
+    )
+    load_and_validate_ocr_alignment_data_contract(
+        contract_path,
+        args.data,
+        token_contract,
+    )
+    decode = bundle.tokenizer.decode
 
     rows = _load_rows(args.data, args.limit)
     prompts: list[list[int]] = []
@@ -357,11 +480,6 @@ def main(argv=None) -> int:
     model.load_state_dict(state)
     print(f"[eval] loaded {ckpt_path} on {device}")
 
-    from Tokenizer.unified.bundle import TokenizerBundle
-
-    bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
-    decode = bundle.tokenizer.decode
-
     if args.precision == "auto":
         precision = "bf16" if device.type == "cuda" else "fp32"
     else:
@@ -375,10 +493,22 @@ def main(argv=None) -> int:
     processor = PILImageProcessor(image_size=args.image_size)
 
     def real_pixels(start, end):
-        return _pixel_batch(images[start:end], processor, omvt_cfg, device)
+        verified = [
+            read_verified_ocr_image_bytes(
+                rows[index],
+                context=f"{args.data}:row-{index + 1}",
+            )
+            for index in range(start, end)
+        ]
+        return _pixel_batch(verified, processor, omvt_cfg, device)
 
     preds = [decode(ids) for ids in _decode_batches(
-        model, prompts, real_pixels, args, device, autocast_ctx
+        model,
+        prompts,
+        real_pixels,
+        args,
+        device,
+        autocast_ctx,
     )]
     refs = [decode(ids) for ids in refs_ids]
     rep = ocr_report(preds, refs)
@@ -397,7 +527,12 @@ def main(argv=None) -> int:
             )
 
         preds_blank = [decode(ids) for ids in _decode_batches(
-            model, prompts, blank_pixels, args, device, autocast_ctx
+            model,
+            prompts,
+            blank_pixels,
+            args,
+            device,
+            autocast_ctx,
         )]
         rep_blank = ocr_report(preds_blank, refs)
         print(

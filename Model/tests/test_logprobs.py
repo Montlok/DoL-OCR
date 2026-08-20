@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from Model.config import RDTConfig
 from Model.inference.cache import DecodeCache
 from Model.model import RDTForCausalLM
+from Model.ocr.position_contract import BOUNDARY_V1
 from Model.posttrain.logprobs import (
     completion_logprobs,
     logits_to_token_logprobs,
@@ -106,6 +107,46 @@ class LogprobTest(unittest.TestCase):
         self.assertTrue(torch.equal(token[:, :5], torch.zeros_like(token[:, :5])))
         # Sum equals the masked token log-probs.
         self.assertTrue(torch.allclose(summed, token.sum(dim=-1), atol=ATOL))
+
+    def test_completion_slice_matches_full_path_exactly(self):
+        model, ids = self._model_ids()
+        start = 5
+        with torch.no_grad():
+            full = sequence_logprobs(
+                model,
+                ids,
+                position_contract=BOUNDARY_V1,
+            )
+            sliced = sequence_logprobs(
+                model,
+                ids,
+                completion_start=start,
+                position_contract=BOUNDARY_V1,
+            )
+        self.assertTrue(
+            torch.equal(sliced[:, :start], torch.zeros_like(sliced[:, :start]))
+        )
+        torch.testing.assert_close(
+            sliced[:, start:],
+            full[:, start:],
+            rtol=0.0,
+            atol=0.0,
+        )
+        with torch.no_grad():
+            empty_tail = sequence_logprobs(
+                model,
+                ids,
+                completion_start=ids.shape[1] - 1,
+                position_contract=BOUNDARY_V1,
+            )
+        self.assertTrue(torch.equal(empty_tail, torch.zeros_like(empty_tail)))
+
+    def test_completion_slice_rejects_invalid_start(self):
+        model, ids = self._model_ids()
+        for value, error in ((True, TypeError), (-1, ValueError), (11, ValueError)):
+            with self.subTest(value=value):
+                with self.assertRaises(error):
+                    sequence_logprobs(model, ids, completion_start=value)
 
     def test_depth_knob_changes_but_is_deterministic(self):
         model, ids = self._model_ids()

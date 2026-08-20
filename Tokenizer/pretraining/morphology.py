@@ -14,6 +14,9 @@ class TokenLike(Protocol):
 
 
 WORD_TRACKS = {"mn", "general"}
+MORPH_TRACK_RESET = 0
+MORPH_TRACK_MONGOLIAN = 1
+MORPH_TRACK_GENERAL = 2
 
 
 def derive_morph_info_from_tokens(
@@ -72,6 +75,55 @@ def derive_morph_info_from_tokens(
     return word_positions, morph_depths
 
 
+def derive_morph_info_from_track_ids(
+    track_ids: Sequence[int],
+) -> tuple[list[int], list[int]]:
+    """Derive the pretrained morphology features from canonical route ids.
+
+    This is the offset-free contract used during autoregressive decoding, when
+    only generated token ids are available.  ``0`` is a reset/non-word token,
+    ``1`` is a Mongolian word piece, and ``2`` is a general-script word piece.
+    Consecutive pieces on the same word track share ``word_pos`` and advance
+    ``morph_depth``; a reset or track transition starts the next word.
+
+    Strict OCR producers compare this result with
+    :func:`derive_morph_info_from_tokens` for every reference and reject any
+    route whose token id is ambiguous.  That makes this runtime representation
+    identical to the span-aware pretraining representation for all admitted
+    OCR text.
+    """
+
+    valid_word_tracks = {MORPH_TRACK_MONGOLIAN, MORPH_TRACK_GENERAL}
+    word_positions: list[int] = []
+    morph_depths: list[int] = []
+    cur_word = -1
+    cur_depth = 0
+    previous = MORPH_TRACK_RESET
+
+    for raw_track in track_ids:
+        track = int(raw_track)
+        if track not in {
+            MORPH_TRACK_RESET,
+            MORPH_TRACK_MONGOLIAN,
+            MORPH_TRACK_GENERAL,
+        }:
+            raise ValueError(f"unknown morphology track id: {track}")
+        if track not in valid_word_tracks:
+            word_positions.append(max(cur_word, 0))
+            morph_depths.append(0)
+            previous = MORPH_TRACK_RESET
+            continue
+        if previous == track:
+            cur_depth += 1
+        else:
+            cur_word += 1
+            cur_depth = 0
+        word_positions.append(cur_word)
+        morph_depths.append(cur_depth)
+        previous = track
+    return word_positions, morph_depths
+
+
 def derive_morph_info_from_offsets(
     token_offsets: Sequence[tuple[int, int] | list[int]],
 ) -> tuple[list[int], list[int]]:
@@ -127,16 +179,18 @@ def derive_morph_info_from_boundary_ids(
       word has opened). They do **not** advance ``word_pos``.
     * Other tokens inherit ``(word_pos, depth)``.
 
-    Output positions are non-negative. ``max_depth`` (if given and > 0)
-    caps ``morph_depth`` to ``max_depth - 1``; non-positive values are
-    treated as "no cap" to keep depths non-negative.
+    Output positions are non-negative. ``max_depth`` (if given and
+    non-negative) is the largest representable depth, so clipping is
+    inclusive.  Model runtime paths normally leave this uncapped and let
+    morphological RoPE own the single, identical clipping operation for both
+    precomputed and dynamically derived features.
     """
 
     lo, hi = special_id_range
     word_positions: list[int] = []
     morph_depths: list[int] = []
 
-    cap = max_depth - 1 if (max_depth is not None and max_depth > 0) else None
+    cap = max_depth if (max_depth is not None and max_depth >= 0) else None
 
     cur_word = -1
     cur_depth = 0

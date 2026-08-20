@@ -6,9 +6,9 @@ Production-usable online RL with **verifiable** rewards (no reward model). Loads
 a policy from an SFT/DPO checkpoint, builds a frozen reference, samples a group
 of responses per prompt via the native ``generate()``, scores them with
 rule-based rewards (exact/numeric match, Mongolian script purity, ``<think>``
-format), normalizes advantages within each group, and takes a clipped
-policy-gradient step with a KL penalty. Externally injected ``<tool_result>``
-spans are excluded from the objective.
+format), forms group-relative advantages, and takes one synchronous on-policy
+step with a KL penalty. Externally injected ``<tool_result>`` spans are excluded
+from the objective.
 
 Usage::
 
@@ -22,8 +22,6 @@ Usage::
 import argparse
 import contextlib
 import copy
-import hashlib
-import json
 import math
 import os
 import random
@@ -59,8 +57,21 @@ from Model.config import (  # noqa: E402
     two_stage_tiny_config,
 )
 from Model.model import RDTForCausalLM  # noqa: E402
+from Model.ocr.tokenization import (  # noqa: E402
+    OCR_NATIVE_TARGET_ENCODING,
+    canonical_json_sha256,
+    canonicalize_native_ocr_text,
+    make_ocr_target_encoder,
+    native_tokenization_contract,
+)
+from Model.ocr.position_contract import (  # noqa: E402
+    OCR_POSITION_CONTRACT_CHOICES,
+    OCR_POSITION_CONTRACT_METADATA_VERSION,
+    resolve_checkpoint_ocr_position_contract,
+)
 from Model.posttrain.checkpointing import (  # noqa: E402
     OCR_GRPO_CONTRACT_VERSION,
+    load_verified_policy_metadata,
     reconstruct_policy_from_checkpoint,
 )
 from Model.posttrain.grpo import (  # noqa: E402
@@ -72,7 +83,26 @@ from Model.posttrain.ocr_eval import (  # noqa: E402
     evaluate_ocr_manifest as _evaluate_ocr_validation,
 )
 from Model.posttrain.ocr_decode import decode_ocr_completion  # noqa: E402
+from Model.posttrain.ocr_manifests import (  # noqa: E402
+    golden_identity_keys,
+    golden_identity_semantic_sha256,
+    load_golden_identity_manifest,
+    load_ocr_dataset_contract,
+)
+from Model.posttrain.ocr_manifest_builder import (  # noqa: E402
+    file_sha256 as _file_sha256,
+)
 from Model.posttrain.preference_data import OCRPromptDataset, PromptDataset  # noqa: E402
+from Model.posttrain.release_contract import (  # noqa: E402
+    STREAMING_V2_RELEASE_SOURCE_CONTRACT_KIND,
+    VISUAL_SOURCE_CONTRACT_ALIGNMENT_V3,
+    VISUAL_SOURCE_CONTRACT_STREAMING_V2_RELEASE,
+    admit_visual_ocr_source,
+)
+from Model.posttrain.ocr_selection import (  # noqa: E402
+    build_selection_receipt,
+    write_selection_receipt,
+)
 from Model.posttrain.rewards import (  # noqa: E402
     RewardConfig,
     compute_rewards_with_breakdown,
@@ -83,13 +113,19 @@ from Model.training import (  # noqa: E402
     apply_parallelism,
     build_optimizer,
     build_scheduler,
+    clear_no_update_progress,
     clip_or_check_grad_norm,
     destroy_distributed,
     init_distributed,
     is_main_process,
+    load_checkpoint_metadata,
+    load_no_update_progress,
     resolve_checkpoint_dir,
+    restore_rng_state,
     resume_state,
+    save_no_update_progress,
     save_checkpoint,
+    validate_resumable_checkpoint,
 )
 
 CONFIG_CHOICES = {
@@ -113,6 +149,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--data", default="", help="prompt JSONL path")
     p.add_argument("--init-checkpoint", default="",
                    help="checkpoint dir to initialize policy + reference")
+    p.add_argument(
+        "--visual-source-contract",
+        choices=(
+            VISUAL_SOURCE_CONTRACT_ALIGNMENT_V3,
+            VISUAL_SOURCE_CONTRACT_STREAMING_V2_RELEASE,
+        ),
+        default=VISUAL_SOURCE_CONTRACT_ALIGNMENT_V3,
+        help=(
+            "visual checkpoint admission contract; streaming-v2-release is "
+            "restricted to the repository-owned Montlok/DoL-1.2-OCR lock"
+        ),
+    )
+    p.add_argument(
+        "--ocr-position-contract",
+        choices=OCR_POSITION_CONTRACT_CHOICES,
+        default=None,
+        help=(
+            "explicit compatibility override for a historical OCR checkpoint; "
+            "self-describing checkpoints are resolved from metadata"
+        ),
+    )
     p.add_argument("--output", default="outputs/grpo")
     p.add_argument("--resume", default="")
     p.add_argument("--dist", choices=["single", "ddp", "fsdp"], default="single")
@@ -133,7 +190,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--save-every", type=int, default=200)
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--keep-last-n", type=int, default=3)
-    p.add_argument("--clip-eps", type=float, default=0.2)
+    p.add_argument(
+        "--clip-eps",
+        type=float,
+        default=None,
+        help=(
+            "legacy PPO ratio clip; text default 0.2, OCR forbids it because "
+            "each rollout receives exactly one synchronous update"
+        ),
+    )
+    p.add_argument(
+        "--advantage-mode",
+        choices=["centered", "standardized"],
+        default=None,
+        help="OCR default centered; text default standardized",
+    )
+    p.add_argument(
+        "--min-reward-spread",
+        type=float,
+        default=0.0,
+        help="zero groups whose max-min reward is at or below this value",
+    )
+    p.add_argument(
+        "--max-behavior-log-ratio",
+        type=float,
+        default=None,
+        help=(
+            "fail if rollout-time and fresh scoring |log-ratio| exceed this; "
+            "OCR default 0.005"
+        ),
+    )
     p.add_argument("--kl-coef", type=float, default=0.04)
     p.add_argument("--exact-weight", type=float, default=0.0)
     p.add_argument("--numeric-weight", type=float, default=0.0)
@@ -159,10 +245,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dist-backend", choices=["nccl", "gloo"], default="nccl")
     p.add_argument("--image-root", default="",
                    help="base directory for relative OCR image paths")
+    p.add_argument(
+        "--dataset-contract",
+        default="",
+        help="defaults to dataset_contract.json beside the OCR train manifest",
+    )
     p.add_argument("--required-split", default="rl_train",
                    help="OCR rows must carry this split label")
-    p.add_argument("--golden-manifest", default="",
-                   help="locked golden JSONL; any id/image overlap aborts")
+    p.add_argument(
+        "--golden-identity-manifest",
+        default="",
+        help="public transcript-free golden identity JSONL used only for leakage gates",
+    )
     p.add_argument("--validation-manifest", default="",
                    help="held-out rl_val JSONL used for checkpoint selection")
     p.add_argument("--validation-split", default="rl_val")
@@ -178,7 +272,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    default=None,
                    help="OCR default vision (language frozen); text default all")
     p.add_argument("--max-degenerate-steps", type=int, default=20,
-                   help="abort after this many all-zero-advantage steps")
+                   help="clean-stop after this many all-zero-advantage rollouts")
     p.add_argument("--max-consecutive-optimizer-skips", type=int, default=20,
                    help="abort fp16 training after this many scaler-skipped updates")
     p.add_argument("--kl-abort-threshold", type=float, default=1.0)
@@ -201,6 +295,12 @@ def _apply_task_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.train_scope = "vision" if args.task == "ocr" else "all"
     if args.temperature is None:
         args.temperature = 1.0
+    if args.advantage_mode is None:
+        args.advantage_mode = "centered" if args.task == "ocr" else "standardized"
+    if args.task == "text" and args.clip_eps is None:
+        args.clip_eps = 0.2
+    if args.task == "ocr" and args.max_behavior_log_ratio is None:
+        args.max_behavior_log_ratio = 5e-3
     return args
 
 
@@ -291,6 +391,9 @@ def _grpo_config(
         tool_result_open_ids=list(tool_result_open_ids or []),
         tool_result_close_ids=list(tool_result_close_ids or []),
         log_ratio_clip=args.log_ratio_clip,
+        advantage_mode=args.advantage_mode,
+        min_reward_spread=args.min_reward_spread,
+        max_behavior_log_ratio=args.max_behavior_log_ratio,
     )
 
 
@@ -299,8 +402,8 @@ def _validate_args(args: argparse.Namespace) -> int:
         "learning-rate": args.learning_rate,
         "weight-decay": args.weight_decay,
         "grad-clip": args.grad_clip,
-        "clip-eps": args.clip_eps,
         "kl-coef": args.kl_coef,
+        "min-reward-spread": args.min_reward_spread,
         "kl-abort-threshold": args.kl_abort_threshold,
         "log-ratio-clip": args.log_ratio_clip,
         "min-visual-logit-delta": args.min_visual_logit_delta,
@@ -309,6 +412,10 @@ def _validate_args(args: argparse.Namespace) -> int:
         "min-validation-eos-rate": args.min_validation_eos_rate,
         "max-validation-invalid-rate": args.max_validation_invalid_rate,
     }
+    if args.clip_eps is not None:
+        finite_args["clip-eps"] = args.clip_eps
+    if args.max_behavior_log_ratio is not None:
+        finite_args["max-behavior-log-ratio"] = args.max_behavior_log_ratio
     nonfinite = [name for name, value in finite_args.items() if not math.isfinite(value)]
     if nonfinite:
         print(
@@ -335,14 +442,48 @@ def _validate_args(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if not 0.0 < args.clip_eps < 1.0 or args.kl_coef < 0:
-        print("[error] clip-eps must be in (0,1) and kl-coef non-negative", file=sys.stderr)
+    if (
+        args.clip_eps is not None
+        and not 0.0 < args.clip_eps < 1.0
+    ) or args.kl_coef < 0:
+        print(
+            "[error] clip-eps must be omitted or in (0,1), and kl-coef "
+            "must be non-negative",
+            file=sys.stderr,
+        )
+        return 2
+    if args.min_reward_spread < 0:
+        print("[error] --min-reward-spread must be non-negative", file=sys.stderr)
+        return 2
+    if (
+        args.max_behavior_log_ratio is not None
+        and args.max_behavior_log_ratio <= 0
+    ):
+        print(
+            "[error] --max-behavior-log-ratio must be positive when set",
+            file=sys.stderr,
+        )
         return 2
     if args.log_ratio_clip <= 0:
         print("[error] --log-ratio-clip must be positive", file=sys.stderr)
         return 2
     if args.resume and args.init_checkpoint:
         print("[error] use --resume or --init-checkpoint, not both", file=sys.stderr)
+        return 2
+    if args.task != "ocr" and args.ocr_position_contract is not None:
+        print(
+            "[error] --ocr-position-contract is valid only with --task ocr",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        args.task != "ocr" or args.smoke
+    ) and args.visual_source_contract != VISUAL_SOURCE_CONTRACT_ALIGNMENT_V3:
+        print(
+            "[error] --visual-source-contract streaming-v2-release is valid "
+            "only for a non-smoke OCR run",
+            file=sys.stderr,
+        )
         return 2
     if args.max_degenerate_steps <= 0:
         print("[error] --max-degenerate-steps must be positive", file=sys.stderr)
@@ -410,11 +551,36 @@ def _validate_args(args: argparse.Namespace) -> int:
             )
             return 2
         if args.task == "ocr":
+            if args.clip_eps is not None:
+                print(
+                    "[error] OCR uses one synchronous on-policy update per "
+                    "rollout; --clip-eps would be a misleading no-op",
+                    file=sys.stderr,
+                )
+                return 2
+            if args.advantage_mode != "centered":
+                print(
+                    "[error] OCR requires --advantage-mode centered so tiny "
+                    "reward spreads are not standardized to full scale",
+                    file=sys.stderr,
+                )
+                return 2
+            if args.max_behavior_log_ratio is None:
+                print(
+                    "[error] OCR requires a rollout/scoring behavior-log-ratio "
+                    "gate",
+                    file=sys.stderr,
+                )
+                return 2
             if not (args.init_checkpoint or args.resume):
                 print("[error] OCR GRPO requires a multimodal checkpoint", file=sys.stderr)
                 return 2
-            if not args.golden_manifest:
-                print("[error] OCR GRPO requires --golden-manifest leakage gate", file=sys.stderr)
+            if not args.golden_identity_manifest:
+                print(
+                    "[error] OCR GRPO requires --golden-identity-manifest "
+                    "(transcript-free leakage gate)",
+                    file=sys.stderr,
+                )
                 return 2
             if not args.validation_manifest:
                 print(
@@ -486,11 +652,35 @@ def _load_immutable_reference(
     device: torch.device,
     *,
     require_vision: bool,
+    tokenization_contract: dict[str, object] | None = None,
+    source_checkpoint_model_sha256: str = "",
+    expected_reference_model_sha256: str = "",
+    position_contract: str | None = None,
 ) -> tuple[torch.nn.Module, Path]:
+    if (
+        len(expected_reference_model_sha256) != 64
+        or any(
+            char not in "0123456789abcdef"
+            for char in expected_reference_model_sha256
+        )
+    ):
+        raise ValueError(
+            "immutable reference expected model SHA256 must be a lowercase digest"
+        )
+    reference_metadata, reference_metadata_sha256 = (
+        load_verified_policy_metadata(checkpoint)
+    )
     restored = reconstruct_policy_from_checkpoint(
         checkpoint,
         require_vision=require_vision,
+        metadata_override=reference_metadata,
+        expected_metadata_sha256=reference_metadata_sha256,
+        expected_model_sha256=expected_reference_model_sha256,
     )
+    if restored.model_sha256 != expected_reference_model_sha256:
+        raise ValueError(
+            "immutable reference model SHA256 differs from the persisted data contract"
+        )
     if not (restored.checkpoint_dir / "COMPLETE").is_file():
         raise ValueError("immutable reference checkpoint has no COMPLETE marker")
     if asdict(restored.rdt_config) != asdict(model_cfg):
@@ -507,6 +697,30 @@ def _load_immutable_reference(
         raise ValueError("reference checkpoint is not marked immutable")
     if restored.metadata.get("source_checkpoint") != source_checkpoint:
         raise ValueError("reference checkpoint points to a different source policy")
+    if require_vision:
+        if restored.metadata.get("ocr_tokenization_contract") != dict(
+            tokenization_contract or {}
+        ):
+            raise ValueError(
+                "immutable reference uses a different OCR tokenization contract"
+            )
+        if restored.metadata.get(
+            "source_checkpoint_model_sha256"
+        ) != source_checkpoint_model_sha256:
+            raise ValueError(
+                "immutable reference points to different visual source weights"
+            )
+        if position_contract is not None:
+            restored_position_contract = (
+                resolve_checkpoint_ocr_position_contract(
+                    restored.metadata,
+                    position_contract,
+                )
+            )
+            if restored_position_contract != position_contract:
+                raise ValueError(
+                    "immutable reference uses a different OCR position contract"
+                )
     reference = _prepare_reference_model(
         restored.model,
         train_cfg,
@@ -574,6 +788,24 @@ def _distributed_max(value: float, device: torch.device) -> float:
     return float(tensor)
 
 
+def _distributed_min(value: float, device: torch.device) -> float:
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return float(value)
+    tensor = torch.tensor(float(value), dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
+    return float(tensor)
+
+
+def _broadcast_rank_zero_object(value, device: torch.device):
+    """Use rank zero's control payload so every worker takes the same branch."""
+
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return value
+    payload = [value if torch.distributed.get_rank() == 0 else None]
+    torch.distributed.broadcast_object_list(payload, src=0, device=device)
+    return payload[0]
+
+
 def _all_ranks_true(value: bool, device: torch.device) -> bool:
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return bool(value)
@@ -596,33 +828,6 @@ def _consensus_bool(value: bool, device: torch.device, name: str) -> bool:
             f"distributed workers disagreed on {name}: {votes}/{world_size} true"
         )
     return votes == world_size
-
-
-def _validate_resumable_checkpoint_files(
-    checkpoint: str | Path,
-    *,
-    require_scaler: bool,
-) -> Path:
-    """Reject model-only or interrupted artifacts passed as ``--resume``."""
-
-    checkpoint_dir = resolve_checkpoint_dir(checkpoint)
-    required = {
-        "COMPLETE",
-        "model.pt",
-        "optimizer.pt",
-        "scheduler.pt",
-        "rng.pt",
-        "meta.pt",
-    }
-    if require_scaler:
-        required.add("scaler.pt")
-    missing = sorted(name for name in required if not (checkpoint_dir / name).is_file())
-    if missing:
-        raise ValueError(
-            "--resume requires a complete resumable GRPO checkpoint; missing: "
-            + ", ".join(missing)
-        )
-    return checkpoint_dir
 
 
 def _make_grad_scaler(
@@ -663,14 +868,6 @@ def _dataset_exclusions(
     return ids, images, hashes, groups
 
 
-def _file_sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _distributed_file_sha256(path: str | Path, rank: int) -> str:
     """Hash a shared artifact once, then broadcast the digest to every rank."""
 
@@ -683,33 +880,388 @@ def _distributed_file_sha256(path: str | Path, rank: int) -> str:
     return payload[0]
 
 
+def _tokenizer_vocab_extent(tokenizer) -> int:
+    ids = [int(index) for index in tokenizer.vocab.values()]
+    if not ids or min(ids) < 0:
+        raise ValueError("tokenizer vocabulary ids must be non-negative and non-empty")
+    return max(ids) + 1
+
+
+def _visual_source_mode_from_lineage(lineage: dict[str, object]) -> str:
+    """Map a persisted, normalized lineage kind back to its explicit CLI mode."""
+
+    kind = lineage.get("source_contract_kind")
+    if kind == VISUAL_SOURCE_CONTRACT_ALIGNMENT_V3:
+        return VISUAL_SOURCE_CONTRACT_ALIGNMENT_V3
+    if kind == STREAMING_V2_RELEASE_SOURCE_CONTRACT_KIND:
+        return VISUAL_SOURCE_CONTRACT_STREAMING_V2_RELEASE
+    raise ValueError(
+        "visual source lineage has no supported explicit source contract kind: "
+        f"{kind!r}"
+    )
+
+
+def _visual_source_reconstruction_inputs(
+    lineage: dict[str, object],
+) -> tuple[Path, str, str]:
+    """Return the exact admitted source path and its two artifact hashes."""
+
+    raw_checkpoint = lineage.get("source_checkpoint")
+    if not isinstance(raw_checkpoint, str) or not raw_checkpoint:
+        raise ValueError("visual source lineage has no source_checkpoint")
+
+    def required_sha256(field: str) -> str:
+        value = lineage.get(field)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise ValueError(
+                f"visual source lineage {field} must be a lowercase SHA256 digest"
+            )
+        return value
+
+    return (
+        resolve_checkpoint_dir(raw_checkpoint),
+        required_sha256("source_checkpoint_model_sha256"),
+        required_sha256("source_checkpoint_metadata_sha256"),
+    )
+
+
+def _preflight_artifacts(args: argparse.Namespace):
+    """Validate tokenizer/OCR lineage before model or GPU allocation."""
+
+    if args.smoke:
+        return None, None, {}, {}, {}, {}
+
+    from Tokenizer.unified.bundle import TokenizerBundle
+
+    bundle = TokenizerBundle.from_dir(args.tokenizer)
+    bundle_issues = bundle.validate()
+    if bundle_issues:
+        raise ValueError(
+            "invalid tokenizer bundle:\n  - " + "\n  - ".join(bundle_issues)
+        )
+    if args.task != "ocr":
+        return bundle, None, {}, {}, {}, {}
+
+    token_contract = native_tokenization_contract(
+        bundle.tokenizer,
+        args.tokenizer,
+    )
+    encode_probe = make_ocr_target_encoder(
+        bundle.tokenizer,
+        mode=OCR_NATIVE_TARGET_ENCODING,
+    )
+    probes = (
+        "ᠮᠣᠩᠭᠣᠯ ᠪᠢᠴᠢᠭ",
+        "ᠪᠢᠴᠢᠭ᠋ ᠦᠨ",
+        "ᠮᠣᠩᠭᠣᠯ᠎ᠠ",
+        "ᠨᠡᠷ ᠡ",
+        "︱ 9/7 ︱ 9/9/9",
+        "2026-07-29, 99.5%",
+        "a b",
+    )
+    for text in probes:
+        ids = encode_probe(text)
+        expected = canonicalize_native_ocr_text(text)
+        if bundle.tokenizer.decode(ids) != expected:
+            raise ValueError(
+                "native OCR tokenizer preflight failed exact round-trip for "
+                f"{text!r}"
+            )
+    if encode_probe.stats["byte_fallback"]:
+        raise ValueError("strict-native OCR tokenizer preflight used byte fallback")
+
+    identity_rows = load_golden_identity_manifest(
+        args.golden_identity_manifest,
+        required_split=args.golden_split,
+    )
+    checkpoint_path = args.resume or args.init_checkpoint
+    checkpoint_dir = resolve_checkpoint_dir(checkpoint_path)
+    if args.resume:
+        # This is our own GRPO checkpoint.  Its immutable data contract tells us
+        # which visual-source admission path must be replayed below.
+        metadata = load_checkpoint_metadata(checkpoint_dir)
+        if metadata.get("phase") != "grpo" or metadata.get("task") != "ocr":
+            raise ValueError("--resume checkpoint is not an OCR GRPO checkpoint")
+        if metadata.get("contract_version") != OCR_GRPO_CONTRACT_VERSION:
+            raise ValueError(
+                "--resume checkpoint predates the strict OCR-GRPO contract"
+            )
+        saved_data = metadata.get("data_contract")
+        if not isinstance(saved_data, dict):
+            raise ValueError("--resume checkpoint has no immutable data contract")
+        if (
+            "ocr_position_contract" not in saved_data
+            or "ocr_position_contract_version" not in saved_data
+        ):
+            raise ValueError(
+                "--resume checkpoint has no explicit OCR position contract; "
+                "implicit OCR-GRPO checkpoints cannot be replayed safely"
+            )
+        args.ocr_position_contract = resolve_checkpoint_ocr_position_contract(
+            saved_data,
+            args.ocr_position_contract,
+        )
+        if saved_data.get("ocr_tokenization_contract") != token_contract:
+            raise ValueError(
+                "--resume tokenizer/native contract differs from checkpoint"
+            )
+        saved_source_lineage = saved_data.get("visual_source")
+        if not isinstance(saved_source_lineage, dict):
+            raise ValueError("--resume checkpoint has no visual source lineage")
+        saved_source_mode = _visual_source_mode_from_lineage(
+            saved_source_lineage
+        )
+        if args.visual_source_contract != saved_source_mode:
+            raise ValueError(
+                "--resume visual source contract differs from the persisted "
+                f"lineage: checkpoint={saved_source_mode!r} "
+                f"current={args.visual_source_contract!r}"
+            )
+        (
+            source_dir,
+            _source_model_sha256,
+            source_metadata_sha256,
+        ) = _visual_source_reconstruction_inputs(saved_source_lineage)
+        source_metadata_before_admission = (
+            load_verified_policy_metadata(
+                source_dir,
+                expected_sha256=source_metadata_sha256,
+            )[0]
+            if saved_source_mode == VISUAL_SOURCE_CONTRACT_ALIGNMENT_V3
+            else None
+        )
+        admitted = admit_visual_ocr_source(
+            saved_source_mode,
+            checkpoint_dir=source_dir,
+            metadata=source_metadata_before_admission,
+            runtime_native_tokenization_contract=token_contract,
+            tokenizer_vocab_extent=_tokenizer_vocab_extent(bundle.tokenizer),
+            expected_lineage=saved_source_lineage,
+        )
+        source_metadata = admitted["metadata"]
+        source_lineage = dict(admitted["lineage"])
+        source_position_contract = resolve_checkpoint_ocr_position_contract(
+            source_metadata,
+            args.ocr_position_contract,
+        )
+        if source_position_contract != args.ocr_position_contract:
+            raise ValueError(
+                "visual source checkpoint uses a different OCR position contract"
+            )
+        source_lineage["ocr_position_contract"] = source_position_contract
+        source_lineage["ocr_position_contract_version"] = (
+            OCR_POSITION_CONTRACT_METADATA_VERSION
+        )
+        if source_lineage != saved_source_lineage:
+            raise ValueError(
+                "admitted visual source lineage differs from the full persisted "
+                "OCR-GRPO lineage"
+            )
+    else:
+        # streaming-v2 metadata is a pickle from a historical release.  Never
+        # deserialize it here: the repository-owned reviewed release gate must
+        # validate all package bytes before it returns safe metadata.
+        metadata_before_admission: dict[str, object] | None = None
+        metadata_sha256_before_admission = ""
+        if args.visual_source_contract == VISUAL_SOURCE_CONTRACT_ALIGNMENT_V3:
+            (
+                metadata_before_admission,
+                metadata_sha256_before_admission,
+            ) = load_verified_policy_metadata(checkpoint_dir)
+        admitted = admit_visual_ocr_source(
+            args.visual_source_contract,
+            checkpoint_dir=checkpoint_dir,
+            metadata=metadata_before_admission,
+            runtime_native_tokenization_contract=token_contract,
+            tokenizer_vocab_extent=_tokenizer_vocab_extent(bundle.tokenizer),
+        )
+        metadata = admitted["metadata"]
+        source_lineage = dict(admitted["lineage"])
+        (
+            admitted_source_dir,
+            _source_model_sha256,
+            admitted_metadata_sha256,
+        ) = _visual_source_reconstruction_inputs(source_lineage)
+        if admitted_source_dir.resolve() != checkpoint_dir.resolve():
+            raise ValueError(
+                "admitted visual source resolves to a different checkpoint"
+            )
+        if (
+            metadata_sha256_before_admission
+            and metadata_sha256_before_admission != admitted_metadata_sha256
+        ):
+            raise ValueError(
+                "visual checkpoint metadata changed during source admission"
+            )
+        args.ocr_position_contract = resolve_checkpoint_ocr_position_contract(
+            metadata,
+            args.ocr_position_contract,
+        )
+        saved_source_position = source_lineage.get("ocr_position_contract")
+        if saved_source_position not in {None, args.ocr_position_contract}:
+            raise ValueError(
+                "validated visual source reports a different OCR position contract"
+            )
+        saved_source_position_version = source_lineage.get(
+            "ocr_position_contract_version"
+        )
+        if saved_source_position_version not in {
+            None,
+            OCR_POSITION_CONTRACT_METADATA_VERSION,
+        }:
+            raise ValueError(
+                "validated visual source reports an unsupported OCR position "
+                "contract version"
+            )
+        source_lineage["ocr_position_contract"] = args.ocr_position_contract
+        source_lineage["ocr_position_contract_version"] = (
+            OCR_POSITION_CONTRACT_METADATA_VERSION
+        )
+    dataset_contract_path = (
+        Path(args.dataset_contract)
+        if args.dataset_contract
+        else Path(args.data).parent / "dataset_contract.json"
+    )
+    public_dataset_contract = load_ocr_dataset_contract(
+        dataset_contract_path,
+        train_manifest=args.data,
+        validation_manifest=args.validation_manifest,
+        golden_identity_manifest=args.golden_identity_manifest,
+        tokenization_contract=token_contract,
+    )
+    contract_image_root = Path(
+        str(public_dataset_contract["resolved_image_root"])
+    ).resolve()
+    if args.image_root and Path(args.image_root).resolve() != contract_image_root:
+        raise ValueError(
+            "--image-root differs from the materialized public dataset root"
+        )
+    args.image_root = str(contract_image_root)
+    args.dataset_contract = str(dataset_contract_path.resolve())
+    return (
+        bundle,
+        identity_rows,
+        token_contract,
+        source_lineage,
+        dict(source_metadata if args.resume else metadata),
+        public_dataset_contract,
+    )
+
+
+def _reconstruct_requested_policy(
+    args: argparse.Namespace,
+    fallback_model_cfg: RDTConfig,
+    visual_source: dict[str, object],
+    admitted_source_metadata: dict[str, object],
+):
+    """Reconstruct from the admitted source identity, never the raw CLI alias."""
+
+    load_checkpoint_path = args.resume or args.init_checkpoint
+    if not load_checkpoint_path:
+        return None
+
+    reconstruct_kwargs: dict[str, object] = {
+        "fallback_rdt_config": fallback_model_cfg,
+        "require_vision": args.task == "ocr",
+    }
+    expected_source_dir: Path | None = None
+    expected_model_sha256 = ""
+    expected_metadata_sha256 = ""
+    if args.task == "ocr" and not args.smoke and not args.resume:
+        if not admitted_source_metadata:
+            raise ValueError("fresh OCR training has no admitted source metadata")
+        (
+            expected_source_dir,
+            expected_model_sha256,
+            expected_metadata_sha256,
+        ) = _visual_source_reconstruction_inputs(visual_source)
+        load_checkpoint_path = expected_source_dir
+        reconstruct_kwargs.update(
+            {
+                "metadata_override": dict(admitted_source_metadata),
+                "expected_metadata_sha256": expected_metadata_sha256,
+                "expected_model_sha256": expected_model_sha256,
+            }
+        )
+
+    restored = reconstruct_policy_from_checkpoint(
+        load_checkpoint_path,
+        **reconstruct_kwargs,
+    )
+    if expected_source_dir is not None:
+        if restored.checkpoint_dir.resolve() != expected_source_dir.resolve():
+            raise ValueError(
+                "reconstructed visual checkpoint differs from admitted source"
+            )
+        if restored.metadata != admitted_source_metadata:
+            raise ValueError(
+                "reconstructed visual metadata differs from admitted metadata"
+            )
+        if restored.model_sha256 != expected_model_sha256:
+            raise ValueError(
+                "reconstructed visual model SHA256 differs from admitted lineage"
+            )
+        if restored.metadata_sha256 != expected_metadata_sha256:
+            raise ValueError(
+                "reconstructed visual metadata SHA256 differs from admitted lineage"
+            )
+    return restored
+
+
 def _data_contract(
     args: argparse.Namespace,
     bundle,
-) -> dict[str, str]:
+    *,
+    golden_identity_rows: list[dict[str, str | int]] | None = None,
+    tokenization_contract: dict[str, object] | None = None,
+    visual_source: dict[str, object] | None = None,
+    public_dataset_contract: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Immutable data/tokenizer fingerprint persisted across resumes."""
 
-    vocab_payload = json.dumps(
-        sorted((str(token), int(idx)) for token, idx in bundle.tokenizer.vocab.items()),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    from Model.ocr.tokenization import (
+        tokenizer_manifest_canonical_sha256,
+        tokenizer_vocab_sha256,
+    )
+
     contract = {
         "train_manifest_sha256": _file_sha256(args.data),
-        "tokenizer_vocab_sha256": hashlib.sha256(vocab_payload).hexdigest(),
-        "tokenizer_manifest_sha256": _file_sha256(
-            Path(args.tokenizer) / "manifest.json"
+        "tokenizer_vocab_sha256": tokenizer_vocab_sha256(bundle.tokenizer),
+        "tokenizer_manifest_canonical_sha256": (
+            tokenizer_manifest_canonical_sha256(args.tokenizer)
         ),
         "image_root": str(Path(args.image_root).absolute()) if args.image_root else "",
         "required_split": args.required_split,
     }
     if args.task == "ocr":
+        if golden_identity_rows is None:
+            raise ValueError("OCR data contract requires golden identity rows")
         contract.update(
             {
                 "validation_manifest_sha256": _file_sha256(args.validation_manifest),
-                "golden_manifest_sha256": _file_sha256(args.golden_manifest),
+                "golden_identity_manifest_sha256": _file_sha256(
+                    args.golden_identity_manifest
+                ),
+                "golden_identity_semantic_sha256": (
+                    golden_identity_semantic_sha256(golden_identity_rows)
+                ),
                 "validation_split": args.validation_split,
                 "golden_split": args.golden_split,
+                "ocr_position_contract": args.ocr_position_contract,
+                "ocr_position_contract_version": (
+                    OCR_POSITION_CONTRACT_METADATA_VERSION
+                ),
+                "ocr_tokenization_contract": dict(tokenization_contract or {}),
+                "visual_source": dict(visual_source or {}),
+                "public_dataset_contract_sha256": str(
+                    (public_dataset_contract or {}).get(
+                        "contract_file_sha256", ""
+                    )
+                ),
             }
         )
     return contract
@@ -741,6 +1293,7 @@ def _visual_conditioning_delta(
     pixel_values: dict[str, torch.Tensor],
     precision: str,
     device: torch.device,
+    position_contract: str,
 ) -> float:
     """Max next-token-logit change between a real and blank visual payload."""
 
@@ -756,11 +1309,13 @@ def _visual_conditioning_delta(
             real = policy(
                 input_ids=ids,
                 pixel_values=pixel_values,
+                position_contract=position_contract,
                 return_logits=True,
             )["logits"][:, -1, :].float()
             empty = policy(
                 input_ids=ids,
                 pixel_values=blank,
+                position_contract=position_contract,
                 return_logits=True,
             )["logits"][:, -1, :].float()
         return float((real - empty).abs().max())
@@ -779,11 +1334,12 @@ def _checkpoint_metadata(
     source_checkpoint: str,
     reference_checkpoint: str,
     *,
-    data_contract: dict[str, str] | None = None,
+    data_contract: dict[str, object] | None = None,
     health_state: dict[str, object] | None = None,
     final: bool = False,
 ) -> dict:
-    return {
+    health = dict(health_state or {})
+    metadata = {
         "phase": "grpo",
         "contract_version": OCR_GRPO_CONTRACT_VERSION,
         "task": args.task,
@@ -797,8 +1353,9 @@ def _checkpoint_metadata(
         "max_consecutive_optimizer_skips": args.max_consecutive_optimizer_skips,
         "source_checkpoint": source_checkpoint,
         "reference_checkpoint": reference_checkpoint,
-        "golden_manifest": args.golden_manifest,
+        "golden_identity_manifest": args.golden_identity_manifest,
         "validation_manifest": args.validation_manifest,
+        "public_dataset_contract": args.dataset_contract,
         "required_split": args.required_split,
         "validation_split": args.validation_split,
         "golden_split": args.golden_split,
@@ -824,24 +1381,51 @@ def _checkpoint_metadata(
             "min_visual_logit_delta": args.min_visual_logit_delta,
         },
         "data_contract": dict(data_contract or {}),
-        "health_state": dict(health_state or {}),
+        "health_state": health,
+        "stop_reason": str(health.get("stop_reason", "running")),
         "final": bool(final),
     }
+    if args.task == "ocr":
+        metadata.update(
+            {
+                "ocr_position_contract": args.ocr_position_contract,
+                "ocr_position_contract_version": (
+                    OCR_POSITION_CONTRACT_METADATA_VERSION
+                ),
+            }
+        )
+    return metadata
 
 
 def _reference_metadata(
     model_cfg: RDTConfig,
     omvt_cfg: OMVTConfig | None,
     source_checkpoint: str,
+    *,
+    tokenization_contract: dict[str, object] | None = None,
+    source_checkpoint_model_sha256: str = "",
+    position_contract: str | None = None,
 ) -> dict:
-    return {
+    metadata = {
         "phase": "grpo_reference",
         "contract_version": OCR_GRPO_CONTRACT_VERSION,
         "rdt_config": asdict(model_cfg),
         "omvt_config": asdict(omvt_cfg) if omvt_cfg is not None else None,
         "source_checkpoint": source_checkpoint,
+        "source_checkpoint_model_sha256": source_checkpoint_model_sha256,
+        "ocr_tokenization_contract": dict(tokenization_contract or {}),
         "immutable": True,
     }
+    if position_contract is not None:
+        metadata.update(
+            {
+                "ocr_position_contract": position_contract,
+                "ocr_position_contract_version": (
+                    OCR_POSITION_CONTRACT_METADATA_VERSION
+                ),
+            }
+        )
+    return metadata
 
 
 _RESUME_MUTABLE_FIELDS = {
@@ -861,7 +1445,7 @@ def _validate_resume_contract(
     train_cfg: TrainingConfig,
     reward_cfg: RewardConfig,
     grpo_cfg: GRPOConfig,
-    data_contract: dict[str, str],
+    data_contract: dict[str, object],
 ) -> None:
     """Refuse resumes that would mix optimizer, reward, or policy semantics."""
 
@@ -876,6 +1460,15 @@ def _validate_resume_contract(
         "validation_split": args.validation_split,
         "golden_split": args.golden_split,
     }
+    if args.task == "ocr":
+        expected_top.update(
+            {
+                "ocr_position_contract": args.ocr_position_contract,
+                "ocr_position_contract_version": (
+                    OCR_POSITION_CONTRACT_METADATA_VERSION
+                ),
+            }
+        )
     conflicts: list[str] = []
     for key, current in expected_top.items():
         if metadata.get(key) != current:
@@ -942,6 +1535,7 @@ def _validate_resume_contract(
             "optimizer_skip_count",
             "consecutive_optimizer_skips",
             "best_val_eligible",
+            "stop_reason",
         }
         if not isinstance(health, dict):
             conflicts.append("health_state: missing from OCR GRPO checkpoint")
@@ -1021,26 +1615,17 @@ def main(argv: list[str] | None = None) -> int:
     rc = _validate_args(args)
     if rc != 0:
         return rc
+    (
+        bundle,
+        golden_identity_rows,
+        tokenization_contract,
+        visual_source,
+        admitted_source_metadata,
+        public_dataset_contract,
+    ) = _preflight_artifacts(args)
 
     fallback_model_cfg = _build_model_cfg(args)
     train_cfg = _build_train_cfg(args)
-    rank, world_size, local_rank = init_distributed(backend=train_cfg.dist_backend)
-    rank_seed = args.seed + rank
-    torch.manual_seed(rank_seed)
-    random.seed(rank_seed)
-    try:
-        import numpy as np
-
-        np.random.seed(rank_seed % (2**32))
-    except ImportError:  # pragma: no cover - optional dependency
-        pass
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if args.resume:
-        _validate_resumable_checkpoint_files(
-            args.resume,
-            require_scaler=(train_cfg.precision == "fp16" and device.type == "cuda"),
-        )
-
     output_path = Path(train_cfg.output_dir)
     if not args.resume and not args.smoke and output_path.exists():
         occupied = (
@@ -1057,22 +1642,42 @@ def main(argv: list[str] | None = None) -> int:
                 f"output directory already contains a training run: {output_path}; "
                 "use --resume or a new --output"
             )
-    if is_main_process():
-        output_path.mkdir(parents=True, exist_ok=True)
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    restored = _reconstruct_requested_policy(
+        args,
+        fallback_model_cfg,
+        visual_source,
+        admitted_source_metadata,
+    )
+    rank, world_size, local_rank = init_distributed(backend=train_cfg.dist_backend)
+    rank_seed = args.seed + rank
+    torch.manual_seed(rank_seed)
+    random.seed(rank_seed)
+    try:
+        import numpy as np
 
-    load_checkpoint_path = args.resume or args.init_checkpoint
+        np.random.seed(rank_seed % (2**32))
+    except ImportError:  # pragma: no cover - optional dependency
+        pass
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    ocr_position_contract = (
+        args.ocr_position_contract if args.task == "ocr" else None
+    )
+    if args.task == "ocr" and not args.smoke and ocr_position_contract is None:
+        raise RuntimeError(
+            "OCR preflight did not resolve an explicit position contract"
+        )
+    if args.resume:
+        validate_resumable_checkpoint(
+            args.resume,
+            require_scaler=(train_cfg.precision == "fp16" and device.type == "cuda"),
+            context="GRPO --resume",
+        )
+
     source_checkpoint = ""
     reference_checkpoint = ""
     reference_artifact_dir = ""
     source_metadata: dict = {}
-    if load_checkpoint_path:
-        restored = reconstruct_policy_from_checkpoint(
-            load_checkpoint_path,
-            fallback_rdt_config=fallback_model_cfg,
-            require_vision=args.task == "ocr",
-        )
+    if restored is not None:
         policy = restored.model
         model_cfg = restored.rdt_config
         omvt_cfg = restored.omvt_config
@@ -1089,7 +1694,11 @@ def main(argv: list[str] | None = None) -> int:
             if not reference_checkpoint:
                 raise ValueError("GRPO resume checkpoint has no immutable reference_checkpoint")
         else:
-            source_checkpoint = str(restored.checkpoint_dir.absolute())
+            source_checkpoint = (
+                str(visual_source["source_checkpoint"])
+                if args.task == "ocr" and not args.smoke
+                else str(restored.checkpoint_dir.absolute())
+            )
     else:
         model_cfg = fallback_model_cfg
         omvt_cfg = None
@@ -1098,6 +1707,16 @@ def main(argv: list[str] | None = None) -> int:
     policy.reverse_loss_enabled = False
     trainable_names = _configure_trainable_scope(policy, args.train_scope)
     if args.resume:
+        resume_data_contract = source_metadata.get("data_contract")
+        if not isinstance(resume_data_contract, dict):
+            raise ValueError("GRPO resume checkpoint has no immutable data contract")
+        expected_reference_model_sha256 = resume_data_contract.get(
+            "reference_model_sha256"
+        )
+        if not isinstance(expected_reference_model_sha256, str):
+            raise ValueError(
+                "GRPO resume data contract has no immutable reference model SHA256"
+            )
         reference, restored_reference_dir = _load_immutable_reference(
             reference_checkpoint,
             source_checkpoint,
@@ -1107,6 +1726,12 @@ def main(argv: list[str] | None = None) -> int:
             local_rank,
             device,
             require_vision=args.task == "ocr",
+            tokenization_contract=tokenization_contract,
+            source_checkpoint_model_sha256=str(
+                visual_source.get("source_checkpoint_model_sha256", "")
+            ),
+            expected_reference_model_sha256=expected_reference_model_sha256,
+            position_contract=ocr_position_contract,
         )
         reference_artifact_dir = str(restored_reference_dir)
     else:
@@ -1114,6 +1739,13 @@ def main(argv: list[str] | None = None) -> int:
             policy, model_cfg, train_cfg, local_rank, device
         )
     policy = policy.to(device)
+
+    # Do not create a run directory until source admission and hash-bound
+    # reconstruction have both succeeded.
+    if is_main_process():
+        output_path.mkdir(parents=True, exist_ok=True)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     if is_main_process():
         n_trainable = sum(param.numel() for param in policy.parameters() if param.requires_grad)
@@ -1137,29 +1769,24 @@ def main(argv: list[str] | None = None) -> int:
     tool_close_ids: list[int] = []
     processor = None
     validation_dataset = None
-    golden_dataset = None
-    run_data_contract: dict[str, str] = {}
+    run_data_contract: dict[str, object] = {}
     if args.smoke:
         dataset = _smoke_dataset()
         decode = _smoke_decode
     else:
-        from Tokenizer.unified.bundle import TokenizerBundle
-
         from Model.posttrain.chat_template import (
             TOOL_RESULT_CLOSE,
             TOOL_RESULT_OPEN,
         )
 
-        bundle = TokenizerBundle.from_dir(args.tokenizer)
-        bundle_issues = bundle.validate()
-        if bundle_issues:
-            raise ValueError(
-                "invalid tokenizer bundle:\n  - " + "\n  - ".join(bundle_issues)
-            )
+        assert bundle is not None
         if args.task == "ocr":
-            from scripts.build_ocr_data import make_ocr_target_encoder
-
-            encode_reference = make_ocr_target_encoder(bundle.tokenizer)
+            if golden_identity_rows is None:
+                raise RuntimeError("OCR preflight produced no golden identity rows")
+            encode_reference = make_ocr_target_encoder(
+                bundle.tokenizer,
+                mode=OCR_NATIVE_TARGET_ENCODING,
+            )
             decode = lambda ids: decode_ocr_completion(  # noqa: E731
                 ids,
                 bundle.tokenizer.decode,
@@ -1181,38 +1808,23 @@ def main(argv: list[str] | None = None) -> int:
                 image_patch_id=IMAGE_PATCH_ID,
                 image_end_id=IMAGE_END_ID,
                 encode_reference=encode_reference,
+                canonicalize_reference=canonicalize_native_ocr_text,
                 image_root=args.image_root or None,
                 max_prompt_len=args.max_prompt_len,
                 max_completion_len=args.max_new_tokens,
                 max_seq_len=model_cfg.max_seq_len,
                 validate_images=True,
-                verify_image_decode=True,
+                verify_image_decode=False,
                 require_sha256=True,
                 require_group_id=True,
                 require_domain=True,
-                verify_sha256=True,
+                verify_sha256=False,
+                allow_instruction=False,
             )
-            golden_dataset_kwargs = dict(dataset_kwargs)
-            # The locked golden labels are not a source of generation-length
-            # or reward hyperparameters.  Training may inspect schema and
-            # identity keys only, so even reference token counts stay hidden.
-            golden_dataset_kwargs.update(
-                max_completion_len=None,
-                inspect_reference_tokens=False,
-                retain_reference=False,
-                inspect_prompt_tokens=False,
+            golden_ids, golden_sha256, golden_groups = golden_identity_keys(
+                golden_identity_rows
             )
-            golden_dataset = OCRPromptDataset(
-                args.golden_manifest,
-                required_split=args.golden_split,
-                **golden_dataset_kwargs,
-            )
-            (
-                golden_ids,
-                golden_images,
-                golden_sha256,
-                golden_groups,
-            ) = _dataset_exclusions(golden_dataset)
+            golden_images: set[str] = set()
             validation_dataset = OCRPromptDataset(
                 args.validation_manifest,
                 required_split=args.validation_split,
@@ -1251,7 +1863,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.task == "text" and not args.no_tool_result_mask:
             tool_open_ids = list(bundle.encode(TOOL_RESULT_OPEN, add_bos=False, add_eos=False))
             tool_close_ids = list(bundle.encode(TOOL_RESULT_CLOSE, add_bos=False, add_eos=False))
-        run_data_contract = _data_contract(args, bundle)
+        run_data_contract = _data_contract(
+            args,
+            bundle,
+            golden_identity_rows=golden_identity_rows,
+            tokenization_contract=tokenization_contract,
+            visual_source=visual_source,
+            public_dataset_contract=public_dataset_contract,
+        )
 
     if not args.resume and not args.smoke:
         reference_root = (Path(train_cfg.output_dir) / "reference").absolute()
@@ -1264,7 +1883,16 @@ def main(argv: list[str] | None = None) -> int:
                 reference,
                 optimizer=None,
                 scheduler=None,
-                metadata=_reference_metadata(model_cfg, omvt_cfg, source_checkpoint),
+                metadata=_reference_metadata(
+                    model_cfg,
+                    omvt_cfg,
+                    source_checkpoint,
+                    tokenization_contract=tokenization_contract,
+                    source_checkpoint_model_sha256=str(
+                        visual_source.get("source_checkpoint_model_sha256", "")
+                    ),
+                    position_contract=ocr_position_contract,
+                ),
                 keep_last_n=1,
             )
     if not args.smoke and (args.resume or args.task != "ocr"):
@@ -1285,6 +1913,8 @@ def main(argv: list[str] | None = None) -> int:
             run_data_contract,
         )
     state = TrainState()
+    progress_contract_sha256 = canonical_json_sha256(run_data_contract)
+    last_full_checkpoint_dir: Path | None = None
     if train_cfg.resume:
         state.step = resume_state(
             train_cfg.resume, policy, optimizer, scheduler, state=state
@@ -1292,7 +1922,23 @@ def main(argv: list[str] | None = None) -> int:
         pending_scaler = state.extra.pop("grad_scaler_state", None)
         if pending_scaler is not None and scaler.is_enabled():
             scaler.load_state_dict(pending_scaler)
+        last_full_checkpoint_dir = resolve_checkpoint_dir(train_cfg.resume)
     restored_health = source_metadata.get("health_state", {}) if args.resume else {}
+    if train_cfg.resume:
+        journal = load_no_update_progress(
+            train_cfg.resume,
+            contract_sha256=progress_contract_sha256,
+        )
+        if journal is not None:
+            restore_rng_state(journal["rng_state"])
+            restored_health = journal["state"]
+            if is_main_process():
+                print(
+                    "[resume] restored no-update rollout cursor "
+                    f"at optimizer_step={state.step} "
+                    f"batch={restored_health.get('batches_consumed')}",
+                    flush=True,
+                )
     degenerate_streak = int(restored_health.get("degenerate_streak", 0))
     high_kl_streak = int(restored_health.get("high_kl_streak", 0))
     best_val_cer = float(restored_health.get("best_val_grapheme_cer", float("inf")))
@@ -1309,6 +1955,7 @@ def main(argv: list[str] | None = None) -> int:
     consecutive_optimizer_skips = int(
         restored_health.get("consecutive_optimizer_skips", 0)
     )
+    stop_reason = str(restored_health.get("stop_reason", "running"))
     batches = _iter_prompt_batches(
         dataset,
         args.prompts_per_step,
@@ -1337,11 +1984,139 @@ def main(argv: list[str] | None = None) -> int:
             "batches_consumed": batches_consumed,
             "optimizer_skip_count": optimizer_skip_count,
             "consecutive_optimizer_skips": consecutive_optimizer_skips,
+            "stop_reason": stop_reason,
         }
+
+    def save_resumable_checkpoint(*, final: bool = False) -> Path | None:
+        """Publish one full optimizer state and supersede its small journal."""
+
+        nonlocal last_full_checkpoint_dir
+        checkpoint = save_checkpoint(
+            train_cfg.output_dir,
+            state.step,
+            policy,
+            optimizer,
+            scheduler,
+            metadata=_checkpoint_metadata(
+                args,
+                train_cfg,
+                model_cfg,
+                omvt_cfg,
+                reward_cfg,
+                grpo_cfg,
+                source_checkpoint,
+                reference_checkpoint,
+                data_contract=run_data_contract,
+                health_state=health_payload(),
+                final=final,
+            ),
+            keep_last_n=train_cfg.keep_last_n,
+            scaler=scaler if scaler.is_enabled() else None,
+        )
+        last_full_checkpoint_dir = (
+            Path(train_cfg.output_dir).absolute()
+            / f"step_{state.step:08d}"
+        )
+        clear_no_update_progress(last_full_checkpoint_dir)
+        return checkpoint
+
+    def evaluate_and_select(metrics: dict[str, float]) -> dict[str, float]:
+        """Run the full OCR validation set and update the eligible best model."""
+
+        nonlocal best_val_cer
+        nonlocal best_val_step
+        nonlocal best_val_eligible
+        nonlocal best_checkpoint
+        nonlocal bad_eval_count
+        nonlocal eval_count
+
+        assert validation_dataset is not None
+        assert processor is not None and omvt_cfg is not None
+        eval_started = time.time()
+        validation = _evaluate_ocr_validation(
+            policy,
+            validation_dataset,
+            processor,
+            omvt_cfg,
+            decode,
+            batch_size=args.eval_batch_size,
+            max_new_tokens=args.max_new_tokens,
+            recurrent_steps=grpo_cfg.recurrent_steps,
+            precision=train_cfg.precision,
+            device=device,
+            cer_backend=reward_cfg.grapheme_cer_backend,
+            position_contract=ocr_position_contract,
+        )
+        validation = _broadcast_rank_zero_object(validation, device)
+        if not isinstance(validation, dict):
+            raise RuntimeError("rank-zero validation payload is not a dictionary")
+        eval_count += 1
+        current_cer = validation["grapheme_cer"]
+        validation_eligible = bool(
+            validation["eos_rate"] >= args.min_validation_eos_rate
+            and validation["invalid_output_rate"]
+            <= args.max_validation_invalid_rate
+        )
+        improved = validation_eligible and (
+            not best_val_eligible
+            or current_cer < best_val_cer - args.early_stop_min_delta
+        )
+        if improved:
+            best_val_cer = current_cer
+            best_val_step = state.step
+            best_val_eligible = True
+            bad_eval_count = 0
+            best_root = (Path(train_cfg.output_dir) / "best").absolute()
+            best_checkpoint = str(best_root / f"step_{state.step:08d}")
+            save_checkpoint(
+                best_root,
+                state.step,
+                policy,
+                optimizer=None,
+                scheduler=None,
+                metadata=_checkpoint_metadata(
+                    args,
+                    train_cfg,
+                    model_cfg,
+                    omvt_cfg,
+                    reward_cfg,
+                    grpo_cfg,
+                    source_checkpoint,
+                    reference_checkpoint,
+                    data_contract=run_data_contract,
+                    health_state=health_payload(),
+                ),
+                keep_last_n=1,
+            )
+        else:
+            bad_eval_count += 1
+
+        metrics.update(
+            {
+                f"val_{name}": float(value)
+                for name, value in validation.items()
+                if isinstance(value, (int, float)) and value is not None
+            }
+        )
+        metrics["val_best_grapheme_cer"] = best_val_cer
+        metrics["val_best_step"] = float(best_val_step)
+        metrics["val_bad_eval_count"] = float(bad_eval_count)
+        metrics["val_eligible"] = float(validation_eligible)
+        metrics["val_eval_time_s"] = time.time() - eval_started
+        if is_main_process():
+            print(
+                f"[val] step={state.step} grapheme_cer={current_cer:.6f} "
+                f"eligible={int(validation_eligible)} "
+                f"best={best_val_cer:.6f}@{best_val_step} "
+                f"bad={bad_eval_count}/{args.early_stop_patience}",
+                flush=True,
+            )
+        return validation
 
     try:
         if args.task == "ocr":
             assert processor is not None and omvt_cfg is not None
+            assert ocr_position_contract is not None
             first_row = dataset[0]
             first_prompt = torch.tensor(
                 first_row["prompt_ids"], dtype=torch.long, device=device
@@ -1355,14 +2130,17 @@ def main(argv: list[str] | None = None) -> int:
                 first_pixels,
                 train_cfg.precision,
                 device,
+                ocr_position_contract,
             )
-            if (
+            delta_ok = not (
                 not torch.isfinite(torch.tensor(delta))
                 or delta < args.min_visual_logit_delta
-            ):
+            )
+            if not _all_ranks_true(delta_ok, device):
+                rank_min_delta = _distributed_min(delta, device)
                 raise RuntimeError(
                     "visual conditioning gate failed: real-vs-blank "
-                    f"max_logit_delta={delta:.6g} < "
+                    f"rank_min_max_logit_delta={rank_min_delta:.6g} < "
                     f"{args.min_visual_logit_delta:.6g}"
                 )
             if is_main_process():
@@ -1383,7 +2161,9 @@ def main(argv: list[str] | None = None) -> int:
                 precision=train_cfg.precision,
                 device=device,
                 cer_backend=reward_cfg.grapheme_cer_backend,
+                position_contract=ocr_position_contract,
             )
+            baseline = _broadcast_rank_zero_object(baseline, device)
             blank_baseline = _evaluate_ocr_validation(
                 policy,
                 validation_dataset,
@@ -1396,8 +2176,16 @@ def main(argv: list[str] | None = None) -> int:
                 precision=train_cfg.precision,
                 device=device,
                 cer_backend=reward_cfg.grapheme_cer_backend,
+                position_contract=ocr_position_contract,
                 blank_visual=True,
             )
+            blank_baseline = _broadcast_rank_zero_object(blank_baseline, device)
+            if not isinstance(baseline, dict) or not isinstance(
+                blank_baseline, dict
+            ):
+                raise RuntimeError(
+                    "rank-zero baseline validation payload is invalid"
+                )
             baseline_visual_cer_gap = (
                 blank_baseline["grapheme_cer"] - baseline["grapheme_cer"]
             )
@@ -1415,13 +2203,23 @@ def main(argv: list[str] | None = None) -> int:
                 reference,
                 optimizer=None,
                 scheduler=None,
-                metadata=_reference_metadata(model_cfg, omvt_cfg, source_checkpoint),
+                metadata=_reference_metadata(
+                    model_cfg,
+                    omvt_cfg,
+                    source_checkpoint,
+                    tokenization_contract=tokenization_contract,
+                    source_checkpoint_model_sha256=str(
+                        visual_source.get("source_checkpoint_model_sha256", "")
+                    ),
+                    position_contract=ocr_position_contract,
+                ),
                 keep_last_n=1,
             )
             run_data_contract["reference_model_sha256"] = _distributed_file_sha256(
                 Path(reference_artifact_dir) / "model.pt",
                 rank,
             )
+            progress_contract_sha256 = canonical_json_sha256(run_data_contract)
             best_val_cer = baseline["grapheme_cer"]
             best_val_step = state.step
             best_val_eligible = bool(
@@ -1456,27 +2254,7 @@ def main(argv: list[str] | None = None) -> int:
             # Establish a fully resumable step-0 anchor immediately. Waiting
             # for the first periodic/evaluation save would leave the beginning
             # of a long run without optimizer/RNG recovery after an outage.
-            save_checkpoint(
-                train_cfg.output_dir,
-                state.step,
-                policy,
-                optimizer,
-                scheduler,
-                metadata=_checkpoint_metadata(
-                    args,
-                    train_cfg,
-                    model_cfg,
-                    omvt_cfg,
-                    reward_cfg,
-                    grpo_cfg,
-                    source_checkpoint,
-                    reference_checkpoint,
-                    data_contract=run_data_contract,
-                    health_state=health_payload(),
-                ),
-                keep_last_n=train_cfg.keep_last_n,
-                scaler=scaler if scaler.is_enabled() else None,
-            )
+            save_resumable_checkpoint()
             logger.log(
                 state.step,
                 {
@@ -1507,20 +2285,32 @@ def main(argv: list[str] | None = None) -> int:
                     f"{best_checkpoint!r}"
                 )
 
-        resume_already_plateaued = bool(
+        resume_already_stopped = bool(
             args.resume
-            and args.task == "ocr"
-            and bad_eval_count >= args.early_stop_patience
+            and (
+                stop_reason != "running"
+                or (
+                    args.task == "ocr"
+                    and bad_eval_count >= args.early_stop_patience
+                )
+                or degenerate_streak >= args.max_degenerate_steps
+            )
         )
-        if resume_already_plateaued and is_main_process():
+        if resume_already_stopped and stop_reason == "running":
+            stop_reason = (
+                "no_reward_spread"
+                if degenerate_streak >= args.max_degenerate_steps
+                else "validation_plateau"
+            )
+        if resume_already_stopped and is_main_process():
             print(
-                "[early-stop] resume checkpoint already reached validation "
-                f"patience; keeping selected {best_checkpoint}",
+                "[early-stop] resume checkpoint is already terminal "
+                f"(reason={stop_reason}); keeping selected {best_checkpoint}",
                 flush=True,
             )
 
         last_logged_step = state.step
-        while not resume_already_plateaued and state.step < train_cfg.max_steps:
+        while not resume_already_stopped and state.step < train_cfg.max_steps:
             rows = next(batches)
             batches_consumed += 1
             prompts = [torch.tensor(r["prompt_ids"], dtype=torch.long, device=device)
@@ -1549,25 +2339,43 @@ def main(argv: list[str] | None = None) -> int:
                     policy, reference, prompts, reward_fn, decode,
                     cfg=grpo_cfg, eos_id=EOS_ID, pad_id=PAD_ID,
                     pixel_values=pixels,
+                    position_contract=ocr_position_contract,
+                    enforce_behavior_gate=False,
                 )
             loss_is_finite = bool(torch.isfinite(loss.detach()))
             if not _all_ranks_true(loss_is_finite, device):
                 raise FloatingPointError(f"non-finite GRPO loss at step {state.step}")
             metrics.update({f"reward_{name}": value for name, value in reward_parts.items()})
+            rank_max_behavior_log_ratio = _distributed_max(
+                metrics.get("behavior_log_ratio_abs_max", 0.0),
+                device,
+            )
+            if (
+                grpo_cfg.max_behavior_log_ratio is not None
+                and rank_max_behavior_log_ratio
+                > grpo_cfg.max_behavior_log_ratio
+            ):
+                raise RuntimeError(
+                    "rollout/scoring policy mismatch on at least one worker: "
+                    "completion-token "
+                    f"|log_ratio|max={rank_max_behavior_log_ratio:.6g} exceeds "
+                    f"{grpo_cfg.max_behavior_log_ratio:.6g}"
+                )
             rank_max_kl = _distributed_max(metrics.get("kl", 0.0), device)
             metrics = _distributed_mean_metrics(metrics, device)
             metrics["kl_rank_max"] = rank_max_kl
+            metrics["behavior_log_ratio_rank_max"] = (
+                rank_max_behavior_log_ratio
+            )
 
+            all_groups_degenerate = (
+                metrics.get("active_group", 0.0) <= 1e-9
+            )
             degenerate_streak = (
                 degenerate_streak + 1
-                if metrics.get("degenerate_group", 0.0) >= 1.0 - 1e-9
+                if all_groups_degenerate
                 else 0
             )
-            if degenerate_streak >= args.max_degenerate_steps:
-                raise RuntimeError(
-                    "all prompt groups produced zero reward variance for "
-                    f"{degenerate_streak} consecutive steps; refusing zero-advantage RL"
-                )
             high_kl_streak = (
                 high_kl_streak + 1
                 if rank_max_kl > args.kl_abort_threshold
@@ -1578,6 +2386,76 @@ def main(argv: list[str] | None = None) -> int:
                     f"KL exceeded {args.kl_abort_threshold} for "
                     f"{high_kl_streak} consecutive steps"
                 )
+
+            if all_groups_degenerate:
+                # No group carries a policy-gradient signal.  A KL-only update
+                # would look like learning while merely pulling the policy back
+                # toward the reference, so consume no optimizer/scheduler step.
+                metrics.update(
+                    {
+                        "grad_norm": 0.0,
+                        "lr": float(scheduler.get_last_lr()[0]),
+                        "degenerate_streak": float(degenerate_streak),
+                        "high_kl_streak": float(high_kl_streak),
+                        "batches_consumed": float(batches_consumed),
+                        "optimizer_skip_count": float(optimizer_skip_count),
+                        "consecutive_optimizer_skips": float(
+                            consecutive_optimizer_skips
+                        ),
+                        "optimizer_step_skipped": 1.0,
+                        "no_reward_update_skipped": 1.0,
+                    }
+                )
+                if degenerate_streak >= args.max_degenerate_steps:
+                    if args.task == "ocr":
+                        evaluate_and_select(metrics)
+                    stop_reason = "no_reward_spread"
+                    logger.log(state.step, metrics)
+                    if is_main_process():
+                        print(
+                            "[early-stop] no prompt group carried reward "
+                            f"spread for {degenerate_streak} consecutive "
+                            "rollouts; validation completed and no zero-signal "
+                            "optimizer step was taken",
+                            flush=True,
+                        )
+                    break
+                if (
+                    is_main_process()
+                    and (
+                        degenerate_streak == 1
+                        or degenerate_streak % 5 == 0
+                    )
+                ):
+                    print(
+                        "[no-signal] skipped optimizer update "
+                        f"streak={degenerate_streak}/"
+                        f"{args.max_degenerate_steps}",
+                        flush=True,
+                    )
+                if not args.smoke:
+                    output_root = Path(train_cfg.output_dir).resolve()
+                    anchor_is_current = bool(
+                        last_full_checkpoint_dir is not None
+                        and last_full_checkpoint_dir.name
+                        == f"step_{state.step:08d}"
+                        and last_full_checkpoint_dir.parent.resolve()
+                        == output_root
+                    )
+                    if not anchor_is_current:
+                        # At most one full checkpoint is needed when a
+                        # no-signal streak begins after unsaved optimizer
+                        # updates. Further zero-update rollouts use the small
+                        # control/RNG journal below.
+                        save_resumable_checkpoint()
+                    else:
+                        assert last_full_checkpoint_dir is not None
+                        save_no_update_progress(
+                            last_full_checkpoint_dir,
+                            contract_sha256=progress_contract_sha256,
+                            state=health_payload(),
+                        )
+                continue
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -1653,70 +2531,7 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint_written = False
             stop_for_plateau = False
             if args.task == "ocr" and state.step % args.eval_every == 0:
-                assert validation_dataset is not None
-                assert processor is not None and omvt_cfg is not None
-                eval_started = time.time()
-                validation = _evaluate_ocr_validation(
-                    policy,
-                    validation_dataset,
-                    processor,
-                    omvt_cfg,
-                    decode,
-                    batch_size=args.eval_batch_size,
-                    max_new_tokens=args.max_new_tokens,
-                    recurrent_steps=grpo_cfg.recurrent_steps,
-                    precision=train_cfg.precision,
-                    device=device,
-                    cer_backend=reward_cfg.grapheme_cer_backend,
-                )
-                eval_count += 1
-                current_cer = validation["grapheme_cer"]
-                validation_eligible = bool(
-                    validation["eos_rate"] >= args.min_validation_eos_rate
-                    and validation["invalid_output_rate"]
-                    <= args.max_validation_invalid_rate
-                )
-                improved = (
-                    validation_eligible
-                    and current_cer < best_val_cer - args.early_stop_min_delta
-                )
-                if improved:
-                    best_val_cer = current_cer
-                    best_val_step = state.step
-                    best_val_eligible = True
-                    bad_eval_count = 0
-                    best_root = (Path(train_cfg.output_dir) / "best").absolute()
-                    best_checkpoint = str(best_root / f"step_{state.step:08d}")
-                    save_checkpoint(
-                        best_root,
-                        state.step,
-                        policy,
-                        optimizer=None,
-                        scheduler=None,
-                        metadata=_checkpoint_metadata(
-                            args,
-                            train_cfg,
-                            model_cfg,
-                            omvt_cfg,
-                            reward_cfg,
-                            grpo_cfg,
-                            source_checkpoint,
-                            reference_checkpoint,
-                            data_contract=run_data_contract,
-                            health_state=health_payload(),
-                        ),
-                        keep_last_n=1,
-                    )
-                else:
-                    bad_eval_count += 1
-                metrics.update(
-                    {f"val_{name}": value for name, value in validation.items()}
-                )
-                metrics["val_best_grapheme_cer"] = best_val_cer
-                metrics["val_best_step"] = float(best_val_step)
-                metrics["val_bad_eval_count"] = float(bad_eval_count)
-                metrics["val_eligible"] = float(validation_eligible)
-                metrics["val_eval_time_s"] = time.time() - eval_started
+                evaluate_and_select(metrics)
                 stop_for_plateau = bad_eval_count >= args.early_stop_patience
 
                 # Every validation decision is resumable.  Otherwise a power
@@ -1727,37 +2542,8 @@ def main(argv: list[str] | None = None) -> int:
                     and not stop_for_plateau
                     and state.step < train_cfg.max_steps
                 ):
-                    save_checkpoint(
-                        train_cfg.output_dir,
-                        state.step,
-                        policy,
-                        optimizer,
-                        scheduler,
-                        metadata=_checkpoint_metadata(
-                            args,
-                            train_cfg,
-                            model_cfg,
-                            omvt_cfg,
-                            reward_cfg,
-                            grpo_cfg,
-                            source_checkpoint,
-                            reference_checkpoint,
-                            data_contract=run_data_contract,
-                            health_state=health_payload(),
-                        ),
-                        keep_last_n=train_cfg.keep_last_n,
-                        scaler=scaler if scaler.is_enabled() else None,
-                    )
+                    save_resumable_checkpoint()
                     checkpoint_written = True
-                if is_main_process():
-                    print(
-                        f"[val] step={state.step} grapheme_cer={current_cer:.6f} "
-                        f"eligible={int(validation_eligible)} "
-                        f"best={best_val_cer:.6f}@{best_val_step} "
-                        f"bad={bad_eval_count}/{args.early_stop_patience}",
-                        flush=True,
-                    )
-
             if state.step % train_cfg.log_every == 0 or args.smoke:
                 dt = max(1e-6, time.time() - t0)
                 logged_steps = max(1, state.step - last_logged_step)
@@ -1778,26 +2564,12 @@ def main(argv: list[str] | None = None) -> int:
                 and not checkpoint_written
                 and state.step < train_cfg.max_steps
             ):
-                save_checkpoint(
-                    train_cfg.output_dir, state.step, policy, optimizer, scheduler,
-                    metadata=_checkpoint_metadata(
-                        args,
-                        train_cfg,
-                        model_cfg,
-                        omvt_cfg,
-                        reward_cfg,
-                        grpo_cfg,
-                        source_checkpoint,
-                        reference_checkpoint,
-                        data_contract=run_data_contract,
-                        health_state=health_payload(),
-                    ),
-                    keep_last_n=train_cfg.keep_last_n,
-                    scaler=scaler if scaler.is_enabled() else None,
-                )
+                save_resumable_checkpoint()
             if args.smoke and state.step >= 4:
+                stop_reason = "smoke_complete"
                 break
             if stop_for_plateau:
+                stop_reason = "validation_plateau"
                 if is_main_process():
                     print(
                         "[early-stop] validation grapheme CER did not improve "
@@ -1806,29 +2578,42 @@ def main(argv: list[str] | None = None) -> int:
                         flush=True,
                     )
                 break
+        if stop_reason == "running":
+            stop_reason = (
+                "max_steps"
+                if state.step >= train_cfg.max_steps
+                else "completed"
+            )
         completed = True
     finally:
         try:
             logger.close()
             if completed and not args.smoke:
-                save_checkpoint(
-                    train_cfg.output_dir, state.step, policy, optimizer, scheduler,
-                    metadata=_checkpoint_metadata(
-                        args,
-                        train_cfg,
-                        model_cfg,
-                        omvt_cfg,
-                        reward_cfg,
-                        grpo_cfg,
-                        source_checkpoint,
-                        reference_checkpoint,
+                terminal_checkpoint = save_resumable_checkpoint(final=True)
+                if (
+                    args.task == "ocr"
+                    and is_main_process()
+                    and best_val_eligible
+                    and best_val_step > 0
+                ):
+                    if terminal_checkpoint is None:
+                        raise RuntimeError(
+                            "rank zero did not receive the terminal checkpoint path"
+                        )
+                    receipt = build_selection_receipt(
+                        selected_checkpoint=best_checkpoint,
+                        selected_step=best_val_step,
+                        terminal_checkpoint=terminal_checkpoint,
+                        terminal_step=state.step,
+                        stop_reason=stop_reason,
                         data_contract=run_data_contract,
-                        health_state=health_payload(),
-                        final=True,
-                    ),
-                    keep_last_n=train_cfg.keep_last_n,
-                    scaler=scaler if scaler.is_enabled() else None,
-                )
+                    )
+                    write_selection_receipt(
+                        Path(train_cfg.output_dir)
+                        / "best"
+                        / "SELECTION_FINALIZED.json",
+                        receipt,
+                    )
         finally:
             destroy_distributed()
     return 0

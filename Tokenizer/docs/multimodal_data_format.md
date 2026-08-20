@@ -37,9 +37,17 @@
 
 | 脚本 | 启用多模态的方式 |
 | --- | --- |
-| `scripts/train_rdt.py` | `--multimodal --image-size 56 --n-image-tokens 4 --data <jsonl>` |
+| `scripts/train_rdt.py` | `--multimodal --image-size 56 --n-image-tokens 4 --tokenizer-bundle <bundle> --data <jsonl> --data-receipt <receipt>` |
 | `scripts/train_vlm_align.py` | `--data <jsonl>`（同时锁住视觉塔可加 `--frozen-vision`） |
 | `scripts/train_omvt_ssl.py` | `--data <jsonl>`（orientation 自监督自动生效；OCR/layout 头按字段降级） |
+
+这里的 RDT receipt 必须来自生成这些预分词 JSONL 的
+`Tokenizer.tools.build_pretraining_data --receipt ...`，它同时绑定分片
+字节、tokenizer bundle 和 tokenizer 算法。若另设 `--eval-data`，验证集需
+独立 receipt，并通过 `--eval-data-receipt` 传入。
+所有 production/non-smoke receipt-backed train/eval/mix JSONL 行还必须
+持久化 `word_pos` 与 `morph_depth`；model-side fallback 仅限 legacy/smoke，
+不得作为 production 路径。
 
 ## 公开数据集 → 本 Schema 的迁移骨架
 

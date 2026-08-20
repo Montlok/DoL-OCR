@@ -64,6 +64,24 @@ def parse_args(argv=None):
         help="JSONL path with rows {'images': [...], 'ocr_labels': [...], 'reading_order': [...]} "
         "(ocr_labels / reading_order optional)",
     )
+    p.add_argument(
+        "--pair-shards-dir",
+        default="",
+        help="directory with pre-rendered WebDataset shard-NNNNN.tar pairs",
+    )
+    p.add_argument(
+        "--pair-shard-indices",
+        default="",
+        help="shard index spec for --pair-shards-dir, e.g. 0:3479",
+    )
+    p.add_argument(
+        "--tokenizer-bundle",
+        default="",
+        help="TokenizerBundle directory required for --pair-shards-dir",
+    )
+    p.add_argument("--pair-max-seq-len", type=int, default=512)
+    p.add_argument("--pair-val-src-doc-min", type=int, default=434600)
+    p.add_argument("--pair-test-src-doc-min", type=int, default=435200)
     p.add_argument("--output", default="outputs/omvt_ssl")
     p.add_argument("--resume", default="")
     p.add_argument("--save-every", type=int, default=0)
@@ -92,6 +110,12 @@ def parse_args(argv=None):
     )
     p.add_argument("--warmup-steps", type=int, default=200)
     p.add_argument(
+        "--lr-decay-steps",
+        type=int,
+        default=None,
+        help="LR schedule horizon; defaults to --steps",
+    )
+    p.add_argument(
         "--ema-decay", type=float, default=0.999,
         help="EMA decay for the tower weights (0 disables); the EMA tower is "
         "saved as 'tower_ema' in checkpoints and preferred by eval",
@@ -118,6 +142,20 @@ def _omvt_cfg(args) -> OMVTConfig:
     )
 
 
+def _training_cfg(args, cfg: OMVTConfig, use_bf16: bool) -> TrainingConfig:
+    return TrainingConfig(
+        train_data="",
+        seq_len=cfg.compress_to,
+        micro_batch_size=args.batch_size,
+        learning_rate=args.lr,
+        weight_decay=0.05,
+        max_steps=args.steps,
+        warmup_steps=max(1, args.warmup_steps),
+        lr_decay_steps=args.lr_decay_steps,
+        precision="bf16" if use_bf16 else "fp32",
+    )
+
+
 def _first_seq(value: object) -> list[int] | None:
     """Normalize a schema-correct ``list[list[int]]`` field to a 1-D row.
 
@@ -136,6 +174,91 @@ def _first_seq(value: object) -> list[int] | None:
         # Legacy or hand-built rows that already store a flat list.
         return [int(x) for x in value]  # type: ignore[arg-type]
     return None
+
+
+def _iter_pair_shards(
+    shards_dir: str,
+    shard_indices: list[int],
+    batch_size: int,
+    image_processor: PILImageProcessor,
+    encode_target,
+    *,
+    seed: int,
+    n_image_tokens: int,
+    max_seq_len: int = 512,
+    val_src_doc_min: int = 434600,
+    test_src_doc_min: int = 435200,
+    crop_prob: float = 0.0,
+    crop_min: float = 0.30,
+    crop_max: float = 0.60,
+) -> Iterator[dict]:
+    """Yield SSL batches directly from WebDataset-style tar shards.
+
+    This streams the NAS image-text corpus without materializing a second
+    224x224 copy on disk. It mirrors ``build_ocr_data_from_pairs``: keep only
+    train-band ``kind=="line"`` rows, byte-fallback encode targets, skip
+    over-length rows, and letterbox source strips before train-time image
+    processing.
+    """
+
+    if not shard_indices:
+        raise ValueError("pair shard indices must not be empty")
+    if val_src_doc_min >= test_src_doc_min:
+        raise ValueError("pair val src_doc min must be < test src_doc min")
+
+    from scripts.build_ocr_data_from_pairs import (
+        ShardCounters,
+        iter_tar_pairs,
+        letterbox_to_square,
+        shard_path,
+    )
+
+    rng = torch.Generator().manual_seed(seed)
+    pyrng = random.Random(seed)
+    prompt_overhead = 4 + int(n_image_tokens)
+
+    while True:
+        imgs: list = []
+        ocr: list = []
+        for shard_index in shard_indices:
+            tar_path = shard_path(shards_dir, shard_index)
+            counters = ShardCounters(shard_index)
+            for key, png_bytes, row in iter_tar_pairs(tar_path, counters):
+                if row.get("kind") != "line":
+                    continue
+                src_doc = row.get("src_doc")
+                if not isinstance(src_doc, int):
+                    raise ValueError(f"{tar_path}: key={key!r}: invalid src_doc")
+                if src_doc >= val_src_doc_min:
+                    continue
+                text = row.get("text")
+                if not isinstance(text, str) or not text:
+                    raise ValueError(f"{tar_path}: key={key!r}: missing text")
+                target_ids = encode_target(text)
+                if max_seq_len > 0 and prompt_overhead + len(target_ids) > max_seq_len:
+                    continue
+
+                spec = letterbox_to_square(png_bytes, image_processor.image_size)
+                label = target_ids
+                if crop_prob > 0 and pyrng.random() < crop_prob:
+                    short = min(spec.size)
+                    side = max(32, int(short * pyrng.uniform(crop_min, crop_max)))
+                    x = pyrng.randint(0, max(spec.width - side, 0))
+                    y = pyrng.randint(0, max(spec.height - side, 0))
+                    spec = spec.crop((x, y, x + side, y + side))
+                    label = None
+
+                imgs.append(spec)
+                ocr.append(label)
+                if len(imgs) == batch_size:
+                    yield {
+                        "images": image_processor(imgs),
+                        "ocr_labels": ocr,
+                        "reading_order": [None] * batch_size,
+                        "rng": rng,
+                    }
+                    imgs = []
+                    ocr = []
 
 
 def _iter_real_jsonl(
@@ -371,6 +494,15 @@ def _load_checkpoint(
 
 def main(argv=None):
     args = parse_args(argv)
+    pair_mode = bool(args.pair_shards_dir or args.pair_shard_indices)
+    if args.data and pair_mode:
+        raise ValueError("--data and --pair-shards-dir are mutually exclusive")
+    if pair_mode and not (
+        args.pair_shards_dir and args.pair_shard_indices and args.tokenizer_bundle
+    ):
+        raise ValueError(
+            "--pair-shards-dir requires --pair-shard-indices and --tokenizer-bundle"
+        )
     torch.manual_seed(args.seed)
     if getattr(args, "device", "auto") == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -388,16 +520,7 @@ def main(argv=None):
     use_bf16 = args.precision == "bf16" or (
         args.precision == "auto" and device.type == "cuda"
     )
-    train_cfg = TrainingConfig(
-        train_data="",
-        seq_len=cfg.compress_to,
-        micro_batch_size=args.batch_size,
-        learning_rate=args.lr,
-        weight_decay=0.05,
-        max_steps=args.steps,
-        warmup_steps=max(1, args.warmup_steps),
-        precision="bf16" if use_bf16 else "fp32",
-    )
+    train_cfg = _training_cfg(args, cfg, use_bf16)
     optimizer = build_optimizer(modules, train_cfg)
     scheduler = build_scheduler(optimizer, train_cfg)
     ema = _Ema(tower, args.ema_decay) if args.ema_decay > 0 else None
@@ -431,6 +554,31 @@ def main(argv=None):
                 args.batch_size,
                 PILImageProcessor(image_size=args.image_size),
                 seed=args.seed,
+                crop_prob=args.crop_prob,
+                crop_min=args.crop_min,
+                crop_max=args.crop_max,
+            ),
+            args.prefetch,
+        )
+    elif pair_mode:
+        from Tokenizer.unified.bundle import TokenizerBundle
+        from scripts.build_ocr_data import make_ocr_target_encoder
+        from scripts.build_ocr_data_from_pairs import parse_shard_indices
+
+        bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
+        encode_target = make_ocr_target_encoder(bundle.tokenizer)
+        real_iter = _prefetch(
+            _iter_pair_shards(
+                args.pair_shards_dir,
+                parse_shard_indices(args.pair_shard_indices),
+                args.batch_size,
+                PILImageProcessor(image_size=args.image_size),
+                encode_target,
+                seed=args.seed,
+                n_image_tokens=cfg.compress_to,
+                max_seq_len=args.pair_max_seq_len,
+                val_src_doc_min=args.pair_val_src_doc_min,
+                test_src_doc_min=args.pair_test_src_doc_min,
                 crop_prob=args.crop_prob,
                 crop_min=args.crop_min,
                 crop_max=args.crop_max,

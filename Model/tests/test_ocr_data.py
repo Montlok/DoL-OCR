@@ -61,6 +61,51 @@ class TestBuildOCRRow(unittest.TestCase):
         self.assertEqual(len(row["labels"]), n)
         self.assertTrue(all(m == 1 for m in row["attention_mask"]))
 
+    def test_pretraining_morphology_features_align_with_full_row(self):
+        row = build_ocr_row(
+            [10, 11, 12],
+            2,
+            "images/0.png",
+            bos_id=BOS,
+            image_start_id=ISTART,
+            image_patch_id=IPATCH,
+            image_end_id=IEND,
+            eos_id=EOS,
+            instruction_ids=[20, 21],
+            instruction_track_ids=[2, 0],
+            target_track_ids=[1, 1, 0],
+        )
+        self.assertEqual(len(row["word_pos"]), len(row["input_ids"]))
+        self.assertEqual(len(row["morph_depth"]), len(row["input_ids"]))
+        self.assertEqual(row["morph_depth"][-4:], [0, 1, 0, 0])
+
+    def test_partial_or_misaligned_morphology_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            build_ocr_row(
+                [10],
+                2,
+                "images/0.png",
+                bos_id=BOS,
+                image_start_id=ISTART,
+                image_patch_id=IPATCH,
+                image_end_id=IEND,
+                eos_id=EOS,
+                target_track_ids=[1],
+            )
+        with self.assertRaisesRegex(ValueError, "align"):
+            build_ocr_row(
+                [10, 11],
+                2,
+                "images/0.png",
+                bos_id=BOS,
+                image_start_id=ISTART,
+                image_patch_id=IPATCH,
+                image_end_id=IEND,
+                eos_id=EOS,
+                instruction_track_ids=[],
+                target_track_ids=[1],
+            )
+
     def test_single_image_passthrough(self):
         row = self._row([10], n=2)
         self.assertEqual(row["images"], ["images/0.png"])

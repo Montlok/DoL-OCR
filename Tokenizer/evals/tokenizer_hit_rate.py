@@ -86,6 +86,9 @@ def compute_hit_rate(texts: list[str], tokenizer: DualTrackTokenizer) -> dict[st
     tokens = 0
     unk_count = 0
     byte_fallback = 0
+    mongolian_chars = 0
+    mongolian_native_chars = 0
+    mongolian_fallback_tokens = 0
     by_track: Counter[str] = Counter()
     chars_by_track: Counter[str] = Counter()
     unk_by_track: Counter[str] = Counter()
@@ -118,6 +121,19 @@ def compute_hit_rate(texts: list[str], tokenizer: DualTrackTokenizer) -> dict[st
                 for token in result.tokens
                 if token.start >= span.start and token.end <= span.end
             ]
+            native_positions = set(range(span.start, span.end))
+            for token in span_tokens:
+                if token.track == "mn" and token.id != tokenizer.unk_id:
+                    continue
+                mongolian_fallback_tokens += 1
+                native_positions.difference_update(
+                    range(
+                        max(span.start, token.start),
+                        min(span.end, token.end),
+                    )
+                )
+            mongolian_chars += span.end - span.start
+            mongolian_native_chars += len(native_positions)
             for word in span.text.split():
                 mn_word_total += 1
             if span.text and all(token.id != tokenizer.unk_id for token in span_tokens):
@@ -135,6 +151,14 @@ def compute_hit_rate(texts: list[str], tokenizer: DualTrackTokenizer) -> dict[st
         "token_hit_rate": 1.0 - (unk_count / tokens if tokens else 0.0),
         "byte_fallback_tokens": byte_fallback,
         "byte_fallback_rate": byte_fallback / tokens if tokens else 0.0,
+        "mongolian_chars": mongolian_chars,
+        "mongolian_native_chars": mongolian_native_chars,
+        "mongolian_fallback_tokens": mongolian_fallback_tokens,
+        "mongolian_native_char_rate": (
+            mongolian_native_chars / mongolian_chars
+            if mongolian_chars
+            else 1.0
+        ),
         "mongolian_words": mn_word_total,
         "mongolian_word_hit_rate": mn_word_hit / mn_word_total
         if mn_word_total

@@ -41,8 +41,10 @@ class BoundaryRecallEvalTest(unittest.TestCase):
         self.assertEqual(metrics["unk_count"], 0)
         self.assertEqual(metrics["token_hit_rate"], 1.0)
         self.assertEqual(metrics["mongolian_word_hit_rate"], 1.0)
+        self.assertEqual(metrics["mongolian_fallback_tokens"], 0)
+        self.assertEqual(metrics["mongolian_native_char_rate"], 1.0)
 
-    def test_hit_rate_exposes_unseeded_alphabet_misses(self):
+    def test_hit_rate_exposes_lossless_unseeded_alphabet_fallback(self):
         train = ["ᠮᠣᠩᠭᠣᠯ"]
         eval_texts = ["ᠠᠪᠤ"]
         tokenizer = build_experimental_tokenizer(
@@ -54,8 +56,11 @@ class BoundaryRecallEvalTest(unittest.TestCase):
 
         metrics = compute_hit_rate(eval_texts, tokenizer)
 
-        self.assertGreater(metrics["unk_count"], 0)
-        self.assertLess(metrics["token_hit_rate"], 1.0)
+        self.assertEqual(metrics["unk_count"], 0)
+        self.assertEqual(metrics["token_hit_rate"], 1.0)
+        self.assertEqual(metrics["roundtrip_failures_sample"], [])
+        self.assertGreater(metrics["mongolian_fallback_tokens"], 0)
+        self.assertEqual(metrics["mongolian_native_char_rate"], 0.0)
 
 
 if __name__ == "__main__":

@@ -2,10 +2,12 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from Tokenizer.morphbpe import MorphBPETrainer
 from Tokenizer.pretraining import (
@@ -14,7 +16,19 @@ from Tokenizer.pretraining import (
     iter_pack_samples,
     pack_samples,
 )
+from Tokenizer.pretraining.data_contract import (
+    PRETRAINING_PRODUCER_GENERIC_BUILDER,
+    build_pretraining_data_contract,
+    canonical_json_sha256,
+    load_and_validate_pretraining_data_contract,
+    pretraining_producer_algorithm_contract,
+    write_pretraining_data_contract,
+)
 from Tokenizer.unified.bundle import TokenizerBundle
+from Tokenizer.unified.contract import (
+    tokenizer_algorithm_contract,
+    tokenizer_bundle_contract,
+)
 
 
 def build_smoke_bundle(tmp: str) -> TokenizerBundle:
@@ -303,6 +317,12 @@ class PretrainingBuilderTest(unittest.TestCase):
             summary = json.loads(proc.stdout)
             with open(out, "r", encoding="utf-8") as f:
                 row = json.loads(f.readline())
+            receipt = load_and_validate_pretraining_data_contract(
+                summary["receipt"],
+                out,
+                tokenizer_bundle=tokenizer_bundle_contract(bundle_dir),
+                tokenizer_algorithm=tokenizer_algorithm_contract(),
+            )
         self.assertEqual(summary["num_samples"], 1)
         self.assertGreater(summary["supervised_tokens"], 0)
         self.assertIn("input_ids", row)
@@ -311,6 +331,18 @@ class PretrainingBuilderTest(unittest.TestCase):
         self.assertEqual(len(row["input_ids"]), len(row["morph_depth"]))
         self.assertEqual(len(row["input_ids"]), 16)
         self.assertEqual(row["labels"][-1], IGNORE_INDEX)
+        self.assertEqual(receipt["data_file_count"], 1)
+        self.assertEqual(receipt["data_sha256"], summary["data_sha256"])
+        self.assertEqual(
+            receipt["producer_kind"],
+            PRETRAINING_PRODUCER_GENERIC_BUILDER,
+        )
+        self.assertEqual(
+            receipt["producer_algorithm"],
+            pretraining_producer_algorithm_contract(
+                PRETRAINING_PRODUCER_GENERIC_BUILDER
+            ),
+        )
 
     def test_build_pretraining_data_cli_can_rotate_shards(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -344,10 +376,149 @@ class PretrainingBuilderTest(unittest.TestCase):
             )
             summary = json.loads(proc.stdout)
             shards = summary["shards"]
+            receipt = json.loads(
+                Path(summary["receipt"]).read_text(encoding="utf-8")
+            )
         self.assertEqual(summary["num_samples"], 2)
         self.assertEqual(len(shards), 2)
         self.assertTrue(shards[0].endswith("out-00000.jsonl"))
         self.assertTrue(shards[1].endswith("out-00001.jsonl"))
+        self.assertEqual(
+            [entry["name"] for entry in receipt["data_files"]],
+            ["out-00000.jsonl", "out-00001.jsonl"],
+        )
+
+    def test_pretraining_receipt_detects_shard_failure_injections(self):
+        scenarios = ("mutate", "add", "remove", "reorder")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                build_smoke_bundle(tmp)
+                bundle_dir = root / "bundle"
+                shard_dir = root / "shards"
+                shard_dir.mkdir()
+                first = shard_dir / "shard-00000.jsonl"
+                second = shard_dir / "shard-00001.jsonl"
+                first.write_text('{"input_ids":[2,3],"labels":[-100,3]}\n')
+                second.write_text('{"input_ids":[2,4],"labels":[-100,4]}\n')
+                bundle_identity = tokenizer_bundle_contract(bundle_dir)
+                algorithm_identity = tokenizer_algorithm_contract()
+                payload = build_pretraining_data_contract(
+                    [first, second],
+                    producer_kind=PRETRAINING_PRODUCER_GENERIC_BUILDER,
+                    tokenizer_bundle=bundle_identity,
+                    tokenizer_algorithm=algorithm_identity,
+                )
+                receipt = root / "receipt.json"
+                write_pretraining_data_contract(receipt, payload)
+
+                if scenario == "mutate":
+                    first.write_text(
+                        '{"input_ids":[2,9],"labels":[-100,9]}\n',
+                        encoding="utf-8",
+                    )
+                    data_spec = shard_dir
+                elif scenario == "add":
+                    (shard_dir / "shard-00002.jsonl").write_text(
+                        '{"input_ids":[2,5],"labels":[-100,5]}\n',
+                        encoding="utf-8",
+                    )
+                    data_spec = shard_dir
+                elif scenario == "remove":
+                    second.unlink()
+                    data_spec = shard_dir
+                else:
+                    data_spec = [second, first]
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "resolved data shards differ",
+                ):
+                    load_and_validate_pretraining_data_contract(
+                        receipt,
+                        data_spec,
+                        tokenizer_bundle=bundle_identity,
+                        tokenizer_algorithm=algorithm_identity,
+                    )
+
+    def test_pretraining_receipt_rejects_tampered_or_unknown_producer(self):
+        for scenario in ("algorithm", "unknown-kind"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                build_smoke_bundle(tmp)
+                shard = root / "train.jsonl"
+                shard.write_text(
+                    '{"input_ids":[2,3],"labels":[-100,3],'
+                    '"word_pos":[0,0],"morph_depth":[0,0]}\n',
+                    encoding="utf-8",
+                )
+                bundle_identity = tokenizer_bundle_contract(root / "bundle")
+                algorithm_identity = tokenizer_algorithm_contract()
+                payload = build_pretraining_data_contract(
+                    shard,
+                    producer_kind=PRETRAINING_PRODUCER_GENERIC_BUILDER,
+                    tokenizer_bundle=bundle_identity,
+                    tokenizer_algorithm=algorithm_identity,
+                )
+                if scenario == "algorithm":
+                    payload["producer_algorithm"]["source_sha256"] = "0" * 64
+                    expected = "producer_algorithm differs"
+                else:
+                    payload["producer_kind"] = "unregistered_builder"
+                    expected = "unknown pretraining producer_kind"
+                core = dict(payload)
+                core.pop("contract_canonical_sha256")
+                payload["contract_canonical_sha256"] = canonical_json_sha256(
+                    core
+                )
+                receipt = root / "receipt.json"
+                write_pretraining_data_contract(receipt, payload)
+
+                with self.assertRaisesRegex(ValueError, expected):
+                    load_and_validate_pretraining_data_contract(
+                        receipt,
+                        shard,
+                        tokenizer_bundle=bundle_identity,
+                        tokenizer_algorithm=algorithm_identity,
+                    )
+
+    def test_pretraining_receipt_allows_mount_relocation_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_smoke_bundle(tmp)
+            bundle_dir = root / "bundle"
+            original = root / "original"
+            original.mkdir()
+            (original / "shard-00000.jsonl").write_text(
+                '{"input_ids":[2,3],"labels":[-100,3]}\n',
+                encoding="utf-8",
+            )
+            bundle_identity = tokenizer_bundle_contract(bundle_dir)
+            algorithm_identity = tokenizer_algorithm_contract()
+            receipt = root / "receipt.json"
+            write_pretraining_data_contract(
+                receipt,
+                build_pretraining_data_contract(
+                    original,
+                    producer_kind=PRETRAINING_PRODUCER_GENERIC_BUILDER,
+                    tokenizer_bundle=bundle_identity,
+                    tokenizer_algorithm=algorithm_identity,
+                ),
+            )
+            relocated_root = root / "different-mount"
+            relocated_bundle = relocated_root / "bundle"
+            shutil.copytree(bundle_dir, relocated_bundle)
+            relocated_identity = tokenizer_bundle_contract(relocated_bundle)
+            self.assertEqual(relocated_identity, bundle_identity)
+            relocated = relocated_root / "rows"
+            shutil.copytree(original, relocated)
+            validated = load_and_validate_pretraining_data_contract(
+                receipt,
+                relocated,
+                tokenizer_bundle=relocated_identity,
+                tokenizer_algorithm=algorithm_identity,
+            )
+        self.assertEqual(validated["data_file_count"], 1)
 
     def test_build_pretraining_data_cli_streams_without_pack(self):
         with tempfile.TemporaryDirectory() as tmp:

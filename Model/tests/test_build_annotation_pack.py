@@ -276,6 +276,8 @@ class ImageDirEndToEndTest(unittest.TestCase):
         argv = [
             "--image-dir",
             str(image_dir),
+            "--capture-session",
+            "test-session",
             "--out",
             str(out_dir),
             "--pages-per-doc",
@@ -323,6 +325,7 @@ class ImageDirEndToEndTest(unittest.TestCase):
 
             for row in manifest["lines"]:
                 self.assertRegex(row["id"], _ID_PATTERN)
+                self.assertEqual(row["group_id"], "capture:test-session")
                 self.assertTrue((out_dir / row["raw_path"]).exists())
                 self.assertTrue((out_dir / row["preview_path"]).exists())
 
@@ -338,6 +341,37 @@ class ImageDirEndToEndTest(unittest.TestCase):
             expected = round(n_lines * 0.33)
             self.assertAlmostEqual(
                 manifest["counts"]["n_double_annotate"], expected, delta=1
+            )
+
+    def test_multiple_image_dirs_keep_capture_sessions_disjoint(self):
+        with TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            capture_a = tmp / "capture_a"
+            capture_b = tmp / "capture_b"
+            capture_a.mkdir()
+            capture_b.mkdir()
+            _draw_three_column_page().save(capture_a / "page.png")
+            _draw_three_column_page().save(capture_b / "page.png")
+            args = parse_args(
+                [
+                    "--image-dir",
+                    str(capture_a),
+                    "--capture-session",
+                    "session-a",
+                    "--image-dir",
+                    str(capture_b),
+                    "--capture-session",
+                    "session-b",
+                    "--out",
+                    str(tmp / "out"),
+                    "--pages-per-doc",
+                    "1",
+                ]
+            )
+            manifest = build_pack(args)
+            self.assertEqual(
+                {row["group_id"] for row in manifest["lines"]},
+                {"capture:session-a", "capture:session-b"},
             )
 
     def test_deterministic_given_seed_across_process_reinvocation(self):
@@ -362,6 +396,8 @@ class ImageDirEndToEndTest(unittest.TestCase):
                         "scripts.build_annotation_pack",
                         "--image-dir",
                         str(image_dir),
+                        "--capture-session",
+                        "test-session",
                         "--out",
                         str(out_dir),
                         "--pages-per-doc",
@@ -478,7 +514,31 @@ class ImageDirEndToEndTest(unittest.TestCase):
                 ["--pdf-dir", "a", "--image-dir", "b", "--out", "/tmp/x"]
             )  # both given
         with self.assertRaises(SystemExit):
-            parse_args(["--image-dir", "a", "--out", "/tmp/x", "--dpi", "0"])
+            parse_args(["--image-dir", "a", "--out", "/tmp/x"])
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--image-dir",
+                    "a",
+                    "--capture-session",
+                    "session",
+                    "--out",
+                    "/tmp/x",
+                    "--dpi",
+                    "0",
+                ]
+            )
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--pdf-dir",
+                    "a",
+                    "--capture-session",
+                    "session",
+                    "--out",
+                    "/tmp/x",
+                ]
+            )
 
 
 # ===========================================================================

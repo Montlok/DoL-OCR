@@ -26,11 +26,10 @@ line's held-out split.
 
 Target encoding
 ----------------
-Targets are encoded through :func:`scripts.build_ocr_data.make_ocr_target_encoder`
-(byte-fallback, zero-``<unk>``, round-trip verified) — the same lossless
-channel the Pillow-rendering builder uses. A round-trip failure aborts the
-whole shard loudly (wrapped with shard + key context) rather than skipping
-the row: a silently-corrupted OCR label is worse than a stopped build.
+Targets use the shared native OCR tokenizer contract: the exact span-aware
+representation learned during language pretraining, including persisted
+morphology features. ``<unk>``, Mongolian-to-general fallback, or a round-trip
+change aborts the shard rather than changing frozen-LM supervision.
 
 Letterboxing
 ------------
@@ -55,11 +54,10 @@ trainer's ``arange`` fallback is already correct for a single text line.
 
 Idempotent resume
 ------------------
-Each shard's outputs (images, jsonl rows, meta sidecar) are only considered
-valid once its ``done/shard-NNNNN.json`` sentinel exists. A rerun skips any
-shard with a sentinel; a shard that crashed mid-way (partial outputs, no
-sentinel) has its partial outputs deleted and is rebuilt from scratch, so a
-crash never leaves a shard half-written but "invisible" to a resumed run.
+Each shard is only complete when its sentinel matches the current tokenizer
+contract, producer code, build parameters, source identity, and exact
+JSONL/meta hashes. Legacy, partial, corrupt, or stale sentinels cause a clean
+rebuild. Image digests live in each row and are verified lazily when consumed.
 
 Usage (tar mode)::
 
@@ -105,11 +103,9 @@ Parallelism in hanshi mode is a single reader process (the only thing that
 streams the multi-GB meta file) feeding a bounded work queue of
 ``(virtual_shard_index, rows)`` batches to a pool of letterbox/encode worker
 processes, each of which owns and fully builds whole virtual shards -- never
-more than one meta-file read total, regardless of ``--workers``. Idempotency
-is identical to tar mode: the reader skips enqueuing a virtual shard whose
-``done/`` sentinel already exists, so resuming a partially-built hanshi run
-still streams the whole meta file (cheap -- text only) but does no image
-work for shards already done.
+more than one meta-file read total, regardless of ``--workers``. The reader
+enqueues current rows for every virtual shard; workers validate the full
+sentinel before deciding whether image work can be skipped.
 
 Usage (hanshi mode)::
 
@@ -127,16 +123,17 @@ Usage (hanshi mode)::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import multiprocessing as mp
 import os
 import shutil
 import sys
-import tarfile
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
@@ -151,8 +148,33 @@ from Model.config import (  # noqa: E402
     IMAGE_PATCH_ID,
     IMAGE_START_ID,
 )
+from Model.ocr.alignment_contract import (  # noqa: E402
+    build_ocr_alignment_data_contract,
+    file_sha256,
+    write_json_atomically,
+    write_ocr_alignment_data_contract,
+)
 from Model.ocr.data import build_ocr_row  # noqa: E402
-from scripts.build_ocr_data import make_ocr_target_encoder  # noqa: E402
+from Model.ocr.image_preprocess import (  # noqa: E402
+    letterbox_grayscale_to_square,
+)
+from Model.ocr.pair_shards import ShardCounters, iter_tar_pairs  # noqa: E402
+from Model.ocr.shard_contract import (  # noqa: E402
+    DigestingTextWriter,
+    ImageBindingAccumulator,
+    build_shard_sentinel,
+    producer_algorithm_contract,
+    update_canonical_manifest,
+    validate_sha256,
+    validate_shard_sentinel,
+    validate_shard_sentinel_payload,
+)
+from Model.ocr.tokenization import (  # noqa: E402
+    canonical_json_sha256,
+    encode_lm_text_features,
+    make_ocr_target_encoder,
+    native_tokenization_contract,
+)
 
 # BOS + <image_start> + <image_end> + EOS, matching build_ocr_row(add_eos=True)
 # with a single image (n_image_tokens counted separately by the caller). Kept
@@ -162,6 +184,106 @@ _PROMPT_FIXED_OVERHEAD = 4
 # Files per images/shard-NNNNN/BBB/ bucket; keeps any one directory's dirent
 # count well below filesystem-unfriendly territory at 12.7M-image scale.
 _IMAGES_PER_BUCKET = 4096
+_SEMANTIC_BUILD_PARAMETER_KEYS = (
+    "n_image_tokens",
+    "image_size",
+    "max_seq_len",
+    "val_src_doc_min",
+    "test_src_doc_min",
+    "instruction_ids",
+    "instruction_track_ids",
+)
+
+
+def _shard_build_parameters(
+    *,
+    n_image_tokens: int,
+    image_size: int,
+    max_seq_len: int,
+    val_src_doc_min: int,
+    test_src_doc_min: int,
+    val_cap_per_shard: int,
+    ssl_quota_per_shard: int,
+    instruction_ids: list[int] | None,
+    instruction_track_ids: list[int] | None,
+) -> dict[str, Any]:
+    """Canonical set of every option that changes emitted shard bytes."""
+
+    return {
+        "n_image_tokens": int(n_image_tokens),
+        "image_size": int(image_size),
+        "max_seq_len": int(max_seq_len),
+        "val_src_doc_min": int(val_src_doc_min),
+        "test_src_doc_min": int(test_src_doc_min),
+        "val_cap_per_shard": int(val_cap_per_shard),
+        "ssl_quota_per_shard": int(ssl_quota_per_shard),
+        "instruction_ids": [int(value) for value in instruction_ids or []],
+        "instruction_track_ids": [
+            int(value) for value in instruction_track_ids or []
+        ],
+    }
+
+
+def _build_parameters_from_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    return _shard_build_parameters(
+        n_image_tokens=kwargs["n_image_tokens"],
+        image_size=kwargs["image_size"],
+        max_seq_len=kwargs["max_seq_len"],
+        val_src_doc_min=kwargs["val_src_doc_min"],
+        test_src_doc_min=kwargs["test_src_doc_min"],
+        val_cap_per_shard=kwargs["val_cap_per_shard"],
+        ssl_quota_per_shard=kwargs["ssl_quota_per_shard"],
+        instruction_ids=kwargs.get("instruction_ids"),
+        instruction_track_ids=kwargs.get("instruction_track_ids"),
+    )
+
+
+def _tar_source_identity(tar_path: Path) -> dict[str, Any]:
+    stat = tar_path.stat()
+    return {
+        "kind": "tar_stat_v1",
+        "path": str(tar_path.resolve()),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+    }
+
+
+def _hanshi_source_identity(
+    rows: list[tuple[str, dict[str, Any]]],
+    pages_root: str | Path,
+) -> dict[str, Any]:
+    row_manifest = hashlib.sha256()
+    for doc_id, meta in rows:
+        update_canonical_manifest(row_manifest, [doc_id, meta])
+    return {
+        "kind": "hanshi_rows_v1",
+        "pages_root": str(Path(pages_root).resolve()),
+        "row_count": len(rows),
+        "rows_sha256": row_manifest.hexdigest(),
+    }
+
+
+@lru_cache(maxsize=1)
+def _producer_algorithm_contract() -> dict[str, Any]:
+    """Fingerprint code that turns source pairs into emitted OCR rows."""
+
+    return producer_algorithm_contract(
+        (
+            ("scripts/build_ocr_data_from_pairs.py", Path(__file__)),
+            ("Model/ocr/data.py", Path(_REPO_ROOT) / "Model" / "ocr" / "data.py"),
+            (
+                "Model/ocr/image_preprocess.py",
+                Path(_REPO_ROOT) / "Model" / "ocr" / "image_preprocess.py",
+            ),
+            (
+                "Model/ocr/pair_shards.py",
+                Path(_REPO_ROOT) / "Model" / "ocr" / "pair_shards.py",
+            ),
+        )
+    )
 
 
 # ===========================================================================
@@ -269,167 +391,171 @@ def hanshi_image_path(pages_root: str | Path, bucket: str, doc_id: str) -> Path:
     return Path(pages_root) / bucket / f"{doc_id}.png"
 
 
-# ===========================================================================
-# Per-shard counters
-# ===========================================================================
+_COUNTER_KEYS = frozenset(ShardCounters(0).as_dict())
 
 
-@dataclass
-class ShardCounters:
-    """One shard's routing/skip/output tallies (also the sidecar summary)."""
+def _build_shard_completion(
+    *,
+    mode: str,
+    shard_index: int,
+    tokenization_contract_sha256: str,
+    build_parameters: dict[str, Any],
+    source_identity: dict[str, Any],
+    source_manifest_sha256: str,
+    source_record_count: int,
+    output_artifacts: list[dict[str, Any]],
+    image_manifest: ImageBindingAccumulator,
+    counters: ShardCounters,
+) -> dict[str, Any]:
+    return build_shard_sentinel(
+        mode=mode,
+        shard_index=shard_index,
+        tokenization_contract_sha256=tokenization_contract_sha256,
+        producer_algorithm=_producer_algorithm_contract(),
+        build_parameters=build_parameters,
+        source_identity=source_identity,
+        source_manifest_sha256=source_manifest_sha256,
+        source_record_count=source_record_count,
+        output_artifacts=output_artifacts,
+        image_manifest=image_manifest,
+        counters=counters.as_dict(),
+    )
 
-    shard_index: int
-    n_members_seen: int = 0
-    n_samples_seen: int = 0
-    n_orphans: int = 0
-    n_train: int = 0
-    n_val: int = 0
-    n_test_skipped: int = 0
-    n_non_line_skipped: int = 0
-    n_over_length_skipped: int = 0
-    n_align_written: int = 0
-    n_val_written: int = 0
-    n_ssl_written: int = 0
-    n_val_cap_skipped: int = 0
-    max_row_len: int = 0
-    errors: list[str] = field(default_factory=list)
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "shard_index": self.shard_index,
-            "n_members_seen": self.n_members_seen,
-            "n_samples_seen": self.n_samples_seen,
-            "n_orphans": self.n_orphans,
-            "n_train": self.n_train,
-            "n_val": self.n_val,
-            "n_test_skipped": self.n_test_skipped,
-            "n_non_line_skipped": self.n_non_line_skipped,
-            "n_over_length_skipped": self.n_over_length_skipped,
-            "n_align_written": self.n_align_written,
-            "n_val_written": self.n_val_written,
-            "n_ssl_written": self.n_ssl_written,
-            "n_val_cap_skipped": self.n_val_cap_skipped,
-            "max_row_len": self.max_row_len,
+def _load_valid_shard_sentinel(
+    sentinel_path: Path,
+    out_dir: Path,
+    *,
+    mode: str,
+    shard_index: int,
+    tokenization_contract_sha256: str,
+    build_parameters: dict[str, Any],
+    source_identity: dict[str, Any],
+) -> ShardCounters | None:
+    if not sentinel_path.is_file():
+        return None
+    try:
+        counters = validate_shard_sentinel(
+            sentinel_path,
+            out_dir,
+            mode=mode,
+            shard_index=shard_index,
+            tokenization_contract_sha256=tokenization_contract_sha256,
+            producer_algorithm=_producer_algorithm_contract(),
+            build_parameters=build_parameters,
+            source_identity=source_identity,
+            counter_keys=_COUNTER_KEYS,
+        )
+        return ShardCounters(**counters)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(
+            f"[build-ocr-pairs] invalid sentinel {sentinel_path}: {exc}; "
+            "rebuilding shard",
+            flush=True,
+        )
+        return None
+
+
+def _validated_shard_completion_manifest(
+    data_dir: Path,
+    out_dir: Path,
+    *,
+    tokenization_contract_sha256: str,
+    expected_semantics: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prove every JSONL included in an aggregate receipt has a current sentinel."""
+
+    data_files = sorted(data_dir.glob("shard-*.jsonl"))
+    if not data_files:
+        raise ValueError(f"no shard JSONL files found in {data_dir}")
+    producer_algorithm = _producer_algorithm_contract()
+    sentinel_entries: list[dict[str, str]] = []
+    semantics = expected_semantics
+    for data_path in data_files:
+        shard_suffix = data_path.stem.removeprefix("shard-")
+        if not shard_suffix.isdigit():
+            raise ValueError(f"invalid OCR shard filename: {data_path}")
+        shard_index = int(shard_suffix)
+        sentinel_path = out_dir / "done" / f"shard-{shard_index:05d}.json"
+        if not sentinel_path.is_file():
+            raise ValueError(
+                f"{data_path} has no completion sentinel; refusing to re-sign "
+                "unproven shard output"
+            )
+        payload = validate_shard_sentinel_payload(
+            sentinel_path,
+            out_dir,
+            counter_keys=_COUNTER_KEYS,
+        )
+        if payload["shard_index"] != shard_index:
+            raise ValueError(
+                f"{sentinel_path} claims shard {payload['shard_index']}, "
+                f"expected {shard_index}"
+            )
+        if (
+            payload["tokenization_contract_sha256"]
+            != tokenization_contract_sha256
+        ):
+            raise ValueError(
+                f"{sentinel_path} was built with a different tokenizer contract"
+            )
+        if payload["producer_algorithm"] != producer_algorithm:
+            raise ValueError(
+                f"{sentinel_path} was built by a different producer algorithm"
+            )
+        build_parameters = payload["build_parameters"]
+        missing = [
+            key
+            for key in _SEMANTIC_BUILD_PARAMETER_KEYS
+            if key not in build_parameters
+        ]
+        if missing:
+            raise ValueError(
+                f"{sentinel_path} omits semantic build parameters: "
+                + ", ".join(missing)
+            )
+        current_semantics = {
+            key: build_parameters[key]
+            for key in _SEMANTIC_BUILD_PARAMETER_KEYS
         }
-
-
-# ===========================================================================
-# Tar iteration: pair up <key>.png + <key>.json, tolerating either order
-# ===========================================================================
-
-
-def _stem_and_suffix(name: str) -> tuple[str, str]:
-    base = os.path.basename(name)
-    stem, suffix = os.path.splitext(base)
-    return stem, suffix.lower()
-
-
-def iter_tar_pairs(tar_path: str | Path, counters: ShardCounters):
-    """Yield ``(key, png_bytes, meta_dict)`` from a WebDataset-style tar.
-
-    Streams the tar with ``tarfile.open(path, "r|")`` (sequential-only, no
-    random access — required for NAS-friendly reads of very large tars).
-    Members for one sample are expected adjacent (``<key>.png`` then
-    ``<key>.json`` or vice versa) but either order is tolerated by buffering
-    at most one pending half-pair by stem. A member whose partner never
-    arrives (tar ends, or a different stem interrupts before the partner
-    shows up) is counted as an orphan and dropped.
-    """
-
-    pending: dict[str, bytes] | None = None
-    pending_stem: str | None = None
-
-    def _flush_orphan() -> None:
-        nonlocal pending, pending_stem
-        if pending is not None:
-            counters.n_orphans += 1
-        pending = None
-        pending_stem = None
-
-    with tarfile.open(tar_path, "r|") as tf:
-        for member in tf:
-            if not member.isfile():
-                continue
-            counters.n_members_seen += 1
-            stem, suffix = _stem_and_suffix(member.name)
-            if suffix not in (".png", ".json"):
-                continue
-            fh = tf.extractfile(member)
-            if fh is None:
-                continue
-            data = fh.read()
-
-            if pending_stem is not None and stem != pending_stem:
-                # A new stem showed up before the pending one's partner did:
-                # the pending half is an orphan.
-                _flush_orphan()
-
-            if pending_stem is None:
-                pending = {suffix: data}
-                pending_stem = stem
-                continue
-
-            # Same stem as the pending half: this member is its partner
-            # (regardless of order) as long as it's the other suffix.
-            if suffix in pending:
-                # Same suffix twice for one stem — treat the first as an
-                # orphan and start fresh with this one.
-                _flush_orphan()
-                pending = {suffix: data}
-                pending_stem = stem
-                continue
-
-            pending[suffix] = data
-            png_bytes = pending.get(".png")
-            json_bytes = pending.get(".json")
-            pending = None
-            pending_stem = None
-            if png_bytes is None or json_bytes is None:
-                counters.n_orphans += 1
-                continue
-            try:
-                meta = json.loads(json_bytes.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ValueError(
-                    f"{tar_path}: key={stem!r}: invalid JSON sidecar: {exc}"
-                ) from exc
-            counters.n_samples_seen += 1
-            yield stem, png_bytes, meta
-
-        _flush_orphan()
-
-
-# ===========================================================================
-# Letterbox: L-mode strip -> centered white square -> LANCZOS to image_size
-# ===========================================================================
+        if semantics is None:
+            semantics = current_semantics
+        elif current_semantics != semantics:
+            raise ValueError(
+                f"{sentinel_path} has incompatible OCR semantic build parameters"
+            )
+        expected_output = data_path.relative_to(out_dir).as_posix()
+        output_paths = {
+            entry["path"] for entry in payload["outputs"]
+        }
+        if expected_output not in output_paths:
+            raise ValueError(
+                f"{sentinel_path} does not bind included shard {data_path}"
+            )
+        sentinel_entries.append(
+            {
+                "name": sentinel_path.name,
+                "sha256": file_sha256(sentinel_path),
+            }
+        )
+    assert semantics is not None
+    return (
+        {
+            "mode": "validated_shard_sentinels_v2",
+            "sentinel_count": len(sentinel_entries),
+            "sentinels": sentinel_entries,
+            "sentinel_manifest_sha256": canonical_json_sha256(
+                sentinel_entries
+            ),
+        },
+        semantics,
+    )
 
 
 def letterbox_to_square(png_bytes: bytes, image_size: int):
-    """Center-paste an L-mode strip on a white square, then resize it down.
+    """Compatibility wrapper for the shared legacy OCR letterbox contract."""
 
-    Returns a ``PIL.Image`` in L mode, exactly ``(image_size, image_size)``.
-    The blind square-resize ``PILImageProcessor`` performs at train time is
-    only a no-op if the saved file already has this exact shape — this is
-    the one place that geometry is decided.
-    """
-
-    from PIL import Image
-
-    with Image.open(io.BytesIO(png_bytes)) as raw:
-        raw.load()
-        strip = raw.convert("L")
-
-    w, h = strip.size
-    side = max(w, h)
-    canvas = Image.new("L", (side, side), 255)
-    canvas.paste(strip, ((side - w) // 2, (side - h) // 2))
-
-    resample = (
-        Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
-    )
-    if side != image_size:
-        canvas = canvas.resize((image_size, image_size), resample)
-    return canvas
+    return letterbox_grayscale_to_square(png_bytes, image_size)
 
 
 # ===========================================================================
@@ -468,7 +594,9 @@ class _SampleContext:
     val_cap_per_shard: int
     ssl_quota_per_shard: int
     instruction_ids: list[int]
+    instruction_track_ids: list[int]
     prompt_overhead: int
+    image_manifest: ImageBindingAccumulator
     source_label: str  # tar path or meta path, for error-message context only
 
 
@@ -522,7 +650,18 @@ def _process_one_sample(
         )
 
     try:
-        target_ids = ctx.encode_target(text)
+        encode_with_features = getattr(
+            ctx.encode_target,
+            "encode_with_features",
+            None,
+        )
+        if not callable(encode_with_features):
+            raise TypeError(
+                "strict OCR shard building requires an encoder that emits "
+                "pretraining morphology features"
+            )
+        target_features = encode_with_features(text)
+        target_ids = target_features.input_ids
     except ValueError as exc:
         raise ValueError(
             f"{ctx.source_label}: shard={ctx.shard_index} key={key!r}: {exc}"
@@ -555,8 +694,14 @@ def _process_one_sample(
     bucket_dir.mkdir(parents=True, exist_ok=True)
     img_path = bucket_dir / f"{key}.png"
     letterboxed = letterbox_to_square(image_bytes, ctx.image_size)
-    letterboxed.save(img_path)
+    encoded_image = io.BytesIO()
+    letterboxed.save(encoded_image, format="PNG")
+    output_image_bytes = encoded_image.getvalue()
+    img_path.write_bytes(output_image_bytes)
     abs_img_path = str(img_path.resolve())
+    image_size_bytes = len(output_image_bytes)
+    image_sha256 = hashlib.sha256(output_image_bytes).hexdigest()
+    ctx.image_manifest.add(abs_img_path, image_sha256, image_size_bytes)
     index_within_shard += 1
 
     row = build_ocr_row(
@@ -569,6 +714,10 @@ def _process_one_sample(
         image_end_id=IMAGE_END_ID,
         eos_id=EOS_ID,
         instruction_ids=ctx.instruction_ids,
+        instruction_track_ids=ctx.instruction_track_ids,
+        target_track_ids=target_features.morphology_track_ids,
+        image_sha256=image_sha256,
+        image_size_bytes=image_size_bytes,
     )
     counters.max_row_len = max(counters.max_row_len, len(row["input_ids"]))
 
@@ -637,7 +786,9 @@ def process_shard(
     test_src_doc_min: int,
     val_cap_per_shard: int,
     ssl_quota_per_shard: int,
+    tokenization_contract_sha256: str,
     instruction_ids: list[int] | None = None,
+    instruction_track_ids: list[int] | None = None,
 ) -> ShardCounters:
     """Build one shard's images + JSONL rows + meta sidecar + sentinel.
 
@@ -649,7 +800,25 @@ def process_shard(
     """
 
     instruction_ids = list(instruction_ids or [])
+    instruction_track_ids = list(instruction_track_ids or [])
+    if len(instruction_track_ids) != len(instruction_ids):
+        raise ValueError("instruction_track_ids must align with instruction_ids")
     prompt_overhead = _PROMPT_FIXED_OVERHEAD + n_image_tokens + len(instruction_ids)
+    validate_sha256(
+        tokenization_contract_sha256,
+        field_name="tokenization_contract_sha256",
+    )
+    build_parameters = _shard_build_parameters(
+        n_image_tokens=n_image_tokens,
+        image_size=image_size,
+        max_seq_len=max_seq_len,
+        val_src_doc_min=val_src_doc_min,
+        test_src_doc_min=test_src_doc_min,
+        val_cap_per_shard=val_cap_per_shard,
+        ssl_quota_per_shard=ssl_quota_per_shard,
+        instruction_ids=instruction_ids,
+        instruction_track_ids=instruction_track_ids,
+    )
 
     img_root, align_dir, val_dir, ssl_dir, meta_dir, done_dir = _open_shard_output_dirs(
         shard_index, out_dir
@@ -657,6 +826,8 @@ def process_shard(
 
     counters = ShardCounters(shard_index=shard_index)
     ssl_written = 0
+    image_manifest = ImageBindingAccumulator()
+    source_manifest = hashlib.sha256()
 
     align_path = align_dir / f"shard-{shard_index:05d}.jsonl"
     val_path = val_dir / f"shard-{shard_index:05d}.jsonl"
@@ -674,17 +845,31 @@ def process_shard(
         val_cap_per_shard=val_cap_per_shard,
         ssl_quota_per_shard=ssl_quota_per_shard,
         instruction_ids=instruction_ids,
+        instruction_track_ids=instruction_track_ids,
         prompt_overhead=prompt_overhead,
+        image_manifest=image_manifest,
         source_label=str(tar_path),
     )
 
-    with align_path.open("w", encoding="utf-8") as align_fh, val_path.open(
+    with align_path.open("w", encoding="utf-8") as align_handle, val_path.open(
         "w", encoding="utf-8"
-    ) as val_fh, ssl_path.open("w", encoding="utf-8") as ssl_fh, meta_path.open(
+    ) as val_handle, ssl_path.open("w", encoding="utf-8") as ssl_handle, meta_path.open(
         "w", encoding="utf-8"
-    ) as meta_fh:
+    ) as meta_handle:
+        align_fh = DigestingTextWriter(align_handle, align_path)
+        val_fh = DigestingTextWriter(val_handle, val_path)
+        ssl_fh = DigestingTextWriter(ssl_handle, ssl_path)
+        meta_fh = DigestingTextWriter(meta_handle, meta_path)
         index_within_shard = 0
         for key, png_bytes, meta in iter_tar_pairs(tar_path, counters):
+            update_canonical_manifest(
+                source_manifest,
+                [
+                    key,
+                    hashlib.sha256(png_bytes).hexdigest(),
+                    canonical_json_sha256(meta),
+                ],
+            )
             index_within_shard, ssl_written = _process_one_sample(
                 key,
                 lambda b=png_bytes: b,
@@ -700,9 +885,24 @@ def process_shard(
                 ssl_written=ssl_written,
             )
 
+    output_artifacts = [
+        writer.artifact(Path(out_dir))
+        for writer in (align_fh, val_fh, ssl_fh, meta_fh)
+    ]
     sentinel_path = done_dir / f"shard-{shard_index:05d}.json"
-    with sentinel_path.open("w", encoding="utf-8") as fh:
-        json.dump(counters.as_dict(), fh, ensure_ascii=False, indent=2)
+    sentinel = _build_shard_completion(
+        mode="tar",
+        shard_index=shard_index,
+        tokenization_contract_sha256=tokenization_contract_sha256,
+        build_parameters=build_parameters,
+        source_identity=_tar_source_identity(Path(tar_path)),
+        source_manifest_sha256=source_manifest.hexdigest(),
+        source_record_count=counters.n_samples_seen,
+        output_artifacts=output_artifacts,
+        image_manifest=image_manifest,
+        counters=counters,
+    )
+    write_json_atomically(sentinel_path, sentinel)
     return counters
 
 
@@ -726,7 +926,9 @@ def process_hanshi_virtual_shard(
     test_src_doc_min: int,
     val_cap_per_shard: int,
     ssl_quota_per_shard: int,
+    tokenization_contract_sha256: str,
     instruction_ids: list[int] | None = None,
+    instruction_track_ids: list[int] | None = None,
 ) -> ShardCounters:
     """Build one hanshi virtual shard's outputs, sharing tar mode's per-sample core.
 
@@ -751,7 +953,28 @@ def process_hanshi_virtual_shard(
     """
 
     instruction_ids = list(instruction_ids or [])
+    instruction_track_ids = list(instruction_track_ids or [])
+    if len(instruction_track_ids) != len(instruction_ids):
+        raise ValueError("instruction_track_ids must align with instruction_ids")
     prompt_overhead = _PROMPT_FIXED_OVERHEAD + n_image_tokens + len(instruction_ids)
+    if not rows:
+        raise ValueError("hanshi virtual shards must contain at least one row")
+    validate_sha256(
+        tokenization_contract_sha256,
+        field_name="tokenization_contract_sha256",
+    )
+    build_parameters = _shard_build_parameters(
+        n_image_tokens=n_image_tokens,
+        image_size=image_size,
+        max_seq_len=max_seq_len,
+        val_src_doc_min=val_src_doc_min,
+        test_src_doc_min=test_src_doc_min,
+        val_cap_per_shard=val_cap_per_shard,
+        ssl_quota_per_shard=ssl_quota_per_shard,
+        instruction_ids=instruction_ids,
+        instruction_track_ids=instruction_track_ids,
+    )
+    source_identity = _hanshi_source_identity(rows, pages_root)
 
     img_root, align_dir, val_dir, ssl_dir, meta_dir, done_dir = _open_shard_output_dirs(
         output_shard_number, out_dir
@@ -759,6 +982,7 @@ def process_hanshi_virtual_shard(
 
     counters = ShardCounters(shard_index=output_shard_number)
     ssl_written = 0
+    image_manifest = ImageBindingAccumulator()
 
     align_path = align_dir / f"shard-{output_shard_number:05d}.jsonl"
     val_path = val_dir / f"shard-{output_shard_number:05d}.jsonl"
@@ -776,15 +1000,21 @@ def process_hanshi_virtual_shard(
         val_cap_per_shard=val_cap_per_shard,
         ssl_quota_per_shard=ssl_quota_per_shard,
         instruction_ids=instruction_ids,
+        instruction_track_ids=instruction_track_ids,
         prompt_overhead=prompt_overhead,
+        image_manifest=image_manifest,
         source_label=str(pages_root),
     )
 
-    with align_path.open("w", encoding="utf-8") as align_fh, val_path.open(
+    with align_path.open("w", encoding="utf-8") as align_handle, val_path.open(
         "w", encoding="utf-8"
-    ) as val_fh, ssl_path.open("w", encoding="utf-8") as ssl_fh, meta_path.open(
+    ) as val_handle, ssl_path.open("w", encoding="utf-8") as ssl_handle, meta_path.open(
         "w", encoding="utf-8"
-    ) as meta_fh:
+    ) as meta_handle:
+        align_fh = DigestingTextWriter(align_handle, align_path)
+        val_fh = DigestingTextWriter(val_handle, val_path)
+        ssl_fh = DigestingTextWriter(ssl_handle, ssl_path)
+        meta_fh = DigestingTextWriter(meta_handle, meta_path)
         index_within_shard = 0
         counters.n_samples_seen = len(rows)
         for doc_id, meta in rows:
@@ -817,9 +1047,24 @@ def process_hanshi_virtual_shard(
                 ssl_written=ssl_written,
             )
 
+    output_artifacts = [
+        writer.artifact(Path(out_dir))
+        for writer in (align_fh, val_fh, ssl_fh, meta_fh)
+    ]
     sentinel_path = done_dir / f"shard-{output_shard_number:05d}.json"
-    with sentinel_path.open("w", encoding="utf-8") as fh:
-        json.dump(counters.as_dict(), fh, ensure_ascii=False, indent=2)
+    sentinel = _build_shard_completion(
+        mode="hanshi",
+        shard_index=output_shard_number,
+        tokenization_contract_sha256=tokenization_contract_sha256,
+        build_parameters=build_parameters,
+        source_identity=source_identity,
+        source_manifest_sha256=source_identity["rows_sha256"],
+        source_record_count=len(rows),
+        output_artifacts=output_artifacts,
+        image_manifest=image_manifest,
+        counters=counters,
+    )
+    write_json_atomically(sentinel_path, sentinel)
     return counters
 
 
@@ -840,11 +1085,20 @@ def build_one_hanshi_virtual_shard(
     """
 
     out_dir = Path(out_dir)
+    build_parameters = _build_parameters_from_kwargs(kwargs)
+    tokenization_contract_sha256 = kwargs["tokenization_contract_sha256"]
+    source_identity = _hanshi_source_identity(rows, pages_root)
     sentinel_path = out_dir / "done" / f"shard-{output_shard_number:05d}.json"
-    if sentinel_path.exists():
-        with sentinel_path.open("r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-        counters = ShardCounters(**{k: v for k, v in payload.items() if k != "errors"})
+    counters = _load_valid_shard_sentinel(
+        sentinel_path,
+        out_dir,
+        mode="hanshi",
+        shard_index=output_shard_number,
+        tokenization_contract_sha256=tokenization_contract_sha256,
+        build_parameters=build_parameters,
+        source_identity=source_identity,
+    )
+    if counters is not None:
         return counters
 
     _reset_shard_outputs(output_shard_number, out_dir)
@@ -879,6 +1133,9 @@ def _reset_shard_outputs(shard_index: int, out_dir: str | Path) -> None:
     meta_path = out_dir / "meta" / f"{shard_name}.jsonl"
     if meta_path.exists():
         meta_path.unlink()
+    sentinel_path = out_dir / "done" / f"{shard_name}.json"
+    if sentinel_path.exists():
+        sentinel_path.unlink()
 
 
 def build_one_shard(
@@ -891,17 +1148,25 @@ def build_one_shard(
     """Idempotent single-shard entry point: skip if done, else reset + build."""
 
     out_dir = Path(out_dir)
-    sentinel_path = out_dir / "done" / f"shard-{shard_index:05d}.json"
-    if sentinel_path.exists():
-        with sentinel_path.open("r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-        counters = ShardCounters(**{k: v for k, v in payload.items() if k != "errors"})
-        return counters
-
-    _reset_shard_outputs(shard_index, out_dir)
     tar_path = shard_path(shards_dir, shard_index)
     if not tar_path.exists():
         raise FileNotFoundError(f"shard tar not found: {tar_path}")
+    build_parameters = _build_parameters_from_kwargs(kwargs)
+    tokenization_contract_sha256 = kwargs["tokenization_contract_sha256"]
+    sentinel_path = out_dir / "done" / f"shard-{shard_index:05d}.json"
+    counters = _load_valid_shard_sentinel(
+        sentinel_path,
+        out_dir,
+        mode="tar",
+        shard_index=shard_index,
+        tokenization_contract_sha256=tokenization_contract_sha256,
+        build_parameters=build_parameters,
+        source_identity=_tar_source_identity(tar_path),
+    )
+    if counters is not None:
+        return counters
+
+    _reset_shard_outputs(shard_index, out_dir)
     return process_shard(
         shard_index,
         tar_path,
@@ -1121,13 +1386,12 @@ def _hanshi_reader_main(
     the multi-GB meta file is read exactly once. Rows are buffered per
     virtual shard as they stream in; a virtual shard's batch is enqueued the
     moment its last row (by ``--hanshi-shard-size`` grouping) is seen, or at
-    end-of-file for a final partial batch. A virtual shard whose ``done/``
-    sentinel already exists is never enqueued at all (cheap check, no image
-    work), which is how a resumed hanshi run skips finished shards while
-    still paying the (cheap, text-only) cost of streaming past their rows.
+    end-of-file for a final partial batch. Workers validate completion
+    sentinels against these current row bytes, the tokenizer contract, build
+    parameters, and output hashes. The reader must therefore enqueue every
+    batch; trusting sentinel existence here would bypass that proof.
     """
 
-    out_dir_path = Path(out_dir)
     current_virtual_index: int | None = None
     current_rows: list[tuple[str, dict[str, Any]]] = []
     n_enqueued = 0
@@ -1141,10 +1405,8 @@ def _hanshi_reader_main(
         output_shard_number = hanshi_output_shard_number(
             current_virtual_index, shard_offset
         )
-        sentinel_path = out_dir_path / "done" / f"shard-{output_shard_number:05d}.json"
-        if not sentinel_path.exists():
-            work_queue.put((output_shard_number, current_rows))
-            n_enqueued += 1
+        work_queue.put((output_shard_number, current_rows))
+        n_enqueued += 1
         current_virtual_index = None
         current_rows = []
 
@@ -1215,12 +1477,30 @@ def _run_hanshi_mode(args: argparse.Namespace, out_dir: Path) -> int:
     from Tokenizer.unified.bundle import TokenizerBundle
 
     bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
-    instruction_ids = (
-        bundle.encode(args.instruction, add_bos=False, add_eos=False)
+    instruction_features = (
+        encode_lm_text_features(
+            bundle.tokenizer,
+            args.instruction,
+            interpret_special_tokens=True,
+        )
         if args.instruction
+        else None
+    )
+    instruction_ids = (
+        instruction_features.input_ids if instruction_features is not None else []
+    )
+    instruction_track_ids = (
+        instruction_features.morphology_track_ids
+        if instruction_features is not None
         else []
     )
     make_ocr_target_encoder(bundle.tokenizer)  # preflight: raises on bad bundle
+    tokenization_contract_sha256 = canonical_json_sha256(
+        native_tokenization_contract(
+            bundle.tokenizer,
+            args.tokenizer_bundle,
+        )
+    )
     del bundle
 
     kwargs = dict(
@@ -1231,7 +1511,9 @@ def _run_hanshi_mode(args: argparse.Namespace, out_dir: Path) -> int:
         test_src_doc_min=args.test_src_doc_min,
         val_cap_per_shard=args.val_cap,
         ssl_quota_per_shard=args.ssl_rows,
+        tokenization_contract_sha256=tokenization_contract_sha256,
         instruction_ids=instruction_ids,
+        instruction_track_ids=instruction_track_ids,
     )
     print(
         "[build-ocr-pairs] hanshi mode: hanshi_shard_size="
@@ -1507,12 +1789,30 @@ def _run_tar_mode(args: argparse.Namespace, out_dir: Path) -> int:
     # --instruction before spawning workers; each worker still (re)loads its
     # own bundle (see _worker_main's docstring for why).
     bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
-    instruction_ids = (
-        bundle.encode(args.instruction, add_bos=False, add_eos=False)
+    instruction_features = (
+        encode_lm_text_features(
+            bundle.tokenizer,
+            args.instruction,
+            interpret_special_tokens=True,
+        )
         if args.instruction
+        else None
+    )
+    instruction_ids = (
+        instruction_features.input_ids if instruction_features is not None else []
+    )
+    instruction_track_ids = (
+        instruction_features.morphology_track_ids
+        if instruction_features is not None
         else []
     )
     make_ocr_target_encoder(bundle.tokenizer)  # preflight: raises on bad bundle
+    tokenization_contract_sha256 = canonical_json_sha256(
+        native_tokenization_contract(
+            bundle.tokenizer,
+            args.tokenizer_bundle,
+        )
+    )
     del bundle
 
     kwargs = dict(
@@ -1523,7 +1823,9 @@ def _run_tar_mode(args: argparse.Namespace, out_dir: Path) -> int:
         test_src_doc_min=args.test_src_doc_min,
         val_cap_per_shard=val_cap_per_shard,
         ssl_quota_per_shard=ssl_quota_per_shard,
+        tokenization_contract_sha256=tokenization_contract_sha256,
         instruction_ids=instruction_ids,
+        instruction_track_ids=instruction_track_ids,
     )
 
     n_workers = min(args.workers, n_shards)
@@ -1580,8 +1882,57 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.hanshi_meta is not None:
-        return _run_hanshi_mode(args, out_dir)
-    return _run_tar_mode(args, out_dir)
+        result = _run_hanshi_mode(args, out_dir)
+    else:
+        result = _run_tar_mode(args, out_dir)
+    if result != 0:
+        return result
+
+    from Tokenizer.unified.bundle import TokenizerBundle
+
+    bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
+    issues = bundle.validate()
+    if issues:
+        raise ValueError(
+            "invalid tokenizer bundle after shard build:\n  - "
+            + "\n  - ".join(issues)
+        )
+    token_contract = native_tokenization_contract(
+        bundle.tokenizer,
+        args.tokenizer_bundle,
+    )
+    token_contract_sha256 = canonical_json_sha256(token_contract)
+    semantic_parameters: dict[str, Any] | None = None
+    for split in ("align", "val"):
+        data_dir = out_dir / "jsonl" / split
+        if split == "val" and not any(
+            path.stat().st_size > 0 for path in data_dir.glob("*.jsonl")
+        ):
+            print(
+                "[build-ocr-pairs] no val rows; no val receipt emitted",
+                flush=True,
+            )
+            continue
+        shard_completion, semantic_parameters = (
+            _validated_shard_completion_manifest(
+                data_dir,
+                out_dir,
+                tokenization_contract_sha256=token_contract_sha256,
+                expected_semantics=semantic_parameters,
+            )
+        )
+        contract = build_ocr_alignment_data_contract(
+            data_dir,
+            token_contract,
+            shard_completion=shard_completion,
+        )
+        contract_path = data_dir / "ocr_data_contract.json"
+        write_ocr_alignment_data_contract(contract_path, contract)
+        print(
+            f"[build-ocr-pairs] immutable {split} receipt -> {contract_path}",
+            flush=True,
+        )
+    return 0
 
 
 if __name__ == "__main__":

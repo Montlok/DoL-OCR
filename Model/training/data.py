@@ -16,6 +16,15 @@ import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 from Model.config import IGNORE_INDEX, PAD_ID, TrainingConfig
+from Model.ocr.alignment_contract import (
+    read_verified_ocr_image_bytes,
+    validate_ocr_image_binding_fields,
+)
+from Model.ocr.position_contract import (
+    BOUNDARY_V1,
+    LEGACY_SEQUENTIAL_V0,
+    validate_ocr_position_contract,
+)
 from Tokenizer.pretraining import derive_morph_info_from_offsets
 
 
@@ -157,6 +166,8 @@ class PretrainingCollator:
     pad_to_multiple_of: int | None = None
     include_metadata: bool = False
     max_seq_len: int | None = None
+    require_precomputed_morphology: bool = False
+    require_verified_images: bool = False
     # Multimodal: when both ``image_processor`` and ``omvt_cfg`` are set,
     # rows that carry an ``images`` field are turned into a stacked OMVT
     # multi-scale ``pixel_values`` batch dict. Rows without images still
@@ -164,12 +175,33 @@ class PretrainingCollator:
     # row to have images **or** none, to keep the batch shape uniform.
     image_processor: Any = None
     omvt_cfg: Any = None
+    position_contract: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.position_contract is not None:
+            self.position_contract = validate_ocr_position_contract(
+                self.position_contract
+            )
+        if self.position_contract is not None and self.require_precomputed_morphology:
+            raise ValueError(
+                "an explicit OCR position contract cannot consume precomputed "
+                "morphology fields"
+            )
 
     def __call__(self, rows: Sequence[Any]) -> dict[str, Any]:
         if not rows:
             raise ValueError("rows cannot be empty")
 
-        normalized = [_normalize_row(row, max_seq_len=self.max_seq_len) for row in rows]
+        normalized = [
+            _normalize_row(
+                row,
+                max_seq_len=self.max_seq_len,
+                require_precomputed_morphology=self.require_precomputed_morphology,
+                require_verified_images=self.require_verified_images,
+                position_contract=self.position_contract,
+            )
+            for row in rows
+        ]
         max_len = max(len(row["input_ids"]) for row in normalized)
         if max_len <= 0:
             raise ValueError("rows cannot contain empty input_ids")
@@ -180,25 +212,32 @@ class PretrainingCollator:
             if remainder:
                 max_len += self.pad_to_multiple_of - remainder
 
-        batch = {
+        batch: dict[str, list[Any]] = {
             "input_ids": [],
             "attention_mask": [],
             "labels": [],
-            "word_pos": [],
-            "morph_depth": [],
         }
+        include_positions = self.position_contract != BOUNDARY_V1
+        if include_positions:
+            batch["word_pos"] = []
+            batch["morph_depth"] = []
 
         for row in normalized:
             pad_count = max_len - len(row["input_ids"])
             batch["input_ids"].append(row["input_ids"] + [self.pad_id] * pad_count)
             batch["attention_mask"].append(row["attention_mask"] + [0] * pad_count)
             batch["labels"].append(row["labels"] + [self.ignore_index] * pad_count)
-            batch["word_pos"].append(row["word_pos"] + [0] * pad_count)
-            batch["morph_depth"].append(row["morph_depth"] + [0] * pad_count)
+            if include_positions:
+                batch["word_pos"].append(row["word_pos"] + [0] * pad_count)
+                batch["morph_depth"].append(
+                    row["morph_depth"] + [0] * pad_count
+                )
 
         tensors: dict[str, Any] = {
             key: torch.tensor(value, dtype=torch.long) for key, value in batch.items()
         }
+        if self.position_contract is not None:
+            tensors["position_contract"] = self.position_contract
         if self.include_metadata:
             tensors["metadata"] = [row.get("metadata", {}) for row in normalized]
             tensors["modality_spans"] = [
@@ -240,7 +279,16 @@ class PretrainingCollator:
                 "bucketed dataloaders, or extend _build_pixel_batch + VisionInjector "
                 "to handle N>1 images per row."
             )
-        flat = [row_items[0] for row_items in per_row_images]
+        flat: list[Any] = []
+        for row, row_items in zip(normalized, per_row_images):
+            image_ref = row_items[0]
+            if self.require_verified_images or "image_sha256" in row:
+                image_bytes = read_verified_ocr_image_bytes(row)
+                # PILImageProcessor accepts bytes, so verification does not
+                # cause a second filesystem read on the hot path.
+                flat.append(image_bytes)
+            else:
+                flat.append(image_ref)
         images = self.image_processor(flat)
         # images: [B, C, H, W]. OMVT will turn each row into compress_to
         # visual tokens and the injector replaces the row's
@@ -251,7 +299,14 @@ class PretrainingCollator:
         return dict(collate_omvt_batch(images, self.omvt_cfg))
 
 
-def _normalize_row(row: Any, *, max_seq_len: int | None) -> dict[str, Any]:
+def _normalize_row(
+    row: Any,
+    *,
+    max_seq_len: int | None,
+    require_precomputed_morphology: bool = False,
+    require_verified_images: bool = False,
+    position_contract: str | None = None,
+) -> dict[str, Any]:
     if not isinstance(row, dict):
         row = row.__dict__
 
@@ -273,18 +328,51 @@ def _normalize_row(row: Any, *, max_seq_len: int | None) -> dict[str, Any]:
 
     word_pos = row.get("word_pos")
     morph_depth = row.get("morph_depth")
-    if word_pos is None or morph_depth is None:
-        token_offsets = row.get("token_offsets")
-        if token_offsets is None:
+    token_offsets = row.get("token_offsets")
+    if position_contract == BOUNDARY_V1:
+        if word_pos is not None or morph_depth is not None or token_offsets is not None:
+            raise ValueError(
+                "boundary_v1 OCR rows must omit word_pos, morph_depth, and "
+                "token_offsets so the model derives the checkpoint-compatible "
+                "position contract"
+            )
+    else:
+        if require_precomputed_morphology and (
+            word_pos is None or morph_depth is None
+        ):
+            raise ValueError(
+                "strict receipt-backed training rows must persist word_pos and "
+                "morph_depth from the pretraining-compatible tokenizer route"
+            )
+        if position_contract == LEGACY_SEQUENTIAL_V0:
+            if word_pos is not None or morph_depth is not None or token_offsets is not None:
+                raise ValueError(
+                    "legacy_sequential_v0 OCR rows must omit precomputed position fields"
+                )
             word_pos = list(range(n))
             morph_depth = [0] * n
-        else:
-            word_pos, morph_depth = derive_morph_info_from_offsets(token_offsets)
+        elif word_pos is None or morph_depth is None:
+            if token_offsets is None:
+                word_pos = list(range(n))
+                morph_depth = [0] * n
+            else:
+                word_pos, morph_depth = derive_morph_info_from_offsets(token_offsets)
 
-    out["word_pos"] = [int(value) for value in word_pos]
-    out["morph_depth"] = [int(value) for value in morph_depth]
-    if len(out["word_pos"]) != n or len(out["morph_depth"]) != n:
-        raise ValueError("word_pos and morph_depth must align with input_ids")
+        out["word_pos"] = [int(value) for value in word_pos]
+        out["morph_depth"] = [int(value) for value in morph_depth]
+        if len(out["word_pos"]) != n or len(out["morph_depth"]) != n:
+            raise ValueError("word_pos and morph_depth must align with input_ids")
+
+    has_image_binding = (
+        "image_sha256" in row or "image_size_bytes" in row
+    )
+    if require_verified_images or has_image_binding:
+        image_ref, image_sha256, image_size_bytes = (
+            validate_ocr_image_binding_fields(row)
+        )
+        out["images"] = [image_ref]
+        out["image_sha256"] = image_sha256
+        out["image_size_bytes"] = image_size_bytes
 
     if max_seq_len is not None and n > max_seq_len:
         # Multimodal rows carry a fixed number of ``<image_patch>`` slots that
@@ -301,7 +389,10 @@ def _normalize_row(row: Any, *, max_seq_len: int | None) -> dict[str, Any]:
                 "image payload. Set TrainingConfig.seq_len >= the builder's "
                 "max_length so multimodal rows are not truncated."
             )
-        for key in ("input_ids", "attention_mask", "labels", "word_pos", "morph_depth"):
+        truncation_keys = ["input_ids", "attention_mask", "labels"]
+        if position_contract != BOUNDARY_V1:
+            truncation_keys.extend(("word_pos", "morph_depth"))
+        for key in truncation_keys:
             out[key] = out[key][:max_seq_len]
 
     # Multimodal pass-through fields (opaque to the text-side normalizer).
@@ -342,6 +433,9 @@ def build_dataloader(
     drop_last: bool = True,
     image_processor: Any = None,
     omvt_cfg: Any = None,
+    require_precomputed_morphology: bool = False,
+    require_verified_images: bool = False,
+    position_contract: str | None = None,
 ) -> DataLoader:
     """Construct a rank-aware streaming dataloader.
 
@@ -377,6 +471,9 @@ def build_dataloader(
         max_seq_len=cfg.seq_len,
         image_processor=image_processor,
         omvt_cfg=omvt_cfg,
+        require_precomputed_morphology=require_precomputed_morphology,
+        require_verified_images=require_verified_images,
+        position_contract=position_contract,
     )
 
     return DataLoader(

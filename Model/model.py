@@ -13,6 +13,12 @@ from torch.utils.checkpoint import checkpoint
 from Model.blocks import StandardBlock
 from Model.config import RDTConfig
 from Model.layers.rmsnorm import RMSNorm
+from Model.layers.vision_cross_attention import RaggedVisionCrossAttention
+from Model.ocr.position_contract import (
+    BOUNDARY_V1,
+    LEGACY_SEQUENTIAL_V0,
+    validate_ocr_position_contract,
+)
 from Model.recurrent import RecurrentCore
 from Model.segmented import SegmentedCore
 from Model.two_stage import TwoStageCore
@@ -64,6 +70,10 @@ class RDTForCausalLM(nn.Module):
         # supervised/preference gradient. Pretraining keeps it enabled.
         self.reverse_loss_enabled = True
 
+        # OMVT-v2 detail memory is opt-in.  Keeping this as ``None`` means a
+        # v1 model creates no bridge parameters and executes no bridge path.
+        self.vision_cross_attention: RaggedVisionCrossAttention | None = None
+
         self.apply(self._init_weights)
         self._scale_residual_projections()
 
@@ -71,6 +81,35 @@ class RDTForCausalLM(nn.Module):
             self.lm_head.weight = self.embed.weight
             if self.reverse_head is not None:
                 self.reverse_head.weight = self.embed.weight
+
+    def install_vision_cross_attention(
+        self,
+        *,
+        memory_dim: int,
+        n_heads: int | None = None,
+        dropout: float = 0.0,
+    ) -> RaggedVisionCrossAttention:
+        """Explicitly install the teacher-forced OMVT-v2 detail bridge.
+
+        Generation and incremental cache behavior are deliberately not
+        changed here.  A second install is rejected so a trained bridge cannot
+        be silently reinitialized.
+        """
+
+        if self.vision_cross_attention is not None:
+            raise RuntimeError("vision cross-attention is already installed")
+        bridge = RaggedVisionCrossAttention(
+            d_model=self.cfg.d_model,
+            memory_dim=memory_dim,
+            n_heads=self.cfg.n_heads if n_heads is None else n_heads,
+            dropout=dropout,
+        )
+        bridge.apply(self._init_weights)
+        bridge.zero_init_output_projection()
+        bridge.to(device=self.embed.weight.device, dtype=self.embed.weight.dtype)
+        bridge.train(self.training)
+        self.vision_cross_attention = bridge
+        return bridge
 
     def _forward_decode(
         self,
@@ -80,6 +119,8 @@ class RDTForCausalLM(nn.Module):
         cache,
         pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
         visual_features: torch.Tensor | None = None,
+        detail_memory: torch.Tensor | None = None,
+        detail_cu_seqlens: torch.Tensor | None = None,
         steps: int | None = None,
     ) -> torch.Tensor:
         """Incremental forward over the new tokens ``input_ids`` (``[B, m]``).
@@ -121,6 +162,21 @@ class RDTForCausalLM(nn.Module):
                 pos_offset=pos_offset,
             )
 
+        if (detail_memory is None) != (detail_cu_seqlens is None):
+            raise ValueError(
+                "detail_memory and detail_cu_seqlens must be supplied together"
+            )
+        if detail_memory is not None:
+            if self.vision_cross_attention is None:
+                raise RuntimeError(
+                    "detail memory requires install_vision_cross_attention()"
+                )
+            h = self.vision_cross_attention(
+                h,
+                detail_memory,
+                detail_cu_seqlens,
+            )
+
         h, _rec_info = self.recurrent(
             h,
             word_pos=word_pos,
@@ -157,10 +213,15 @@ class RDTForCausalLM(nn.Module):
         visual_features: torch.Tensor | None = None,
         word_pos: torch.Tensor | None = None,
         morph_depth: torch.Tensor | None = None,
+        morphology_track_table: torch.Tensor | None = None,
         steps: int | None = None,
         bptt_window: int | None = None,
         return_logits: bool = True,
         loss_chunk_size: int | None = None,
+        pixel_repeats: int = 1,
+        position_contract: str | None = None,
+        detail_memory: torch.Tensor | None = None,
+        detail_cu_seqlens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | dict | None]:
         self._check_inputs(input_ids, attention_mask, labels)
         if loss_chunk_size is None:
@@ -173,10 +234,40 @@ class RDTForCausalLM(nn.Module):
         if attention_mask is None:
             attention_mask = (input_ids != self.cfg.pad_id).long()
 
-        if word_pos is None or morph_depth is None:
-            word_pos, morph_depth = self._default_morph_info(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+        if position_contract is not None:
+            position_contract = validate_ocr_position_contract(position_contract)
+            if morphology_track_table is not None:
+                raise ValueError(
+                    "morphology_track_table cannot be combined with an explicit "
+                    "OCR position contract"
+                )
+        if (word_pos is None) != (morph_depth is None):
+            raise ValueError("word_pos and morph_depth must be supplied together")
+        if word_pos is None:
+            if position_contract is not None:
+                word_pos, morph_depth = self._morph_info_for_position_contract(
+                    input_ids,
+                    attention_mask,
+                    position_contract,
+                )
+            elif morphology_track_table is not None:
+                word_pos, morph_depth = self._morph_info_from_track_table(
+                    input_ids,
+                    morphology_track_table,
+                )
+            else:
+                word_pos, morph_depth = self._default_morph_info(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+
+        if (detail_memory is None) != (detail_cu_seqlens is None):
+            raise ValueError(
+                "detail_memory and detail_cu_seqlens must be supplied together"
+            )
+        if detail_memory is not None and self.vision_cross_attention is None:
+            raise RuntimeError(
+                "detail memory requires install_vision_cross_attention()"
             )
 
         h = self.embed(input_ids)
@@ -187,6 +278,7 @@ class RDTForCausalLM(nn.Module):
                 input_ids,
                 pixel_values,
                 visual_features=visual_features,
+                pixel_repeats=pixel_repeats,
             )
 
         for block in self.prelude:
@@ -197,6 +289,15 @@ class RDTForCausalLM(nn.Module):
                 morph_depth=morph_depth,
                 attn_mask=attention_mask,
                 causal=True,
+            )
+
+        if detail_memory is not None:
+            assert self.vision_cross_attention is not None
+            h = self.vision_cross_attention(
+                h,
+                detail_memory,
+                detail_cu_seqlens,
+                query_mask=attention_mask,
             )
 
         e0 = h
@@ -491,10 +592,90 @@ class RDTForCausalLM(nn.Module):
         depth = cum_inc - last_reset.clamp(min=0)
         depth = torch.where(reset_positions, torch.zeros_like(depth), depth)
 
-        if cfg.max_morph_depth > 0:
-            depth = depth.clamp(max=cfg.max_morph_depth - 1)
-
         return word_pos.to(torch.long), depth.to(torch.long)
+
+    def _morph_info_for_position_contract(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_contract: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Derive positions for one declared OCR train/inference contract."""
+
+        contract = validate_ocr_position_contract(position_contract)
+        if contract == BOUNDARY_V1:
+            word_pos, morph_depth = self._default_morph_info(
+                input_ids,
+                attention_mask,
+            )
+            if self.cfg.max_morph_depth > 0:
+                morph_depth = morph_depth.clamp(
+                    max=self.cfg.max_morph_depth - 1
+                )
+            return word_pos, morph_depth
+        if contract == LEGACY_SEQUENTIAL_V0:
+            seq_len = input_ids.shape[1]
+            word_pos = torch.arange(
+                seq_len,
+                device=input_ids.device,
+                dtype=torch.long,
+            ).unsqueeze(0).expand_as(input_ids)
+            word_pos = torch.where(
+                attention_mask.to(torch.bool),
+                word_pos,
+                torch.zeros_like(word_pos),
+            )
+            return word_pos, torch.zeros_like(word_pos)
+        raise AssertionError(f"unreachable position contract: {contract}")
+
+    def _morph_info_from_track_table(
+        self,
+        input_ids: torch.Tensor,
+        track_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized span-equivalent morphology for tokenizer-routed ids.
+
+        Track ``0`` resets the current word, ``1`` is a Mongolian word piece,
+        and ``2`` is a general-script word piece. Strict OCR data admits only
+        text for which this id-only representation exactly matches the
+        tokenizer's span-aware pretraining representation.
+        """
+
+        if track_table.ndim != 1:
+            raise ValueError("morphology_track_table must be 1-D")
+        if track_table.device != input_ids.device:
+            raise ValueError(
+                "morphology_track_table must be on the same device as input_ids"
+            )
+        tracks = track_table[input_ids].to(torch.long)
+
+        is_word = tracks > 0
+        previous_word = torch.zeros_like(is_word)
+        previous_word[:, 1:] = is_word[:, :-1]
+        same_track = torch.zeros_like(is_word)
+        same_track[:, 1:] = tracks[:, 1:] == tracks[:, :-1]
+        word_start = is_word & ~(previous_word & same_track)
+
+        starts_seen = word_start.long().cumsum(dim=1)
+        word_pos = (starts_seen - 1).clamp(min=0)
+
+        positions = torch.arange(
+            input_ids.shape[1],
+            device=input_ids.device,
+            dtype=torch.long,
+        ).unsqueeze(0).expand_as(input_ids)
+        start_positions = torch.where(
+            word_start,
+            positions,
+            torch.full_like(positions, -1),
+        )
+        latest_start = start_positions.cummax(dim=1).values
+        morph_depth = torch.where(
+            is_word,
+            positions - latest_start.clamp(min=0),
+            torch.zeros_like(positions),
+        )
+        return word_pos, morph_depth
 
 
     def _check_inputs(
@@ -589,6 +770,11 @@ class RDTForCausalLM(nn.Module):
         pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None,
         visual_features: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        morphology_track_table: torch.Tensor | None = None,
+        word_pos: torch.Tensor | None = None,
+        morph_depth: torch.Tensor | None = None,
+        detail_memory: torch.Tensor | None = None,
+        detail_cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Last-position logits with per-token adaptive recurrent depth.
 
@@ -605,6 +791,15 @@ class RDTForCausalLM(nn.Module):
         threshold = self.cfg.kl_exit_threshold
         prev_logp = None
         logits = None
+        if (word_pos is None) != (morph_depth is None):
+            raise ValueError("word_pos and morph_depth must be supplied together")
+        morphology_kwargs = (
+            {"word_pos": word_pos, "morph_depth": morph_depth}
+            if word_pos is not None
+            else {}
+            if morphology_track_table is None
+            else {"morphology_track_table": morphology_track_table}
+        )
         for d in range(1, max_steps + 1):
             if pixel_values is not None or visual_features is not None:
                 out = self.forward(
@@ -614,6 +809,9 @@ class RDTForCausalLM(nn.Module):
                     return_logits=True,
                     pixel_values=pixel_values,
                     visual_features=visual_features,
+                    detail_memory=detail_memory,
+                    detail_cu_seqlens=detail_cu_seqlens,
+                    **morphology_kwargs,
                 )
             else:
                 out = self.forward(
@@ -621,6 +819,9 @@ class RDTForCausalLM(nn.Module):
                     attention_mask=attention_mask,
                     steps=d,
                     return_logits=True,
+                    detail_memory=detail_memory,
+                    detail_cu_seqlens=detail_cu_seqlens,
+                    **morphology_kwargs,
                 )
             logits = out["logits"][:, -1, :].float()
             logp = F.log_softmax(logits, dim=-1)
@@ -648,8 +849,16 @@ class RDTForCausalLM(nn.Module):
         use_cache: bool = False,
         stop_ids: Sequence[int] | None = None,
         on_token: Callable[[int, torch.Tensor], None] | None = None,
+        on_sample: (
+            Callable[[int, torch.Tensor, torch.Tensor], None] | None
+        ) = None,
         recurrent_steps: int | None = None,
         pixel_values: torch.Tensor | Mapping[str, torch.Tensor] | None = None,
+        morphology_track_table: torch.Tensor | None = None,
+        pixel_repeats: int = 1,
+        position_contract: str | None = None,
+        detail_memory: torch.Tensor | None = None,
+        detail_cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Autoregressively continue ``input_ids`` (``[B, L]``) with sampling.
 
@@ -692,6 +901,13 @@ class RDTForCausalLM(nn.Module):
         sampled id), matching exactly what is written to the output. Both are
         backward compatible: when unset, behaviour is identical to before.
 
+        ``on_sample`` additionally receives
+        ``on_sample(step, token_ids, token_log_probs)``.  The log-probabilities
+        are captured from the exact filtered distribution used by sampling,
+        before any later policy update. Finished rows receive zero because
+        their appended PAD is not a sampled action. OCR-GRPO uses this callback
+        to verify synchronous on-policy rollout/scoring consistency.
+
         ``recurrent_steps`` overrides the recurrent-depth refinement count for
         this decode call (default ``None`` -> ``cfg.recurrent_steps``). Because
         RDT reasons in latent depth, raising this spends more test-time compute
@@ -723,6 +939,29 @@ class RDTForCausalLM(nn.Module):
             raise ValueError("repetition_penalty must be positive")
         if recurrent_steps is not None and recurrent_steps <= 0:
             raise ValueError("recurrent_steps must be positive when set")
+        if type(pixel_repeats) is not int or pixel_repeats <= 0:
+            raise ValueError("pixel_repeats must be a positive integer")
+        if (detail_memory is None) != (detail_cu_seqlens is None):
+            raise ValueError(
+                "detail_memory and detail_cu_seqlens must be supplied together"
+            )
+        if detail_memory is not None:
+            if self.vision_cross_attention is None:
+                raise RuntimeError(
+                    "detail memory requires install_vision_cross_attention()"
+                )
+            if pixel_repeats != 1:
+                raise ValueError(
+                    "detail memory does not support pixel_repeats; repeat its "
+                    "ragged offsets explicitly"
+                )
+        if position_contract is not None:
+            position_contract = validate_ocr_position_contract(position_contract)
+            if morphology_track_table is not None:
+                raise ValueError(
+                    "morphology_track_table cannot be combined with an explicit "
+                    "OCR position contract"
+                )
         if use_cache and self.cfg.core_type not in {"two_stage", "segmented"}:
             raise NotImplementedError(
                 "use_cache=True is only supported for core_type="
@@ -734,6 +973,26 @@ class RDTForCausalLM(nn.Module):
                 "official Mamba kernels are not steppable by the decode cache. "
                 "Pass --mamba=naive for cached decoding or use_cache=False."
             )
+        if morphology_track_table is not None:
+            if morphology_track_table.ndim != 1:
+                raise ValueError("morphology_track_table must be 1-D")
+            if morphology_track_table.shape[0] < self.cfg.vocab_size:
+                raise ValueError(
+                    "morphology_track_table is shorter than model vocab_size"
+                )
+            if morphology_track_table.device != input_ids.device:
+                raise ValueError(
+                    "morphology_track_table must share input_ids device"
+                )
+            if bool(
+                (
+                    (morphology_track_table < 0)
+                    | (morphology_track_table > 2)
+                ).any()
+            ):
+                raise ValueError(
+                    "morphology_track_table values must be reset/mn/general"
+                )
 
         cfg = self.cfg
         eos_id = cfg.eos_id if eos_id is None else eos_id
@@ -796,8 +1055,20 @@ class RDTForCausalLM(nn.Module):
             cached_visual_features = None
             runtime_pixel_values = pixel_values
             if isinstance(pixel_values, Mapping):
-                cached_visual_features = self.vision.encode_visual(pixel_values)
+                cached_visual_features = self.vision.encode_visual(
+                    pixel_values,
+                    pixel_repeats=pixel_repeats,
+                )
                 runtime_pixel_values = None
+            elif pixel_repeats != 1:
+                raise ValueError(
+                    "pixel_repeats is only supported for OMVT mapping inputs"
+                )
+            generic_morphology_kwargs = (
+                {}
+                if morphology_track_table is None
+                else {"morphology_track_table": morphology_track_table}
+            )
             for step in range(max_new_tokens):
                 if use_cache:
                     if decode_cache.seq_len == 0:
@@ -811,9 +1082,25 @@ class RDTForCausalLM(nn.Module):
                         # <image_patch> slots, so pixel_values must be dropped.
                         step_pixels = None
                         step_features = None
-                    word_pos, morph_depth = self._default_morph_info(
-                        seq, seq_attention
-                    )
+                    if position_contract is not None:
+                        word_pos, morph_depth = (
+                            self._morph_info_for_position_contract(
+                                seq,
+                                seq_attention,
+                                position_contract,
+                            )
+                        )
+                    elif morphology_track_table is not None:
+                        word_pos, morph_depth = (
+                            self._morph_info_from_track_table(
+                                seq,
+                                morphology_track_table,
+                            )
+                        )
+                    else:
+                        word_pos, morph_depth = self._default_morph_info(
+                            seq, seq_attention
+                        )
                     m = step_ids.shape[1]
                     logits = self._forward_decode(
                         step_ids,
@@ -822,6 +1109,8 @@ class RDTForCausalLM(nn.Module):
                         cache=decode_cache,
                         pixel_values=step_pixels,
                         visual_features=step_features,
+                        detail_memory=detail_memory,
+                        detail_cu_seqlens=detail_cu_seqlens,
                         steps=recurrent_steps,
                     )[:, -1, :].float()
                 else:
@@ -842,14 +1131,36 @@ class RDTForCausalLM(nn.Module):
                                 "keep L + max_new_tokens <= max_seq_len."
                             )
 
+                    position_kwargs = {}
+                    if position_contract is not None:
+                        word_pos, morph_depth = (
+                            self._morph_info_for_position_contract(
+                                window,
+                                window_attention,
+                                position_contract,
+                            )
+                        )
+                        position_kwargs = {
+                            "word_pos": word_pos,
+                            "morph_depth": morph_depth,
+                        }
+
                     if self._kl_exit_active(recurrent_steps):
                         logits = self._adaptive_depth_logits(
                             window,
                             runtime_pixel_values,
                             visual_features=cached_visual_features,
                             attention_mask=window_attention,
+                            morphology_track_table=morphology_track_table,
+                            detail_memory=detail_memory,
+                            detail_cu_seqlens=detail_cu_seqlens,
+                            **position_kwargs,
                         )
-                    elif runtime_pixel_values is not None or cached_visual_features is not None:
+                    elif (
+                        runtime_pixel_values is not None
+                        or cached_visual_features is not None
+                        or detail_memory is not None
+                    ):
                         out = self.forward(
                             window,
                             attention_mask=window_attention,
@@ -857,6 +1168,10 @@ class RDTForCausalLM(nn.Module):
                             return_logits=True,
                             pixel_values=runtime_pixel_values,
                             visual_features=cached_visual_features,
+                            detail_memory=detail_memory,
+                            detail_cu_seqlens=detail_cu_seqlens,
+                            **position_kwargs,
+                            **generic_morphology_kwargs,
                         )
                         logits = out["logits"][:, -1, :].float()
                     else:
@@ -865,6 +1180,8 @@ class RDTForCausalLM(nn.Module):
                             attention_mask=window_attention,
                             steps=recurrent_steps,
                             return_logits=True,
+                            **position_kwargs,
+                            **generic_morphology_kwargs,
                         )
                         logits = out["logits"][:, -1, :].float()
 
@@ -875,11 +1192,32 @@ class RDTForCausalLM(nn.Module):
 
                 if greedy:
                     next_token = torch.argmax(logits, dim=-1)
+                    sampling_logp = (
+                        F.log_softmax(logits.float(), dim=-1)
+                        .gather(-1, next_token.unsqueeze(-1))
+                        .squeeze(-1)
+                        if on_sample is not None
+                        else None
+                    )
                 else:
                     logits = logits / temperature
                     logits = self._filter_logits(logits, top_k, top_p, min_p)
-                    probs = F.softmax(logits, dim=-1)
+                    if on_sample is not None:
+                        sampling_distribution = F.log_softmax(
+                            logits.float(), dim=-1
+                        )
+                        probs = sampling_distribution.exp()
+                    else:
+                        sampling_distribution = None
+                        probs = F.softmax(logits, dim=-1)
                     next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                    sampling_logp = (
+                        sampling_distribution.gather(
+                            -1, next_token.unsqueeze(-1)
+                        ).squeeze(-1)
+                        if sampling_distribution is not None
+                        else None
+                    )
 
                 was_finished = finished
                 next_token = torch.where(
@@ -891,6 +1229,17 @@ class RDTForCausalLM(nn.Module):
                 seq_attention = torch.cat([seq_attention, next_attention], dim=1)
                 if on_token is not None:
                     on_token(step, next_token)
+                if on_sample is not None:
+                    assert sampling_logp is not None
+                    on_sample(
+                        step,
+                        next_token,
+                        torch.where(
+                            was_finished,
+                            torch.zeros_like(sampling_logp),
+                            sampling_logp,
+                        ),
+                    )
                 if stop_tensor is not None:
                     finished = finished | torch.isin(next_token, stop_tensor)
                 else:

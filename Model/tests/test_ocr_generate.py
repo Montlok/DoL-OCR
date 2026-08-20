@@ -99,14 +99,18 @@ class TestGeneratePixelValues(unittest.TestCase):
         model = RDTForCausalLM(cfg, patch_pixels=4).eval()
         prompt = _image_prompt(cfg)
         pixels = torch.randn(1, 4)
+        track_table = torch.zeros(cfg.vocab_size, dtype=torch.long)
+        track_table[256:512] = 1
 
         free = model.generate(
             prompt, max_new_tokens=5, greedy=True, use_cache=False,
             pixel_values=pixels,
+            morphology_track_table=track_table,
         )
         cached = model.generate(
             prompt, max_new_tokens=5, greedy=True, use_cache=True,
             pixel_values=pixels,
+            morphology_track_table=track_table,
         )
         self.assertTrue(
             torch.equal(free, cached),

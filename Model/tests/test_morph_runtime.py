@@ -7,6 +7,7 @@ import torch
 from Model.config import RDTConfig
 from Model.model import RDTForCausalLM
 from Tokenizer.pretraining import derive_morph_info_from_boundary_ids
+from Tokenizer.pretraining import derive_morph_info_from_track_ids
 
 
 def _cfg() -> RDTConfig:
@@ -52,7 +53,7 @@ class DefaultMorphInfoTest(unittest.TestCase):
 
         for i, seq in enumerate(seqs):
             ref_wp, ref_md = derive_morph_info_from_boundary_ids(
-                seq, wb, mb, max_depth=cfg.max_morph_depth
+                seq, wb, mb
             )
             self.assertEqual(word_pos[i].tolist(), ref_wp, msg=f"row {i}")
             self.assertEqual(morph_depth[i].tolist(), ref_md, msg=f"row {i}")
@@ -67,7 +68,7 @@ class DefaultMorphInfoTest(unittest.TestCase):
         self.assertEqual(word_pos.tolist(), [[0, 0, 0, 0]])
         self.assertEqual(morph_depth.tolist(), [[0, 0, 0, 0]])
 
-    def test_morph_depth_clamps_to_max(self):
+    def test_morph_depth_is_not_preclipped_before_rope(self):
         cfg = _cfg()
         cfg.max_morph_depth = 3
         model = RDTForCausalLM(cfg)
@@ -78,7 +79,53 @@ class DefaultMorphInfoTest(unittest.TestCase):
         attention_mask = torch.ones_like(input_ids)
 
         _, morph_depth = model._default_morph_info(input_ids, attention_mask)
-        self.assertLessEqual(int(morph_depth.max().item()), cfg.max_morph_depth - 1)
+        self.assertGreater(int(morph_depth.max().item()), cfg.max_morph_depth)
+
+    def test_long_word_track_and_explicit_features_have_identical_logits(self):
+        cfg = _cfg()
+        cfg.max_morph_depth = 3
+        model = RDTForCausalLM(cfg).eval()
+        table = torch.zeros(cfg.vocab_size, dtype=torch.long)
+        table[300] = 1
+        ids = torch.tensor(
+            [[cfg.bos_id, 300, 300, 300, 300, 300, cfg.eos_id]],
+            dtype=torch.long,
+        )
+        tracks = [int(table[token_id]) for token_id in ids[0].tolist()]
+        expected_word_pos, expected_morph_depth = (
+            derive_morph_info_from_track_ids(tracks)
+        )
+        self.assertGreater(max(expected_morph_depth), cfg.max_morph_depth)
+
+        with torch.no_grad():
+            explicit = model(
+                ids,
+                word_pos=torch.tensor([expected_word_pos]),
+                morph_depth=torch.tensor([expected_morph_depth]),
+            )["logits"]
+            runtime = model(
+                ids,
+                morphology_track_table=table,
+            )["logits"]
+        torch.testing.assert_close(explicit, runtime, rtol=0, atol=0)
+
+    def test_token_track_runtime_matches_python_contract(self):
+        cfg = _cfg()
+        model = RDTForCausalLM(cfg)
+        table = torch.zeros(cfg.vocab_size, dtype=torch.long)
+        table[300:303] = 1
+        table[400:402] = 2
+        rows = [
+            [cfg.bos_id, 300, 301, cfg.word_boundary_id, 302, cfg.eos_id],
+            [cfg.bos_id, 400, 401, 300, 301, cfg.eos_id],
+        ]
+        ids = torch.tensor(rows, dtype=torch.long)
+        word_pos, morph_depth = model._morph_info_from_track_table(ids, table)
+        for index, row in enumerate(rows):
+            tracks = [int(table[token_id]) for token_id in row]
+            expected = derive_morph_info_from_track_ids(tracks)
+            self.assertEqual(word_pos[index].tolist(), expected[0])
+            self.assertEqual(morph_depth[index].tolist(), expected[1])
 
 
 if __name__ == "__main__":

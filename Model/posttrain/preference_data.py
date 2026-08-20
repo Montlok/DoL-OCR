@@ -42,6 +42,7 @@ from Model.config import IGNORE_INDEX
 from .sft_data import build_sft_example
 
 Encode = Callable[[str], list[int]]
+CanonicalizeReference = Callable[[str], str]
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 
 
@@ -200,6 +201,7 @@ class OCRPromptDataset(Dataset):
         image_patch_id: int,
         image_end_id: int,
         encode_reference: Encode | None = None,
+        canonicalize_reference: CanonicalizeReference | None = None,
         image_root: str | Path | None = None,
         max_prompt_len: int | None = None,
         max_completion_len: int | None = None,
@@ -218,6 +220,7 @@ class OCRPromptDataset(Dataset):
         inspect_reference_tokens: bool = True,
         retain_reference: bool = True,
         inspect_prompt_tokens: bool = True,
+        allow_instruction: bool = True,
     ) -> None:
         if n_image_tokens <= 0:
             raise ValueError("n_image_tokens must be positive")
@@ -328,19 +331,37 @@ class OCRPromptDataset(Dataset):
                             f"manifest={digest} actual={actual}"
                         )
 
-            reference = obj.get("reference")
-            if not isinstance(reference, str):
+            raw_reference = obj.get("reference")
+            if not isinstance(raw_reference, str):
                 raise ValueError(f"{source}:{line_no}: string 'reference' is required")
-            if not reference.strip():
+            if not raw_reference.strip():
                 raise ValueError(f"{source}:{line_no}: reference must not be empty")
-            if "\ufffd" in reference:
+            if "\ufffd" in raw_reference:
                 raise ValueError(
                     f"{source}:{line_no}: reference contains U+FFFD, which is "
                     "reserved as the reward-safe invalid-token sentinel"
                 )
+            reference = (
+                canonicalize_reference(raw_reference)
+                if canonicalize_reference is not None
+                else raw_reference
+            )
+            if not isinstance(reference, str) or not reference.strip():
+                raise ValueError(
+                    f"{source}:{line_no}: canonical reference must be a non-empty string"
+                )
+            if "\ufffd" in reference:
+                raise ValueError(
+                    f"{source}:{line_no}: canonical reference contains U+FFFD"
+                )
             instruction = obj.get("instruction", "")
             if not isinstance(instruction, str):
                 raise ValueError(f"{source}:{line_no}: instruction must be a string")
+            if instruction and not allow_instruction:
+                raise ValueError(
+                    f"{source}:{line_no}: locked golden instructions are "
+                    "forbidden because they can leak the reference"
+                )
             domain = obj.get("domain")
             if domain is None and not require_domain:
                 domain = "unknown"
@@ -435,6 +456,8 @@ class OCRPromptDataset(Dataset):
                 row["prompt_ids"] = prompt_ids
             if retain_reference:
                 row["reference"] = reference
+                row["raw_reference"] = raw_reference
+                row["reference_canonicalized"] = reference != raw_reference
             self._rows.append(row)
 
         if not self._rows:

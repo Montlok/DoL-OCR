@@ -20,6 +20,7 @@ htmlcov/
 runs/
 ckpt/
 checkpoints/
+weight/
 outputs/
 wandb/
 logs/

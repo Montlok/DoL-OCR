@@ -88,6 +88,7 @@ python -m Tokenizer.tools.build_pretraining_data \
     --tokenizer-bundle artefacts/tokenizer_bundle \
     --input Tokenizer/data/sample_multimodal.jsonl \
     --output artefacts/pretrain.jsonl \
+    --receipt artefacts/pretrain.receipt.json \
     --max-length 2048 \
     --pack \
     --pack-max-length 2048 \
@@ -121,6 +122,26 @@ python -m Tokenizer.evals.pretraining_gate \
     --min-supervised-rate 0.01 \
     --json
 ```
+
+The builder receipt binds the emitted shard bytes to the exact tokenizer
+bundle, shared tokenizer algorithm, and the current source fingerprint of the
+named row producer. `train_rdt` accepts only registered producer kinds and
+fails closed on producer drift. Pass the receipt to every formal RDT run;
+never construct a receipt path independently of the builder output:
+
+```bash
+python -m scripts.train_rdt --config pretrain \
+    --tokenizer-bundle artefacts/tokenizer_bundle \
+    --data artefacts/pretrain.jsonl \
+    --data-receipt artefacts/pretrain.receipt.json \
+    --output runs/rdt
+```
+
+When validation data is configured, build it separately and pass its emitted
+receipt with `--eval-data-receipt` alongside `--eval-data`.
+Every production/non-smoke receipt-backed train, eval, or mix JSONL row must
+persist `word_pos` and `morph_depth`; model-side derivation/fallback is only for
+legacy/smoke inputs, never production.
 
 ## 8. Evaluate
 

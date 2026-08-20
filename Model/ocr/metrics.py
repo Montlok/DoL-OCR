@@ -28,8 +28,9 @@ We report three character error rates:
   nominal Mongolian Unicode, then compared. Folding prefers the repository's Rust
   normalizer (``normalize_to_nominal_unicode`` via
   :mod:`Tokenizer.tools.normalize_mongolian`); when ``cargo`` is unavailable it
-  falls back to a light Python folding that strips FVS/MVS/joiners. This keeps the
-  metric meaningful (no rendering-noise penalty) without a hard Rust dependency.
+  falls back to a Unicode-only Python implementation with the same FVS,
+  MVS/NNBSP, and zero-width-noise semantics. This keeps the metric meaningful
+  and backend-stable without a hard Rust dependency.
 - **raw CER**: compares the unmodified code points, exposing the true
   encoding gap.
 
@@ -42,6 +43,12 @@ headline number, to the reverse. :func:`script_bucket_cer` (surfaced on
 ``"latin"``/``"other"`` (see :func:`script_of`) — by projecting each side down
 to one script's characters and scoring the projections independently; see
 that function's docstring for the method's cross-script-substitution caveat.
+
+``OCRReport.symbol_metrics`` provides a second, raw-codepoint diagnostic for
+digits, punctuation, FVS, MVS, and NNBSP.  Unlike the script projection, it
+backtraces the full Levenshtein alignment before attributing matches and edits,
+so a selector or punctuation error remains tied to its position in the line.
+FVS is reported both as one aggregate class and separately for FVS1--FVS4.
 
 This module is intentionally torch-free so it can be unit-tested without loading
 a model.
@@ -57,11 +64,10 @@ from dataclasses import dataclass
 # recognition errors in the Python fallback folding.
 _FVS = {0x180B, 0x180C, 0x180D, 0x180F}  # free variation selectors (incl. FVS4)
 _MVS = {0x180E}  # Mongolian vowel separator
-_JOINERS = {0x200C, 0x200D}  # ZWNJ / ZWJ
-_BOM = {0xFEFF, 0xFFFE}
-_NNBSP = 0x202F  # narrow no-break space -> regular space
+_ZERO_WIDTH_NOISE = {0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF}
+_NNBSP = 0x202F  # Rust nominal contract maps NNBSP to MVS.
 
-_FALLBACK_DELETE = _FVS | _MVS | _JOINERS | _BOM
+_FALLBACK_DELETE = _FVS | _ZERO_WIDTH_NOISE
 
 # Categories that attach to the preceding base character as combining marks:
 # nonspacing (Mn), spacing-combining (Mc), enclosing (Me). FVS is deliberately
@@ -112,9 +118,9 @@ def grapheme_clusters(text: str) -> list[str]:
 def _python_fold(text: str) -> str:
     """Light nominal folding used when the Rust normalizer is unavailable.
 
-    Strips FVS/MVS/joiners/BOM and maps NNBSP to a regular space. This is a
-    deliberately conservative subset of the Rust normalizer; it is *not* a full
-    Menksoft/presentation-form normalizer.
+    Mirrors the Rust normalizer for already-Unicode text: strip FVS and
+    zero-width transport noise, preserve MVS, and map NNBSP to MVS. This is not
+    a Menksoft/PUA converter, but its Unicode semantics are backend-stable.
     """
     out = []
     for ch in text:
@@ -122,7 +128,7 @@ def _python_fold(text: str) -> str:
         if cp in _FALLBACK_DELETE:
             continue
         if cp == _NNBSP:
-            out.append(" ")
+            out.append("\u180e")
             continue
         out.append(ch)
     return "".join(out)
@@ -222,6 +228,203 @@ def edit_distance(a: Sequence, b: Sequence) -> int:
             cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
         prev = cur
     return prev[-1]
+
+
+def _levenshtein_alignment(
+    pred: str,
+    ref: str,
+) -> list[tuple[str, str | None, str | None]]:
+    """Return a deterministic minimum-edit raw-codepoint alignment.
+
+    Each item is ``(operation, reference_character, prediction_character)``.
+    ``operation`` is one of ``"match"``, ``"substitution"``, ``"deletion"``,
+    or ``"insertion"``.  Exact diagonal matches are preferred during
+    backtracing, followed by substitutions, deletions, and insertions.  The
+    preference only resolves equal-cost paths; it never changes the
+    Levenshtein distance.
+    """
+
+    n_ref, n_pred = len(ref), len(pred)
+    distance = [[0] * (n_pred + 1) for _ in range(n_ref + 1)]
+    for i in range(1, n_ref + 1):
+        distance[i][0] = i
+    for j in range(1, n_pred + 1):
+        distance[0][j] = j
+    for i, ref_ch in enumerate(ref, start=1):
+        for j, pred_ch in enumerate(pred, start=1):
+            substitution_cost = 0 if ref_ch == pred_ch else 1
+            distance[i][j] = min(
+                distance[i - 1][j] + 1,
+                distance[i][j - 1] + 1,
+                distance[i - 1][j - 1] + substitution_cost,
+            )
+
+    reverse_alignment: list[tuple[str, str | None, str | None]] = []
+    i, j = n_ref, n_pred
+    while i or j:
+        if (
+            i
+            and j
+            and ref[i - 1] == pred[j - 1]
+            and distance[i][j] == distance[i - 1][j - 1]
+        ):
+            reverse_alignment.append(("match", ref[i - 1], pred[j - 1]))
+            i -= 1
+            j -= 1
+            continue
+        if i and j and distance[i][j] == distance[i - 1][j - 1] + 1:
+            reverse_alignment.append(("substitution", ref[i - 1], pred[j - 1]))
+            i -= 1
+            j -= 1
+            continue
+        if i and distance[i][j] == distance[i - 1][j] + 1:
+            reverse_alignment.append(("deletion", ref[i - 1], None))
+            i -= 1
+            continue
+        if j and distance[i][j] == distance[i][j - 1] + 1:
+            reverse_alignment.append(("insertion", None, pred[j - 1]))
+            j -= 1
+            continue
+        raise RuntimeError("invalid Levenshtein backtrace state")
+
+    reverse_alignment.reverse()
+    return reverse_alignment
+
+
+_SYMBOL_CLASS_NAMES = ("digit", "punctuation", "fvs", "mvs", "nnbsp")
+_FVS_VARIANT_NAMES = {
+    0x180B: "fvs1",
+    0x180C: "fvs2",
+    0x180D: "fvs3",
+    0x180F: "fvs4",
+}
+_SYMBOL_COUNT_FIELDS = (
+    "n_ref",
+    "n_pred",
+    "correct",
+    "substitutions",
+    "deletions",
+    "insertions",
+    "line_support",
+)
+
+
+def _new_symbol_counts() -> dict[str, int]:
+    return {field: 0 for field in _SYMBOL_COUNT_FIELDS}
+
+
+def _symbol_classes(ch: str) -> tuple[str, ...]:
+    """Return non-overlapping base classes plus an exact FVS variant class."""
+
+    cp = ord(ch)
+    if cp in _FVS_VARIANT_NAMES:
+        return ("fvs", _FVS_VARIANT_NAMES[cp])
+    if cp in _MVS:
+        return ("mvs",)
+    if cp == _NNBSP:
+        return ("nnbsp",)
+    category = unicodedata.category(ch)
+    if category == "Nd":
+        return ("digit",)
+    if category.startswith("P"):
+        return ("punctuation",)
+    return ()
+
+
+def _finalize_symbol_counts(
+    counts: dict[str, int],
+) -> dict[str, int | float | None]:
+    result: dict[str, int | float | None] = dict(counts)
+    n_ref = counts["n_ref"]
+    if n_ref == 0:
+        result["error_rate"] = None
+    else:
+        errors = counts["substitutions"] + counts["deletions"] + counts["insertions"]
+        result["error_rate"] = errors / n_ref
+    return result
+
+
+def symbol_metrics(
+    preds: Sequence[str],
+    refs: Sequence[str],
+) -> dict[str, dict[str, object]]:
+    """Measure raw Unicode symbol recognition from full line alignments.
+
+    The five top-level classes are:
+
+    - ``digit``: Unicode decimal digits (general category ``Nd``);
+    - ``punctuation``: every Unicode punctuation category (``P*``);
+    - ``fvs``: U+180B/U+180C/U+180D/U+180F;
+    - ``mvs``: U+180E;
+    - ``nnbsp``: U+202F.
+
+    Every class reports ``n_ref``, ``n_pred``, ``correct``,
+    ``substitutions``, ``deletions``, ``insertions``, ``error_rate``, and
+    ``line_support``. ``line_support`` counts reference lines containing at
+    least one member of the class. ``error_rate`` is ``None`` when ``n_ref`` is
+    zero, leaving prediction-only insertions visible without manufacturing a
+    denominator.
+
+    A substitution is charged to the reference character's class. If the
+    predicted character belongs to a *different* tracked class, it is also an
+    insertion for that predicted class. This exposes cross-class false
+    positives while counting an in-class substitution (for example ``1`` to
+    ``2``) exactly once. The aggregate ``fvs`` entry contains a ``variants``
+    mapping with the same fields for FVS1--FVS4.
+    """
+
+    preds = list(preds)
+    refs = list(refs)
+    if len(preds) != len(refs):
+        raise ValueError(
+            f"preds/refs length mismatch: {len(preds)} != {len(refs)}"
+        )
+
+    class_names = (*_SYMBOL_CLASS_NAMES, *_FVS_VARIANT_NAMES.values())
+    totals = {name: _new_symbol_counts() for name in class_names}
+
+    for pred, ref in zip(preds, refs):
+        ref_support: set[str] = set()
+        for ch in ref:
+            for name in _symbol_classes(ch):
+                totals[name]["n_ref"] += 1
+                ref_support.add(name)
+        for name in ref_support:
+            totals[name]["line_support"] += 1
+        for ch in pred:
+            for name in _symbol_classes(ch):
+                totals[name]["n_pred"] += 1
+
+        for operation, ref_ch, pred_ch in _levenshtein_alignment(pred, ref):
+            ref_classes = set(_symbol_classes(ref_ch)) if ref_ch is not None else set()
+            pred_classes = (
+                set(_symbol_classes(pred_ch)) if pred_ch is not None else set()
+            )
+            if operation == "match":
+                for name in ref_classes:
+                    totals[name]["correct"] += 1
+            elif operation == "substitution":
+                for name in ref_classes:
+                    totals[name]["substitutions"] += 1
+                for name in pred_classes - ref_classes:
+                    totals[name]["insertions"] += 1
+            elif operation == "deletion":
+                for name in ref_classes:
+                    totals[name]["deletions"] += 1
+            elif operation == "insertion":
+                for name in pred_classes:
+                    totals[name]["insertions"] += 1
+            else:  # pragma: no cover - private aligner has a closed operation set.
+                raise RuntimeError(f"unknown alignment operation {operation!r}")
+
+    result: dict[str, dict[str, object]] = {
+        name: _finalize_symbol_counts(totals[name]) for name in _SYMBOL_CLASS_NAMES
+    }
+    result["fvs"]["variants"] = {
+        name: _finalize_symbol_counts(totals[name])
+        for name in _FVS_VARIANT_NAMES.values()
+    }
+    return result
 
 
 def _corpus_rate(
@@ -460,9 +663,12 @@ class OCRReport:
     grapheme_cer: float
     wer: float
     line_exact: float
+    raw_line_exact: float
+    normalized_line_exact: float
     rejection_rate: float
     backend: str
     script_cer: dict[str, dict[str, float | int]] | None = None
+    symbol_metrics: dict[str, dict[str, object]] | None = None
 
 
 def ocr_report(
@@ -481,9 +687,7 @@ def ocr_report(
     preds = list(preds)
     refs = list(refs)
     if len(preds) != len(refs):
-        raise ValueError(
-            f"preds/refs length mismatch: {len(preds)} != {len(refs)}"
-        )
+        raise ValueError(f"preds/refs length mismatch: {len(preds)} != {len(refs)}")
     total = len(preds)
     if rejected is not None:
         rejected = list(rejected)
@@ -512,12 +716,15 @@ def ocr_report(
     wer_rate, _, _ = _corpus_rate(
         [p.split() for p in norm_p], [r.split() for r in norm_r]
     )
-    exact = sum(1 for p, r in zip(norm_p, norm_r) if p == r)
-    line_exact = exact / len(keep) if keep else 0.0
+    normalized_exact = sum(1 for p, r in zip(norm_p, norm_r) if p == r)
+    normalized_line_exact = normalized_exact / len(keep) if keep else 0.0
+    raw_exact = sum(1 for p, r in zip(kp, kr) if p == r)
+    raw_line_exact = raw_exact / len(keep) if keep else 0.0
     # Reuse the same raw-text grapheme clusters as grapheme_cer above (same
     # convention: unfolded text) rather than re-clustering via a second
     # script_bucket_cer(..., unit="grapheme") call.
     script_cer_map = _bucket_cer_from_units(grapheme_p, grapheme_r, unit="grapheme")
+    symbol_metrics_map = symbol_metrics(kp, kr)
 
     return OCRReport(
         n=len(keep),
@@ -525,10 +732,14 @@ def ocr_report(
         raw_cer=raw_cer,
         grapheme_cer=grapheme_cer_rate,
         wer=wer_rate,
-        line_exact=line_exact,
+        # Compatibility alias: historically line_exact was normalized.
+        line_exact=normalized_line_exact,
+        raw_line_exact=raw_line_exact,
+        normalized_line_exact=normalized_line_exact,
         rejection_rate=rejection_rate,
         backend=used_backend,
         script_cer=script_cer_map,
+        symbol_metrics=symbol_metrics_map,
     )
 
 
@@ -541,5 +752,6 @@ __all__ = [
     "ocr_report",
     "script_bucket_cer",
     "script_of",
+    "symbol_metrics",
     "wer",
 ]

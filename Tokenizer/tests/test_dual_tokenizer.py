@@ -50,6 +50,16 @@ class DualTokenizerTest(unittest.TestCase):
             ],
         )
 
+    def test_plain_text_encoding_escapes_literal_control_surfaces(self):
+        tokenizer = build_fake_tokenizer()
+        text = "▁◈<bos><image_patch>"
+        ids = tokenizer.encode_plain_text(text)
+        self.assertNotIn(SPECIAL_TOKENS["▁"], ids)
+        self.assertNotIn(SPECIAL_TOKENS["◈"], ids)
+        self.assertNotIn(SPECIAL_TOKENS["<bos>"], ids)
+        self.assertNotIn(SPECIAL_TOKENS["<image_patch>"], ids)
+        self.assertEqual(tokenizer.decode(ids), text)
+
     def test_fullwidth_latin_and_digits_route_to_general(self):
         spans = segment_by_language("Ａ３！test")
         self.assertEqual(
@@ -213,6 +223,44 @@ class MongolianFallbackOffsetTest(unittest.TestCase):
         self.assertEqual((mn[0].start, mn[0].end), (0, 3))
         self.assertEqual((mn[1].start, mn[1].end), (3, 6))
 
+    def test_uncovered_mongolian_scalar_uses_lossless_general_fallback(self):
+        class SparseMorphBPE:
+            vocab = {"<unk>": 0, "ᠮ": 1}
+
+            def encode_with_offsets(self, text):
+                from Tokenizer.morphbpe.offsets import MorphToken
+
+                return [
+                    MorphToken(
+                        ch,
+                        self.vocab.get(ch, self.vocab["<unk>"]),
+                        index,
+                        index + 1,
+                    )
+                    for index, ch in enumerate(text)
+                ]
+
+        general = GeneralBPEModel.minimal()
+        vocab = build_unified_vocab(
+            morphbpe_vocab=SparseMorphBPE.vocab,
+            general_vocab=general.get_vocab(),
+        )
+        tokenizer = DualTrackTokenizer(vocab, SparseMorphBPE(), general)
+        text = "ᠮ᠐ᠮ"
+        result = tokenizer.encode_with_spans(text)
+        self.assertNotIn(tokenizer.unk_id, result.input_ids)
+        self.assertEqual(tokenizer.decode(result.input_ids), text)
+        self.assertEqual(
+            [token.track for token in result.tokens],
+            [
+                "mn",
+                "mn_general_fallback",
+                "mn_general_fallback",
+                "mn_general_fallback",
+                "mn",
+            ],
+        )
+
 
 class SharedSurfaceCollisionTest(unittest.TestCase):
     """Surfaces present in BOTH track vocabs share one MorphBPE-segment id.
@@ -229,7 +277,7 @@ class SharedSurfaceCollisionTest(unittest.TestCase):
         # "a" and "1" stand in for Latin/digit fragments absorbed into the
         # MorphBPE vocab at build time; build_unified_vocab assigns them
         # MorphBPE-segment ids, which the general track must then share.
-        vocab = {"ᠮᠣᠩᠭᠣᠯ": 0, "a": 1, "1": 2}
+        vocab = {"ᠮᠣᠩᠭᠣᠯ": 0, "a": 1, "1": 2, "±": 3}
 
         def encode(self, text):
             return [self.vocab[text]]
@@ -254,13 +302,19 @@ class SharedSurfaceCollisionTest(unittest.TestCase):
 
     def test_general_text_with_shared_pieces_round_trips_without_unk(self):
         tokenizer, _ = self._build()
-        # Shared pieces decode through the raw unified-surface route while
-        # their neighbours flow through general.decode(); multi-byte chars
-        # around a shared piece pin the buffer flushes to char boundaries.
         for text in ("a1", "var a = 1;", "中a中", "a 中 1"):
             ids = tokenizer.encode(text)
             self.assertNotIn(tokenizer.unk_id, ids)
             self.assertEqual(tokenizer.decode(ids), text)
+
+    def test_non_ascii_shared_byte_atom_stays_in_general_decode_buffer(self):
+        tokenizer, vocab = self._build()
+        # U+FE31 is UTF-8 EF B8 B1. ByteLevel represents the final B1 byte as
+        # the visible atom "±", which deliberately owns a MorphBPE-segment id.
+        text = "︱"
+        ids = tokenizer.encode(text)
+        self.assertIn(vocab["±"], ids)
+        self.assertEqual(tokenizer.decode(ids), text)
 
     def test_mongolian_ids_unaffected_by_collisions(self):
         tokenizer, _ = self._build()

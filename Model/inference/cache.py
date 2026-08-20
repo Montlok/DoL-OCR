@@ -15,8 +15,8 @@ Two primitive caches:
   ``append``. Because each refinement pass of the Stage-2 loop is itself a
   fresh causal attention over the frozen earlier positions, every
   ``(step, layer)`` pair owns its own :class:`MLACache`.
-* :class:`MambaCache` -- the constant-size ``(conv_window, ssm_state)`` of one
-  NaiveSSM layer, so the selective scan can be stepped one token at a time.
+* :class:`MambaCache` -- either the constant-size NaiveSSM recurrent state or
+  one call site's isolated upstream ``InferenceParams`` object.
 
 :class:`DecodeCache` is a flat keyed container the orchestrators
 (``RDTForCausalLM`` / ``TwoStageCore``) populate lazily; keys encode the call
@@ -56,15 +56,25 @@ class MLACache:
 
 @dataclass
 class MambaCache:
-    """Per-NaiveSSM constant-size recurrent state.
+    """Per-call-site recurrent state for exactly one Mamba backend.
 
     ``conv_window`` holds the last ``d_conv - 1`` *pre-convolution* columns
     (shape ``[B, d_inner, d_conv - 1]``); ``ssm_state`` is the selective-scan
-    state ``[B, nheads, headdim, d_state]`` in float32.
+    state ``[B, nheads, headdim, d_state]`` in float32. The ``official_*``
+    fields hold an isolated upstream cache; they must never be shared between
+    logical call sites because upstream indexes state by ``layer_idx``.
     """
 
     conv_window: torch.Tensor | None = None
     ssm_state: torch.Tensor | None = None
+    backend: str | None = None
+    official_inference_params: object | None = None
+    official_owner: object | None = field(default=None, repr=False)
+    official_batch_size: int | None = None
+    official_max_seqlen: int | None = None
+    official_device: torch.device | None = None
+    official_dtype: torch.dtype | None = None
+    official_poisoned: bool = False
 
 
 @dataclass

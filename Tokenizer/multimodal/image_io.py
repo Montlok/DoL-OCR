@@ -46,38 +46,58 @@ def _require_pil() -> None:
         ) from _PIL_IMPORT_ERROR
 
 
-def _open_to_rgb(spec: Any, *, channels: int = 3) -> "Image.Image":
+def _open_to_rgb(
+    spec: Any,
+    *,
+    channels: int = 3,
+    max_pixels: int | None = None,
+) -> "Image.Image":
     """Materialise ``spec`` into a loaded RGB/L ``PIL.Image``.
 
     We wrap every disk/bytes opener in a context manager and call
     ``raw.load()`` before returning, so the underlying file descriptor
     closes deterministically. Without this the OS fd table can fill up
-    when streaming tens of thousands of images per epoch. EXIF orientation is
-    applied before conversion so phone photos are presented as users see them.
+    when streaming tens of thousands of images per epoch.
     """
 
     _require_pil()
     mode = "L" if channels == 1 else "RGB"
+
+    def validate_size(image: "Image.Image") -> None:
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            raise ValueError("image has zero width or height")
+        if max_pixels is not None and width * height > max_pixels:
+            raise ValueError(
+                f"image exceeds max_pixels: {width * height} > {max_pixels}"
+            )
+
+    def orient_and_convert(image: "Image.Image") -> "Image.Image":
+        validate_size(image)
+        return ImageOps.exif_transpose(image).convert(mode)
+
     if Image is not None and isinstance(spec, Image.Image):
-        # Already an in-memory PIL image — convert eagerly so the caller
-        # can drop the original reference.
-        return ImageOps.exif_transpose(spec).convert(mode)
+        return orient_and_convert(spec)
     if isinstance(spec, (bytes, bytearray, memoryview)):
         with Image.open(io.BytesIO(bytes(spec))) as raw:
+            validate_size(raw)
             raw.load()
-            return ImageOps.exif_transpose(raw).convert(mode)
+            return orient_and_convert(raw)
     if isinstance(spec, (str, os.PathLike)):
         with Image.open(spec) as raw:
+            validate_size(raw)
             raw.load()
-            return ImageOps.exif_transpose(raw).convert(mode)
+            return orient_and_convert(raw)
     if isinstance(spec, dict) and "bytes" in spec:
         with Image.open(io.BytesIO(bytes(spec["bytes"]))) as raw:
+            validate_size(raw)
             raw.load()
-            return ImageOps.exif_transpose(raw).convert(mode)
+            return orient_and_convert(raw)
     if isinstance(spec, dict) and "path" in spec:
         with Image.open(spec["path"]) as raw:
+            validate_size(raw)
             raw.load()
-            return ImageOps.exif_transpose(raw).convert(mode)
+            return orient_and_convert(raw)
     raise TypeError(
         f"unsupported image spec type {type(spec).__name__}; "
         "expected path / bytes / PIL.Image / dict with 'path' or 'bytes'."

@@ -3,21 +3,25 @@
 """Extract supervised target tokens from OCR align rows into packed text rows.
 
 Phase 2 (text pretraining) input builder: the align JSONL rows already carry
-byte-fallback-verified target token ids in their supervised tail
+strict-native target token ids in their supervised tail
 (``labels != IGNORE_INDEX``), so no tokenizer or decoding is needed here.
 Each output row is a packed ``[BOS] t1 [BOS] t2 ...`` sequence of exactly
 ``--seq-len`` tokens (the terminal EOS of each target is part of the target
-itself), with ``labels == input_ids`` and full attention.
+itself), with ``labels == input_ids``, full attention, and the exact
+id-derived ``word_pos``/``morph_depth`` representation used by the LM.
 
 Rows whose target contains any image/special-structure id are rejected loudly
 instead of silently skipped. Output shards are plain pretraining JSONL
-consumable by ``scripts.train_rdt --data``.
+consumable by ``scripts.train_rdt`` together with the emitted immutable
+pretraining receipt.  The source native OCR alignment receipt is mandatory;
+this command never retroactively signs unproven token-id shards.
 
 Usage:
 
     python -m scripts.build_text_rows_from_align \
         --align 'data_v1/align_*.jsonl' --output data_v1/text_pretrain \
-        --seq-len 1024 --shard-rows 200000
+        --align-receipt data_v1/ocr_data_contract.json \
+        --bundle data_v1/tokenizer --seq-len 1024 --shard-rows 200000
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,6 +43,24 @@ from Model.config import (
     PAD_ID,
     UNK_ID,
 )
+from Model.ocr.alignment_contract import (
+    load_and_validate_ocr_alignment_data_contract,
+)
+from Model.ocr.tokenization import (
+    native_tokenization_contract,
+    tokenizer_morphology_track_table,
+)
+from Tokenizer.pretraining.data_contract import (
+    PRETRAINING_PRODUCER_OCR_ALIGN_TEXT,
+    build_pretraining_data_contract,
+    write_pretraining_data_contract,
+)
+from Tokenizer.pretraining.morphology import derive_morph_info_from_track_ids
+from Tokenizer.unified import TokenizerBundle
+from Tokenizer.unified.contract import (
+    tokenizer_algorithm_contract,
+    tokenizer_bundle_contract,
+)
 
 FORBIDDEN_IDS = {IMAGE_PATCH_ID, IMAGE_START_ID, IMAGE_END_ID, PAD_ID, UNK_ID}
 
@@ -45,6 +68,11 @@ FORBIDDEN_IDS = {IMAGE_PATCH_ID, IMAGE_START_ID, IMAGE_END_ID, PAD_ID, UNK_ID}
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--align", required=True, help="glob of align JSONL shards")
+    p.add_argument(
+        "--align-receipt",
+        required=True,
+        help="native OCR alignment receipt for the exact --align shards",
+    )
     p.add_argument("--output", required=True, help="output directory")
     p.add_argument("--prefix", default="text", help="output shard name prefix")
     p.add_argument("--seq-len", type=int, default=1024)
@@ -57,9 +85,16 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--bundle",
+        required=True,
+        help="tokenizer bundle bound by --align-receipt and output receipt",
+    )
+    p.add_argument(
+        "--receipt",
         default="",
-        help="optional tokenizer bundle dir; when set, decode-verifies the "
-        "first packed row's first document against its source target text",
+        help=(
+            "output pretraining receipt; defaults to "
+            "<output>/pretraining_data_receipt.json"
+        ),
     )
     return p.parse_args(argv)
 
@@ -95,12 +130,13 @@ class ShardWriter:
         self.rows_in_shard = 0
         self.rows_total = 0
         self._fh = None
+        self.paths: list[Path] = []
 
     def _open_next(self):
-        if self._fh:
-            self._fh.close()
+        self.close()
         path = self.out_dir / f"{self.prefix}_{self.shard_idx:04d}.jsonl"
         self._fh = path.open("w", encoding="utf-8")
+        self.paths.append(path)
         self.shard_idx += 1
         self.rows_in_shard = 0
 
@@ -113,8 +149,19 @@ class ShardWriter:
 
     def close(self):
         if self._fh:
-            self._fh.close()
+            handle = self._fh
             self._fh = None
+            path = Path(handle.name)
+            try:
+                handle.flush()
+                os.fsync(handle.fileno())
+            finally:
+                handle.close()
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
 
 
 def main(argv=None) -> int:
@@ -123,12 +170,30 @@ def main(argv=None) -> int:
     if not shard_paths:
         print(f"no align shards match {args.align!r}", file=sys.stderr)
         return 2
+    bundle_identity = tokenizer_bundle_contract(args.bundle)
+    algorithm_identity = tokenizer_algorithm_contract()
+    bundle = TokenizerBundle.from_dir(args.bundle)
+    native_contract = native_tokenization_contract(
+        bundle.tokenizer,
+        args.bundle,
+    )
+    try:
+        source_lineage = load_and_validate_ocr_alignment_data_contract(
+            args.align_receipt,
+            args.align,
+            native_contract,
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        print(f"unsafe source alignment data: {exc}", file=sys.stderr)
+        return 2
+    track_table = tokenizer_morphology_track_table(bundle.tokenizer)
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     seq_len = args.seq_len
     writer = ShardWriter(out_dir, args.prefix, args.shard_rows)
     buf: list[int] = []
+    track_buf: list[int] = []
     n_src = 0
     n_tokens = 0
     target_len_sum = 0
@@ -136,15 +201,22 @@ def main(argv=None) -> int:
     first_src_target: list[int] | None = None
 
     def flush_full():
-        nonlocal buf
+        nonlocal buf, track_buf
         while len(buf) >= seq_len:
             chunk = buf[:seq_len]
             buf = buf[seq_len:]
+            track_chunk = track_buf[:seq_len]
+            track_buf = track_buf[seq_len:]
+            word_pos, morph_depth = derive_morph_info_from_track_ids(
+                track_chunk
+            )
             writer.write(
                 {
                     "input_ids": chunk,
                     "attention_mask": [1] * seq_len,
                     "labels": list(chunk),
+                    "word_pos": word_pos,
+                    "morph_depth": morph_depth,
                 }
             )
 
@@ -165,7 +237,22 @@ def main(argv=None) -> int:
                 if first_doc is None:
                     first_doc = [BOS_ID] + target
                     first_src_target = target
-                buf.extend([BOS_ID] + target)
+                document = [BOS_ID] + target
+                invalid_ids = [
+                    token_id
+                    for token_id in document
+                    if token_id < 0 or token_id >= len(track_table)
+                ]
+                if invalid_ids:
+                    raise SystemExit(
+                        f"{path}:{line_no}: token ids outside tokenizer "
+                        f"vocabulary: {sorted(set(invalid_ids))}"
+                    )
+                document_tracks = [
+                    track_table[token_id] for token_id in document
+                ]
+                buf.extend(document)
+                track_buf.extend(document_tracks)
                 n_src += 1
                 n_tokens += 1 + len(target)
                 target_len_sum += len(target)
@@ -176,6 +263,8 @@ def main(argv=None) -> int:
     # Drop the tail remainder (< seq_len tokens) rather than padding: at this
     # corpus size the loss is negligible and keeps every row full-length.
     dropped_tail = len(buf)
+    if len(track_buf) != dropped_tail:
+        raise RuntimeError("packed token and morphology-track buffers diverged")
     writer.close()
 
     print(
@@ -194,6 +283,8 @@ def main(argv=None) -> int:
     ids0 = row0["input_ids"]
     assert len(ids0) == seq_len, f"index0 len {len(ids0)} != seq_len {seq_len}"
     assert row0["labels"] == ids0, "index0 labels != input_ids"
+    assert len(row0["word_pos"]) == seq_len, "index0 word_pos length mismatch"
+    assert len(row0["morph_depth"]) == seq_len, "index0 morph_depth length mismatch"
     assert ids0[0] == BOS_ID, f"index0 does not start with BOS ({ids0[0]})"
     assert first_doc is not None
     head = first_doc[: min(len(first_doc), seq_len)]
@@ -202,14 +293,28 @@ def main(argv=None) -> int:
     assert not forbidden_hits, f"index0 contains forbidden ids {forbidden_hits}"
     print(f"[qa] index0 OK: starts with BOS + first target ({len(head)} ids checked)")
 
-    if args.bundle:
-        from Tokenizer.unified import TokenizerBundle
+    assert first_src_target is not None
+    body = [t for t in first_src_target if t != EOS_ID]
+    text = bundle.tokenizer.decode(body)
+    print(f"[qa] index0 first-doc decode ({len(body)} ids): {text[:80]!r}")
 
-        bundle = TokenizerBundle.from_dir(args.bundle)
-        assert first_src_target is not None
-        body = [t for t in first_src_target if t != EOS_ID]
-        text = bundle.tokenizer.decode(body)
-        print(f"[qa] index0 first-doc decode ({len(body)} ids): {text[:80]!r}")
+    receipt_path = (
+        Path(args.receipt)
+        if args.receipt
+        else out_dir / "pretraining_data_receipt.json"
+    )
+    output_receipt = build_pretraining_data_contract(
+        writer.paths,
+        producer_kind=PRETRAINING_PRODUCER_OCR_ALIGN_TEXT,
+        tokenizer_bundle=bundle_identity,
+        tokenizer_algorithm=algorithm_identity,
+    )
+    write_pretraining_data_contract(receipt_path, output_receipt)
+    print(
+        f"[receipt] {receipt_path} data_sha256="
+        f"{output_receipt['data_sha256']} source_alignment_sha256="
+        f"{source_lineage['contract_canonical_sha256']}"
+    )
     return 0
 
 

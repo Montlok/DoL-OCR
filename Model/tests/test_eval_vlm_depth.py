@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from Model.config import OMVTConfig
+from Model.ocr.position_contract import BOUNDARY_V1, LEGACY_SEQUENTIAL_V0
 from Model.training import save_checkpoint
 from scripts.eval_vlm_ocr import (
     _decode_batches,
@@ -27,9 +28,11 @@ class _RecordingGenerator:
     def __init__(self, trained_depth: int) -> None:
         self.cfg = SimpleNamespace(recurrent_steps=trained_depth)
         self.seen_depths: list[int | None] = []
+        self.seen_position_contracts: list[str | None] = []
 
     def generate(self, ids: torch.Tensor, **kwargs) -> torch.Tensor:
         self.seen_depths.append(kwargs.get("recurrent_steps"))
+        self.seen_position_contracts.append(kwargs.get("position_contract"))
         continuation = torch.full(
             (ids.shape[0], 1), 300, dtype=ids.dtype, device=ids.device
         )
@@ -57,6 +60,7 @@ class EvalVlmDepthContractTest(unittest.TestCase):
             contextlib.nullcontext,
         )
         self.assertEqual(model.seen_depths, [4])
+        self.assertEqual(model.seen_position_contracts, [BOUNDARY_V1])
         self.assertEqual(preds, [[300], [300]])
 
     def test_explicit_depth_override_wins(self) -> None:
@@ -70,6 +74,22 @@ class EvalVlmDepthContractTest(unittest.TestCase):
             contextlib.nullcontext,
         )
         self.assertEqual(model.seen_depths, [8])
+
+    def test_explicit_position_contract_is_forwarded(self) -> None:
+        model = _RecordingGenerator(trained_depth=4)
+        args = self._args()
+        args.ocr_position_contract = LEGACY_SEQUENTIAL_V0
+        _decode_batches(
+            model,
+            [[1, 9, 2]],
+            lambda _start, _end: {},
+            args,
+            torch.device("cpu"),
+            contextlib.nullcontext,
+        )
+        self.assertEqual(
+            model.seen_position_contracts, [LEGACY_SEQUENTIAL_V0]
+        )
 
     def test_checkpoint_geometry_is_applied_before_deployment_preprocessing(self) -> None:
         omvt_cfg = OMVTConfig(
