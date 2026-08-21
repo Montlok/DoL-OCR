@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "kind": "reviewed_streaming_v2_ocr_release",
+  "source": {
+    "repository_id": "Montlok/DoL-1.2-OCR",
+    "revision": "bee908ab2a9376f6224dff514564ebb0ae99a643"
+  },
+  "release": {
+    "name": "DoL-1.2-OCR",
+    "parameter_count": 1000824955,
+    "backup_manifest_path": "BACKUP_MANIFEST.json",
+    "backup_manifest_raw_sha256": "c4702319fc07afe7970e50dd037de470014e2c907a15501ad070250f328d4184",
+    "sha256sums_path": "SHA256SUMS",
+    "sha256sums_raw_sha256": "1cb25c8c9906cb2af7ac387095387021244098ea7dc4e707b6e3864af3715619",
+    "model_path": "model.pt",
+    "model_raw_sha256": "8eeaf6f52ebcbaed20a000c911d625925eb6a8b8c2b945feea49661484b75495",
+    "metadata_path": "meta.pt",
+    "metadata_raw_sha256": "5a1416e46286342fb9b7f649e6b15637096a003770cd25a08582e92b603e1dfa"
+  },
+  "tokenizer": {
+    "root": "tokenizer",
+    "manifest_path": "tokenizer/manifest.json",
+    "manifest_raw_sha256": "dbee445fc5573b70306ff84cdec182b798111384c9c2a463abe14574cebac737",
+    "manifest_canonical_sha256": "8fa21f2cac49dc6595f3b746460b36b79db77c5602fd67788ba57d52c52c5f6f",
+    "bundle_files_canonical_sha256": "c6d2c3ba18f5e358deaf2c0d9b7ef503efa61dad270d669bbc2ee622a48a4361",
+    "vocab_path": "tokenizer/vocab.json",
+    "vocab_file_raw_sha256": "dcbe4c518011b858ea6912f8a4a2ea2b01efd60c164ff32a200254dfd9ac9c85",
+    "token_id_map_sha256": "e0338bb7b9c09cd9c74a2434dd8f37a3943c1f124228ebb44d6fc881bd047053"
+  },
+  "contracts": {
+    "phase": "vlm_align",
+    "freeze_rdt": true,
+    "frozen_vision": false,
+    "final": true,
+    "stop_reason": "loss_plateau",
+    "ocr_position_contract": "boundary_v1",
+    "ocr_position_contract_version": 1,
+    "ocr_target_encoding": "native",
+    "ocr_tokenization_contract_version": 2,
+    "checkpoint_step": 292988,
+    "tokenizer_id_extent": 64314,
+    "model_vocab_capacity": 65536
+  },
+  "streaming": {
+    "corpus_manifest_canonical_sha256": "6971db51f4c42908465155042461ad1feede95e441618b3ce5d181b672056c04",
+    "tokenizer_manifest_canonical_sha256": "8fa21f2cac49dc6595f3b746460b36b79db77c5602fd67788ba57d52c52c5f6f",
+    "cursor_canonical_sha256": "1c6e61b3699c3b67d4a7dd97e92ba185cc7fddd433fb8c1573d8cc2d4773e1b1",
+    "samples_exposed": 9375616,
+    "corpus_complete": false
+  }
+}

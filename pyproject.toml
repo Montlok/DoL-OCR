@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dol-ocr"
+version = "0.8.0"
+description = "Training and evaluation stack for traditional-Mongolian DoL-OCR"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "KeikaJames" }]
+keywords = ["ocr", "traditional-mongolian", "multimodal", "rdt"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+# `tokenizers` is required to load/encode any tokenizer bundle
+# (GeneralBPEModel.load()/.minimal() and TokenizerBundle.from_dir()), so it is
+# a base runtime dependency, not optional.
+dependencies = ["tokenizers>=0.19"]
+
+[project.optional-dependencies]
+tokenizer-build = ["tokenizers>=0.19", "datasets>=2.0", "pyarrow>=12"]
+eval = ["sentencepiece>=0.2"]
+model = ["torch>=2.1"]
+train = ["torch>=2.1", "mamba-ssm>=2.2"]
+dist = ["torch>=2.1"]
+vis = ["timm>=1.0"]
+image = ["Pillow>=9", "numpy>=1.24", "scipy>=1.10"]
+log = ["tensorboard>=2.14"]
+cli = ["rich>=13"]
+dev = ["build>=1.2", "numpy>=1.24", "pytest>=8.0", "ruff==0.14.14"]
+
+[project.urls]
+Repository = "https://github.com/Montlok/DoL-OCR"
+Issues = "https://github.com/Montlok/DoL-OCR/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["Tokenizer*", "Model*"]
+
+[tool.ruff]
+target-version = "py310"
+extend-exclude = ["build", "dist"]
