@@ -10,6 +10,30 @@ import torch.nn.functional as F
 
 from Model.layers.rope import MorphologicalRoPE, apply_rope
 
+try:
+    from torch.nn.attention.bias import causal_lower_right
+except ImportError:  # PyTorch versions before the structured attention-bias API.
+    causal_lower_right = None
+
+
+_MAX_CACHED_MASK_ELEMENTS = 8 * 1024 * 1024
+
+
+def _supports_fused_lower_right(q, k, v, dropout_p: float) -> bool:
+    if causal_lower_right is None or not q.is_cuda:
+        return False
+    args = [q, k, v, None, dropout_p, False]
+    if hasattr(torch.backends.cuda.SDPAParams, "enable_gqa"):
+        args.append(False)
+    params = torch.backends.cuda.SDPAParams(*args)
+    return (
+        torch.backends.cuda.flash_sdp_enabled()
+        and torch.backends.cuda.can_use_flash_attention(params)
+    ) or (
+        torch.backends.cuda.mem_efficient_sdp_enabled()
+        and torch.backends.cuda.can_use_efficient_attention(params)
+    )
+
 
 class MLA(nn.Module):
     def __init__(self, cfg):
@@ -158,24 +182,39 @@ class MLA(nn.Module):
 
         q_len = q.shape[-2]
         k_len = k.shape[-2]
-        device = q.device
-
-        rows = torch.arange(q_len, device=device).unsqueeze(-1) + past_len
-        cols = torch.arange(k_len, device=device).unsqueeze(0)
-        allow = (cols <= rows).view(1, 1, q_len, k_len)
 
         if self.use_sdpa:
             dropout_p = self.dropout if self.training and self.dropout > 0 else 0.0
-            return F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=allow,
-                dropout_p=dropout_p,
-                is_causal=False,
-                scale=self.scale,
-            )
+            if past_len == 0 or q_len == 1:
+                return F.scaled_dot_product_attention(
+                    q, k, v, dropout_p=dropout_p,
+                    is_causal=past_len == 0, scale=self.scale,
+                )
+            if _supports_fused_lower_right(q, k, v, dropout_p):
+                return F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=causal_lower_right(q_len, k_len),
+                    dropout_p=dropout_p, scale=self.scale,
+                )
+            # Keep the non-fused/older-PyTorch path batched while bounding
+            # each mask allocation. A non-square is_causal mask would align
+            # upper-left, not at the end of the existing KV prefix.
+            tile_rows = max(1, _MAX_CACHED_MASK_ELEMENTS // k_len)
+            pieces = []
+            for start in range(0, q_len, tile_rows):
+                end = min(start + tile_rows, q_len)
+                key_end = past_len + end
+                rows = torch.arange(start, end, device=q.device)[:, None] + past_len
+                cols = torch.arange(key_end, device=q.device)[None, :]
+                pieces.append(F.scaled_dot_product_attention(
+                    q[:, :, start:end], k[:, :, :key_end], v[:, :, :key_end],
+                    attn_mask=cols <= rows, dropout_p=dropout_p,
+                    is_causal=False, scale=self.scale,
+                ))
+            return torch.cat(pieces, dim=-2)
 
+        rows = torch.arange(q_len, device=q.device).unsqueeze(-1) + past_len
+        cols = torch.arange(k_len, device=q.device).unsqueeze(0)
+        allow = (cols <= rows).view(1, 1, q_len, k_len)
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         scores = scores.masked_fill(~allow, torch.finfo(scores.dtype).min)
         attn = F.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
@@ -251,28 +290,33 @@ class MLA(nn.Module):
                 scale=self.scale,
             )
 
-        key_mask = attn_mask.to(device=q.device, dtype=torch.bool).view(
-            bsz,
-            1,
-            1,
-            k_len,
-        )
+        active = attn_mask.to(device=q.device, dtype=torch.bool)
         if causal:
-            causal_mask = torch.ones(
-                q_len,
-                k_len,
-                dtype=torch.bool,
-                device=q.device,
-            ).tril()
-            sdpa_mask = key_mask & causal_mask.view(1, 1, q_len, k_len)
-        else:
-            sdpa_mask = key_mask
+            # Stable-partition valid tokens ahead of padding. Causal SDPA
+            # then masks all padded keys for valid queries without an LxL
+            # tensor, even for left padding or holes. All indices stay on
+            # device; no per-layer .item()/nonzero() synchronization.
+            ranks = active.long().cumsum(-1)
+            positions = torch.arange(q_len, device=q.device).expand(bsz, -1)
+            destination = torch.where(
+                active, ranks - 1, ranks[:, -1:] + positions - ranks,
+            )
+            permutation = torch.empty_like(destination).scatter(
+                1, destination, positions,
+            )
+            gather = permutation[:, None, :, None].expand_as(q)
+            packed = F.scaled_dot_product_attention(
+                q.gather(2, gather), k.gather(2, gather), v.gather(2, gather),
+                dropout_p=dropout_p, is_causal=True, scale=self.scale,
+            )
+            restore = destination[:, None, :, None].expand_as(q)
+            return packed.gather(2, restore)
 
         return F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=sdpa_mask,
+            attn_mask=active.view(bsz, 1, 1, k_len),
             dropout_p=dropout_p,
             is_causal=False,
             scale=self.scale,

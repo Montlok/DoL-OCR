@@ -30,7 +30,7 @@ PRETRAINING_PRODUCER_ALGORITHM_VERSION = 1
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PRODUCER_SOURCE_FILES = {
     PRETRAINING_PRODUCER_GENERIC_BUILDER: (
-        "Tokenizer/tools/build_pretraining_data.py"
+        "Tokenizer/pretraining/producer.py"
     ),
     PRETRAINING_PRODUCER_OCR_ALIGN_TEXT: (
         "scripts/build_text_rows_from_align.py"

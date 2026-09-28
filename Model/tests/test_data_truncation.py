@@ -21,6 +21,16 @@ def _row(n: int, *, images: list | None = None) -> dict:
 
 
 class NormalizeRowTruncationTest(unittest.TestCase):
+    def test_receipt_backed_text_refuses_target_loss(self) -> None:
+        row = {**_row(10), "word_pos": list(range(10)), "morph_depth": [0] * 10}
+        with self.assertRaisesRegex(ValueError, "rebuild text windows"):
+            _normalize_row(row, max_seq_len=4, require_precomputed_morphology=True)
+
+    def test_windowed_text_refuses_second_truncation(self) -> None:
+        row = {**_row(10), "metadata": {"text_window": {"token_start": 0}}}
+        with self.assertRaisesRegex(ValueError, "rebuild text windows"):
+            _normalize_row(row, max_seq_len=4)
+
     def test_text_row_truncates(self) -> None:
         out = _normalize_row(_row(10), max_seq_len=4)
         self.assertEqual(len(out["input_ids"]), 4)

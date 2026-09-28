@@ -119,8 +119,10 @@ def wrap_fsdp(
     mp_dtype = dtype_map.get(cfg.fsdp_mixed_precision, torch.bfloat16)
     mp_policy = MixedPrecision(
         param_dtype=mp_dtype,
-        reduce_dtype=mp_dtype,
-        buffer_dtype=mp_dtype,
+        reduce_dtype=torch.float32,
+        # RoPE frequencies are non-persistent buffers. Rounding them here
+        # cannot be undone by converting the angles back to FP32 later.
+        buffer_dtype=torch.float32,
     )
 
     wrap_policy = functools.partial(
