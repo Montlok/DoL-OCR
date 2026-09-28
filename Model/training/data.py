@@ -389,6 +389,12 @@ def _normalize_row(
                 "image payload. Set TrainingConfig.seq_len >= the builder's "
                 "max_length so multimodal rows are not truncated."
             )
+        if require_precomputed_morphology or "text_window" in (row.get("metadata") or {}):
+            raise ValueError(
+                f"pretokenized text row length ({n}) exceeds seq_len ({max_seq_len}); "
+                "rebuild text windows at the training sequence length instead of "
+                "discarding next-token targets"
+            )
         truncation_keys = ["input_ids", "attention_mask", "labels"]
         if position_contract != BOUNDARY_V1:
             truncation_keys.extend(("word_pos", "morph_depth"))

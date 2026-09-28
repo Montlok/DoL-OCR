@@ -79,8 +79,14 @@
   （`<pad> <unk> <bos> <img> <image> <image_start> <image_patch> <image_end>
   <video*> <audio*>` 等，见 `DEFAULT_LABEL_IGNORE_TOKENS`），这些位置不计入
   语言建模 loss。
-- 超过 `max_length` 时截断（多模态会同时裁剪对应 `<image_patch>` 跨度）。
-- `--pack` 可把多条纯文本样本打包到一条（仅纯文本；以 `<eos>` 分隔）。
+- CLI 对超长纯文本保留全部窗口，窗口之间重叠一个上下文 token，使每个
+  next-token 目标恰好参与一次监督；不在窗口边界添加虚假的文档结束标记。
+  `metadata.text_window` 保存原始 token 起止位置和总长度，字符偏移仍指向原文。
+- 单样本 `encode_text` / `encode_json_obj` 对超长纯文本报错；调用
+  `iter_encode_text` / `iter_encode_json_obj` 获取完整窗口。多模态单样本路径
+  保留原有跨度裁剪行为，不将媒体负载拆到独立文本窗口。
+- `--pack` 可把多条短纯文本打包到一条（以 `<eos>` 分隔）；长文窗口独立输出，
+  防止重叠的上下文 token 在不同文档拼接处被重复监督。
 
 ---
 
@@ -110,7 +116,8 @@
 - 仅 legacy/smoke 行允许缺失这两个字段：优先用 `token_offsets` 推导；仍
   缺失则填 `range(n)` 与全 `0`。该 model-side fallback 不得用于正式训练。
 - 行长 > `--seq-len` 时：
-  - 纯文本行 → 截断；
+  - 正式 receipt-backed 纯文本行、带 `text_window` 元数据的行 → 报错，
+    应按训练长度重新生成窗口，不能再次丢弃后半段；legacy/smoke 原有截断行为不变；
   - **多模态行（含 `images` 或 `videos`）→ 直接报错**（截断会让
     `<image_patch>` 与图像负载错位）。因此务必让
     `TrainingConfig.seq_len ≥ builder 的 max_length`。

@@ -38,29 +38,27 @@ def run_gate(
     max_len_seen = 0
     max_morph_depth = 0
     for idx, obj in enumerate(_iter_input(input_path)):
-        if _is_encoded_row(obj):
-            try:
-                sample = _sample_from_encoded_row(obj)
+        encoded = _is_encoded_row(obj)
+        try:
+            if encoded:
+                samples = (_sample_from_encoded_row(obj),)
                 text = _source_text_from_encoded_row(obj)
-            except Exception as exc:
-                failures.append(
-                    {"sample": idx, "message": f"encoded row parse failed: {exc}"}
+            else:
+                text = str(obj.get("text", ""))
+                samples = builder.iter_encode_json_obj(obj)
+            for sample in samples:
+                num_samples += 1
+                max_len_seen = max(max_len_seen, len(sample.input_ids))
+                total_tokens += len(sample.input_ids)
+                unk_count += sample.input_ids.count(bundle.tokenizer.unk_id)
+                supervised_tokens += sum(
+                    1 for label in sample.labels if label != IGNORE_INDEX
                 )
-                continue
-        else:
-            text = str(obj.get("text", ""))
-            try:
-                sample = builder.encode_json_obj(obj)
-            except Exception as exc:
-                failures.append({"sample": idx, "message": f"encode failed: {exc}"})
-                continue
-        num_samples += 1
-        max_len_seen = max(max_len_seen, len(sample.input_ids))
-        total_tokens += len(sample.input_ids)
-        unk_count += sample.input_ids.count(bundle.tokenizer.unk_id)
-        supervised_tokens += sum(1 for label in sample.labels if label != IGNORE_INDEX)
-        max_morph_depth = max(max_morph_depth, max(sample.morph_depth, default=0))
-        failures.extend(_validate_sample(bundle, sample, text, idx))
+                max_morph_depth = max(max_morph_depth, max(sample.morph_depth, default=0))
+                failures.extend(_validate_sample(bundle, sample, text, idx))
+        except Exception as exc:
+            detail = "encoded row parse failed" if encoded else "encode failed"
+            failures.append({"sample": idx, "message": f"{detail}: {exc}"})
 
     metrics = {
         "total_tokens": total_tokens,

@@ -39,9 +39,9 @@ def _iter_samples(
             if not line:
                 continue
             if path.endswith(".jsonl"):
-                yield builder.encode_jsonl_line(line)
+                yield from builder.iter_encode_json_obj(json.loads(line))
             else:
-                yield builder.encode_text(line, metadata={"type": "text"})
+                yield from builder.iter_encode_text(line, metadata={"type": "text"})
 
 
 @dataclass
@@ -244,8 +244,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.max_length < 2 or (
+        args.pack_max_length is not None and args.pack_max_length < 2
+    ):
+        parser.error("sequence lengths must be >= 2 for next-token supervision")
     bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
-    builder = PretrainingDataBuilder(bundle, max_length=args.max_length)
+    window_length = min(args.max_length, args.pack_max_length) if (
+        args.pack and args.pack_max_length is not None
+    ) else args.max_length
+    builder = PretrainingDataBuilder(bundle, max_length=window_length)
     if args.shard_token_budget < 0 or args.shard_sample_budget < 0:
         parser.error("shard budgets must be non-negative")
 

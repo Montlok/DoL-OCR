@@ -43,6 +43,107 @@ def build_smoke_bundle(tmp: str) -> TokenizerBundle:
 
 
 class PretrainingBuilderTest(unittest.TestCase):
+    def test_long_text_windows_preserve_every_next_token_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = build_smoke_bundle(tmp)
+            text = ("ᠮᠣᠩᠭᠣᠯ 中文 scientific text 😀 " * 9) + "FINAL-TAIL"
+            full = PretrainingDataBuilder(bundle, max_length=10000).encode_text(text)
+            for length in (2, 7, 31):
+                with self.subTest(length=length):
+                    builder = PretrainingDataBuilder(bundle, max_length=length)
+                    windows = list(builder.iter_encode_json_obj({
+                        "text": text, "source": "book", "id": "chapter-1",
+                    }))
+                    self.assertGreater(len(windows), 1)
+                    rebuilt = windows[0].input_ids + [
+                        token for window in windows[1:] for token in window.input_ids[1:]
+                    ]
+                    self.assertEqual(rebuilt, full.input_ids)
+                    self.assertEqual(
+                        [label for window in windows for label in window.labels[1:]],
+                        full.labels[1:],
+                    )
+                    self.assertEqual(sum(w.input_ids.count(3) for w in windows), 1)
+                    for index, window in enumerate(windows):
+                        self.assertLessEqual(len(window.input_ids), length)
+                        span = window.metadata["text_window"]
+                        start, end = span["token_start"], span["token_end"]
+                        self.assertEqual(span["total_tokens"], len(full.input_ids))
+                        self.assertEqual(window.token_offsets, full.token_offsets[start:end])
+                        self.assertEqual(window.morph_depth, full.morph_depth[start:end])
+                        self.assertEqual(window.word_pos[0], 0)
+                        self.assertEqual(window.metadata["source"], "book")
+                        self.assertEqual(window.metadata["id"], "chapter-1")
+                        if index:
+                            self.assertEqual(window.labels[0], IGNORE_INDEX)
+                            self.assertEqual(window.input_ids[0], windows[index - 1].input_ids[-1])
+
+    def test_single_sample_api_refuses_to_discard_long_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            builder = PretrainingDataBuilder(build_smoke_bundle(tmp), max_length=4)
+            with self.assertRaisesRegex(ValueError, "iter_encode_text"):
+                builder.encode_text("long document with a meaningful tail")
+            with self.assertRaisesRegex(ValueError, "iter_encode_text"):
+                builder.encode_jsonl_line('{"text": "a much longer document"}')
+
+    def test_pack_smaller_windows_preserves_targets_and_source_spans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = build_smoke_bundle(tmp)
+            text = "中文 chapter one two three " * 8
+            full = PretrainingDataBuilder(bundle, max_length=10000).encode_text(text)
+            parent_windows = list(PretrainingDataBuilder(bundle, max_length=31).iter_encode_text(text))
+            for samples in ([full], parent_windows):
+                windows = pack_samples(samples, max_length=7, pad_id=0, eos_id=3)
+                self.assertEqual(
+                    [label for window in windows for label in window.labels[1:]],
+                    full.labels[1:],
+                )
+                for window in windows:
+                    span = window.metadata["text_window"]
+                    self.assertEqual(
+                        window.input_ids,
+                        full.input_ids[span["token_start"]:span["token_end"]],
+                    )
+                    self.assertEqual(span["total_tokens"], len(full.input_ids))
+
+    def test_one_token_windows_cannot_preserve_causal_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            builder = PretrainingDataBuilder(build_smoke_bundle(tmp), max_length=1)
+            with self.assertRaisesRegex(ValueError, "max_length >= 2"):
+                list(builder.iter_encode_text("abc"))
+
+    def test_long_text_cli_preserves_tail_with_and_without_packing(self):
+        from Tokenizer.evals.pretraining_gate import run_gate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = build_smoke_bundle(tmp)
+            text = ("中文 text paragraph " * 20) + "UNIQUE-END"
+            full = PretrainingDataBuilder(bundle, max_length=10000).encode_text(text)
+            for extension, extra in (("txt", []), ("jsonl", ["--pack", "--pack-max-length", "17"])):
+                inp, out = root / f"input.{extension}", root / f"{extension}.jsonl"
+                inp.write_text(
+                    (json.dumps({"text": text}) if extension == "jsonl" else text) + "\n",
+                    encoding="utf-8",
+                )
+                proc = subprocess.run([
+                    sys.executable, "-m", "Tokenizer.tools.build_pretraining_data",
+                    "--tokenizer-bundle", str(root / "bundle"),
+                    "--input", str(inp), "--output", str(out),
+                    "--max-length", "29", *extra,
+                ], check=True, capture_output=True, text=True)
+                rows = [json.loads(line) for line in out.read_text().splitlines()]
+                self.assertEqual(
+                    [label for row in rows for label in row["labels"][1:]],
+                    full.labels[1:],
+                )
+                self.assertEqual(json.loads(proc.stdout)["num_samples"], len(rows))
+                self.assertTrue(Path(json.loads(proc.stdout)["receipt"]).is_file())
+                self.assertTrue(all(len(row["input_ids"]) <= (17 if extra else 29) for row in rows))
+                for path in (inp, out):
+                    report = run_gate(str(root / "bundle"), str(path), max_length=29)
+                    self.assertTrue(report["passed"], report["failures"])
+
     def test_encode_pure_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             builder = PretrainingDataBuilder(build_smoke_bundle(tmp), max_length=128)

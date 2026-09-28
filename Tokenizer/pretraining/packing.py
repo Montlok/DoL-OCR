@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 
-from .builder import IGNORE_INDEX, EncodedSample
+from .builder import IGNORE_INDEX, EncodedSample, iter_text_windows
 
 
 def pack_samples(
@@ -52,6 +52,15 @@ def iter_pack_samples(
 
     for sample in samples:
         is_multimodal = _has_modality(sample)
+        if not is_multimodal and (
+            len(sample.input_ids) > max_length or "text_window" in sample.metadata
+        ):
+            flushed = flush()
+            if flushed is not None:
+                yield flushed
+            for window in iter_text_windows(sample, max_length):
+                yield _pad(window, max_length, pad_id) if pad_to_max_length else window
+            continue
         sample = _trim(sample, max_length)
         if not sample.input_ids:
             continue
