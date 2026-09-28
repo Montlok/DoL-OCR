@@ -71,7 +71,9 @@
 
 ### 1.3 builder 的编码行为（你不需要手填 `input_ids`）
 
-`PretrainingDataBuilder`（`Tokenizer/pretraining/builder.py`）：
+CLI 使用 `WindowedPretrainingDataBuilder`（`Tokenizer/pretraining/producer.py`）。
+旧 `PretrainingDataBuilder` 的源码与单样本行为保持不变，避免无关的 OCR
+数据及 checkpoint 的共享 tokenizer 指纹失效。新语料应使用 CLI 或新类：
 
 - 默认 `add_bos=True, add_eos=True`，`max_length=4096`（CLI `--max-length` 覆盖，
   默认 2048）。
@@ -82,11 +84,17 @@
 - CLI 对超长纯文本保留全部窗口，窗口之间重叠一个上下文 token，使每个
   next-token 目标恰好参与一次监督；不在窗口边界添加虚假的文档结束标记。
   `metadata.text_window` 保存原始 token 起止位置和总长度，字符偏移仍指向原文。
-- 单样本 `encode_text` / `encode_json_obj` 对超长纯文本报错；调用
+- 新类的单样本 `encode_text` / `encode_json_obj` 对超长纯文本报错；调用
   `iter_encode_text` / `iter_encode_json_obj` 获取完整窗口。多模态单样本路径
   保留原有跨度裁剪行为，不将媒体负载拆到独立文本窗口。
 - `--pack` 可把多条短纯文本打包到一条（以 `<eos>` 分隔）；长文窗口独立输出，
   防止重叠的上下文 token 在不同文档拼接处被重复监督。
+- 重叠位置保留原标签：causal loss 自身跳过窗口首标签，reverse loss 跳过
+  窗口末标签，两种方向的相邻 token 监督都不丢失。监督统计按 causal targets
+  （`labels[1:]`）计数。已有右 padding 再分窗时先移除尾部 padding。
+- generic receipt 的 producer 源文件现为 `Tokenizer/pretraining/producer.py`，
+  绑定窗口、packing、CLI 参数与分片产出的完整实现。旧 generic receipt 需重新
+  构建，不能冒充新 producer；未改动的 OCR converter 身份与 receipt 校验保持不变。
 
 ---
 

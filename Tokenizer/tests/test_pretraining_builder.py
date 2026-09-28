@@ -7,9 +7,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from Tokenizer.morphbpe import MorphBPETrainer
+from Tokenizer.pretraining.producer import WindowedPretrainingDataBuilder
 from Tokenizer.pretraining import (
     IGNORE_INDEX,
     PretrainingDataBuilder,
@@ -47,10 +49,10 @@ class PretrainingBuilderTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bundle = build_smoke_bundle(tmp)
             text = ("ᠮᠣᠩᠭᠣᠯ 中文 scientific text 😀 " * 9) + "FINAL-TAIL"
-            full = PretrainingDataBuilder(bundle, max_length=10000).encode_text(text)
+            full = WindowedPretrainingDataBuilder(bundle, max_length=10000).encode_text(text)
             for length in (2, 7, 31):
                 with self.subTest(length=length):
-                    builder = PretrainingDataBuilder(bundle, max_length=length)
+                    builder = WindowedPretrainingDataBuilder(bundle, max_length=length)
                     windows = list(builder.iter_encode_json_obj({
                         "text": text, "source": "book", "id": "chapter-1",
                     }))
@@ -62,6 +64,10 @@ class PretrainingBuilderTest(unittest.TestCase):
                     self.assertEqual(
                         [label for window in windows for label in window.labels[1:]],
                         full.labels[1:],
+                    )
+                    self.assertEqual(
+                        [label for window in windows for label in window.labels[:-1]],
+                        full.labels[:-1],
                     )
                     self.assertEqual(sum(w.input_ids.count(3) for w in windows), 1)
                     for index, window in enumerate(windows):
@@ -75,23 +81,41 @@ class PretrainingBuilderTest(unittest.TestCase):
                         self.assertEqual(window.metadata["source"], "book")
                         self.assertEqual(window.metadata["id"], "chapter-1")
                         if index:
-                            self.assertEqual(window.labels[0], IGNORE_INDEX)
+                            self.assertEqual(window.labels[0], full.labels[start])
                             self.assertEqual(window.input_ids[0], windows[index - 1].input_ids[-1])
 
     def test_single_sample_api_refuses_to_discard_long_text(self):
         with tempfile.TemporaryDirectory() as tmp:
-            builder = PretrainingDataBuilder(build_smoke_bundle(tmp), max_length=4)
+            bundle = build_smoke_bundle(tmp)
+            builder = WindowedPretrainingDataBuilder(bundle, max_length=4)
             with self.assertRaisesRegex(ValueError, "iter_encode_text"):
                 builder.encode_text("long document with a meaningful tail")
             with self.assertRaisesRegex(ValueError, "iter_encode_text"):
                 builder.encode_jsonl_line('{"text": "a much longer document"}')
+            legacy = PretrainingDataBuilder(bundle, max_length=4).encode_text("legacy text")
+            self.assertEqual(len(legacy.input_ids), 4)
+            self.assertTrue(legacy.metadata["truncated"])
+
+    def test_rewindowing_right_padded_text_emits_no_padding_only_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = PretrainingDataBuilder(build_smoke_bundle(tmp), max_length=8).encode_text("a")
+            padded = pack_samples([sample], 16, 0, 3, pad_to_max_length=True)[0]
+            windows = pack_samples([padded], 4, 0, 3)
+            self.assertEqual(len(windows), 1)
+            self.assertEqual(windows[0].input_ids, sample.input_ids)
+            self.assertTrue(all(windows[0].attention_mask))
+            blank = replace(padded, attention_mask=[0] * 16, labels=[IGNORE_INDEX] * 16)
+            self.assertEqual(pack_samples([blank], 4, 0, 3), [])
+            hole = replace(padded, attention_mask=[1, 0, 1] + [0] * 13)
+            with self.assertRaisesRegex(ValueError, "right padding only"):
+                pack_samples([hole], 4, 0, 3)
 
     def test_pack_smaller_windows_preserves_targets_and_source_spans(self):
         with tempfile.TemporaryDirectory() as tmp:
             bundle = build_smoke_bundle(tmp)
             text = "中文 chapter one two three " * 8
-            full = PretrainingDataBuilder(bundle, max_length=10000).encode_text(text)
-            parent_windows = list(PretrainingDataBuilder(bundle, max_length=31).iter_encode_text(text))
+            full = WindowedPretrainingDataBuilder(bundle, max_length=10000).encode_text(text)
+            parent_windows = list(WindowedPretrainingDataBuilder(bundle, max_length=31).iter_encode_text(text))
             for samples in ([full], parent_windows):
                 windows = pack_samples(samples, max_length=7, pad_id=0, eos_id=3)
                 self.assertEqual(
@@ -108,7 +132,7 @@ class PretrainingBuilderTest(unittest.TestCase):
 
     def test_one_token_windows_cannot_preserve_causal_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
-            builder = PretrainingDataBuilder(build_smoke_bundle(tmp), max_length=1)
+            builder = WindowedPretrainingDataBuilder(build_smoke_bundle(tmp), max_length=1)
             with self.assertRaisesRegex(ValueError, "max_length >= 2"):
                 list(builder.iter_encode_text("abc"))
 
@@ -119,7 +143,7 @@ class PretrainingBuilderTest(unittest.TestCase):
             root = Path(tmp)
             bundle = build_smoke_bundle(tmp)
             text = ("中文 text paragraph " * 20) + "UNIQUE-END"
-            full = PretrainingDataBuilder(bundle, max_length=10000).encode_text(text)
+            full = WindowedPretrainingDataBuilder(bundle, max_length=10000).encode_text(text)
             for extension, extra in (("txt", []), ("jsonl", ["--pack", "--pack-max-length", "17"])):
                 inp, out = root / f"input.{extension}", root / f"{extension}.jsonl"
                 inp.write_text(
@@ -138,11 +162,14 @@ class PretrainingBuilderTest(unittest.TestCase):
                     full.labels[1:],
                 )
                 self.assertEqual(json.loads(proc.stdout)["num_samples"], len(rows))
+                expected_targets = sum(label != IGNORE_INDEX for label in full.labels[1:])
+                self.assertEqual(json.loads(proc.stdout)["supervised_tokens"], expected_targets)
                 self.assertTrue(Path(json.loads(proc.stdout)["receipt"]).is_file())
                 self.assertTrue(all(len(row["input_ids"]) <= (17 if extra else 29) for row in rows))
                 for path in (inp, out):
                     report = run_gate(str(root / "bundle"), str(path), max_length=29)
                     self.assertTrue(report["passed"], report["failures"])
+                    self.assertEqual(report["metrics"]["supervised_tokens"], expected_targets)
 
     def test_encode_pure_text(self):
         with tempfile.TemporaryDirectory() as tmp:

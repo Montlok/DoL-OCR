@@ -10,6 +10,30 @@ import torch.nn.functional as F
 
 from Model.layers.rope import MorphologicalRoPE, apply_rope
 
+try:
+    from torch.nn.attention.bias import causal_lower_right
+except ImportError:  # PyTorch versions before the structured attention-bias API.
+    causal_lower_right = None
+
+
+_MAX_CACHED_MASK_ELEMENTS = 8 * 1024 * 1024
+
+
+def _supports_fused_lower_right(q, k, v, dropout_p: float) -> bool:
+    if causal_lower_right is None or not q.is_cuda:
+        return False
+    args = [q, k, v, None, dropout_p, False]
+    if hasattr(torch.backends.cuda.SDPAParams, "enable_gqa"):
+        args.append(False)
+    params = torch.backends.cuda.SDPAParams(*args)
+    return (
+        torch.backends.cuda.flash_sdp_enabled()
+        and torch.backends.cuda.can_use_flash_attention(params)
+    ) or (
+        torch.backends.cuda.mem_efficient_sdp_enabled()
+        and torch.backends.cuda.can_use_efficient_attention(params)
+    )
+
 
 class MLA(nn.Module):
     def __init__(self, cfg):
@@ -166,16 +190,27 @@ class MLA(nn.Module):
                     q, k, v, dropout_p=dropout_p,
                     is_causal=past_len == 0, scale=self.scale,
                 )
-            # A non-square SDPA causal mask is upper-left aligned. Decode
-            # queries instead see a growing prefix that starts at past_len.
-            return torch.cat([
-                F.scaled_dot_product_attention(
-                    q[:, :, i:i + 1], k[:, :, :past_len + i + 1],
-                    v[:, :, :past_len + i + 1], dropout_p=dropout_p,
-                    is_causal=False, scale=self.scale,
+            if _supports_fused_lower_right(q, k, v, dropout_p):
+                return F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=causal_lower_right(q_len, k_len),
+                    dropout_p=dropout_p, scale=self.scale,
                 )
-                for i in range(q_len)
-            ], dim=-2)
+            # Keep the non-fused/older-PyTorch path batched while bounding
+            # each mask allocation. A non-square is_causal mask would align
+            # upper-left, not at the end of the existing KV prefix.
+            tile_rows = max(1, _MAX_CACHED_MASK_ELEMENTS // k_len)
+            pieces = []
+            for start in range(0, q_len, tile_rows):
+                end = min(start + tile_rows, q_len)
+                key_end = past_len + end
+                rows = torch.arange(start, end, device=q.device)[:, None] + past_len
+                cols = torch.arange(key_end, device=q.device)[None, :]
+                pieces.append(F.scaled_dot_product_attention(
+                    q[:, :, start:end], k[:, :, :key_end], v[:, :, :key_end],
+                    attn_mask=cols <= rows, dropout_p=dropout_p,
+                    is_causal=False, scale=self.scale,
+                ))
+            return torch.cat(pieces, dim=-2)
 
         rows = torch.arange(q_len, device=q.device).unsqueeze(-1) + past_len
         cols = torch.arange(k_len, device=q.device).unsqueeze(0)

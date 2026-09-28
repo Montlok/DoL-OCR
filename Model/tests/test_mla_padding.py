@@ -80,7 +80,7 @@ def test_million_token_padding_bookkeeping_on_meta_device():
     assert sdpa.call_args.kwargs.get("attn_mask") is None
 
 
-def test_cached_multitoken_continuations_preserve_causality_without_dense_masks():
+def test_cached_multitoken_continuations_preserve_causality_with_bounded_masks():
     torch.manual_seed(3)
     layer = make_mla().eval()
     x = torch.randn(2, 11, layer.d_model)
@@ -97,4 +97,31 @@ def test_cached_multitoken_continuations_preserve_causality_without_dense_masks(
                 for start, end in [(0, 4), (4, 7), (7, 8), (8, 11)]
             ]
     torch.testing.assert_close(torch.cat(pieces, 1), expected, atol=2e-6, rtol=2e-5)
-    assert all(call.kwargs.get("attn_mask") is None for call in sdpa.call_args_list)
+    assert sdpa.call_count == 4
+    assert all(
+        call.kwargs.get("attn_mask") is None
+        or call.kwargs["attn_mask"].numel() <= 8 * 1024 * 1024
+        for call in sdpa.call_args_list
+    )
+
+
+def test_cached_fallback_batches_queries_and_bounds_each_tile():
+    torch.manual_seed(9)
+    fast, reference = make_mla(), make_mla(False)
+    q = torch.randn(1, 2, 128, 16)
+    k, v = torch.randn(1, 2, 1152, 16), torch.randn(1, 2, 1152, 16)
+    expected = reference._attention_cached(q, k, v, past_len=1024)
+    original = torch.nn.functional.scaled_dot_product_attention
+    with mock.patch("Model.layers.mla.F.scaled_dot_product_attention", wraps=original) as sdpa:
+        actual = fast._attention_cached(q, k, v, past_len=1024)
+    assert sdpa.call_count == 1
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+    budget = 16 * k.shape[-2]
+    with (
+        mock.patch("Model.layers.mla._MAX_CACHED_MASK_ELEMENTS", budget),
+        mock.patch("Model.layers.mla.F.scaled_dot_product_attention", wraps=original) as sdpa,
+    ):
+        tiled = fast._attention_cached(q, k, v, past_len=1024)
+    assert sdpa.call_count == 8
+    assert all(c.kwargs["attn_mask"].numel() <= budget for c in sdpa.call_args_list)
+    torch.testing.assert_close(tiled, expected, atol=2e-6, rtol=2e-5)

@@ -11,10 +11,10 @@ from typing import Any
 from Tokenizer.pretraining import (
     IGNORE_INDEX,
     EncodedSample,
-    PretrainingDataBuilder,
     derive_morph_info_from_offsets,
     nested_int_lists,
 )
+from Tokenizer.pretraining.producer import WindowedPretrainingDataBuilder
 from Tokenizer.unified.bundle import TokenizerBundle
 
 
@@ -30,7 +30,7 @@ def run_gate(
     for issue in bundle.validate():
         failures.append({"scope": "bundle", "message": issue})
 
-    builder = PretrainingDataBuilder(bundle, max_length=max_length)
+    builder = WindowedPretrainingDataBuilder(bundle, max_length=max_length)
     num_samples = 0
     total_tokens = 0
     unk_count = 0
@@ -52,7 +52,8 @@ def run_gate(
                 total_tokens += len(sample.input_ids)
                 unk_count += sample.input_ids.count(bundle.tokenizer.unk_id)
                 supervised_tokens += sum(
-                    1 for label in sample.labels if label != IGNORE_INDEX
+                    1 for label, active in zip(sample.labels[1:], sample.attention_mask[1:])
+                    if active and label != IGNORE_INDEX
                 )
                 max_morph_depth = max(max_morph_depth, max(sample.morph_depth, default=0))
                 failures.extend(_validate_sample(bundle, sample, text, idx))

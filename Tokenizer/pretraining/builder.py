@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -65,45 +64,6 @@ class EncodedSample:
     reading_order: list[list[int]] = field(default_factory=list)
 
 
-def iter_text_windows(
-    sample: EncodedSample, max_length: int,
-) -> Iterator[EncodedSample]:
-    """Preserve every next-token target, using one context token of overlap."""
-
-    if max_length <= 0:
-        raise ValueError("max_length must be positive")
-    if any(sample.modality_spans.values()) or sample.images or sample.videos:
-        raise ValueError("text windows cannot split multimodal samples")
-    if len(sample.input_ids) <= max_length:
-        yield sample
-        return
-    if max_length < 2:
-        raise ValueError("text windows need max_length >= 2 for next-token targets")
-    parent = sample.metadata.get("text_window", {})
-    base = int(parent.get("token_start", 0))
-    total = int(parent.get("total_tokens", len(sample.input_ids)))
-    for start in range(0, len(sample.input_ids) - 1, max_length - 1):
-        end = min(start + max_length, len(sample.input_ids))
-        labels = sample.labels[start:end]
-        if start:
-            labels[0] = IGNORE_INDEX
-        word_base = sample.word_pos[start]
-        yield EncodedSample(
-            input_ids=sample.input_ids[start:end],
-            attention_mask=sample.attention_mask[start:end],
-            labels=labels,
-            token_offsets=sample.token_offsets[start:end],
-            word_pos=[max(0, p - word_base) for p in sample.word_pos[start:end]],
-            morph_depth=sample.morph_depth[start:end],
-            modality_spans={key: [] for key in sample.modality_spans},
-            metadata={**sample.metadata, "text_window": {
-                "token_start": base + start,
-                "token_end": base + end,
-                "total_tokens": total,
-            }},
-        )
-
-
 class PretrainingDataBuilder:
     def __init__(
         self,
@@ -127,40 +87,17 @@ class PretrainingDataBuilder:
             self.label_ignore_tokens = set(label_ignore_tokens)
 
     def encode_text(self, text: str, metadata: dict | None = None) -> EncodedSample:
-        sample = self._encode_text(text, metadata)
-        if len(sample.input_ids) > self.max_length:
-            raise ValueError(
-                "text exceeds max_length; use iter_encode_text to retain all windows"
-            )
-        return sample
-
-    def iter_encode_text(
-        self, text: str, metadata: dict | None = None,
-    ) -> Iterator[EncodedSample]:
-        yield from iter_text_windows(self._encode_text(text, metadata), self.max_length)
-
-    def _encode_text(self, text: str, metadata: dict | None) -> EncodedSample:
         result = self.bundle.encode_with_spans(
             text, add_bos=self.add_bos, add_eos=self.add_eos
         )
-        return self._sample_from_tokens(
+        sample = self._sample_from_tokens(
             result.input_ids,
             result.attention_mask,
             result.tokens,
             {"image_token_spans": [], "video_token_spans": []},
             metadata or {"type": "text"},
         )
-
-    def iter_encode_json_obj(self, obj: dict) -> Iterator[EncodedSample]:
-        if (
-            obj.get("type", "text") in {"image_text", "ocr", "video_text"}
-            or obj.get("images") or obj.get("videos")
-        ):
-            yield self.encode_json_obj(obj)
-        else:
-            yield from self.iter_encode_text(
-                str(obj.get("text", "")), metadata=self._metadata(obj),
-            )
+        return self._truncate(sample)
 
     def encode_json_obj(self, obj: dict) -> EncodedSample:
         text = str(obj.get("text", ""))
